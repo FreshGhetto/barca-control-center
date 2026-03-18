@@ -1,0 +1,53 @@
+{
+  "errors": [],
+  "warnings": [],
+  "metrics": {
+    "shapes": {
+      "clean_sales": [
+        12070,
+        13
+      ],
+      "clean_articles": [
+        12458,
+        18
+      ],
+      "suggested_transfers": [
+        7374,
+        6
+      ],
+      "suggested_transfers_detailed": [
+        7705,
+        6
+      ],
+      "features_after": [
+        12339,
+        32
+      ],
+      "demand_diagnostics": [
+        12459,
+        14
+      ],
+      "shipment_plan": [
+        7374,
+        13
+      ]
+    },
+    "neg_Consegnato_Qty": 0,
+    "neg_Venduto_Qty": 0,
+    "neg_Periodo_Qty": 0,
+    "neg_Altro_Venduto_Qty": 0,
+    "neg_size_cells_clean_articles": 0,
+    "dup_article_shop_sales": 0,
+    "dup_article_shop_articles": 0,
+    "stock_conservation_max_abs_delta": 0.0,
+    "shops_over_capacity": 0,
+    "shops_over_inbound_budget": 0,
+    "shops_over_outbound_budget": 0,
+    "qty_transfers": 7705.0,
+    "qty_shipment": 7705.0,
+    "planned_missing_dispatch": 0,
+    "planned_missing_eta": 0,
+    "articles_only_in_sales": 0,
+    "articles_only_in_stock": 0
+  }
+}
