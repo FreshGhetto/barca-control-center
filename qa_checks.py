@@ -155,6 +155,85 @@ def main() -> int:
             f"Article mismatch between sales and stock (only_sales={only_sales}, only_stock={only_stock})."
         )
 
+    # Optional QA for integrated orders module.
+    orders_dir = out / "orders"
+    orders_summary_path = orders_dir / "orders_summary.json"
+    if orders_summary_path.exists():
+        try:
+            orders_summary = json.loads(orders_summary_path.read_text(encoding="utf-8"))
+            report["metrics"]["orders_enabled"] = bool(orders_summary.get("enabled", False))
+            report["metrics"]["orders_bundles_detected"] = len(orders_summary.get("bundles_detected", []))
+
+            if orders_summary.get("enabled", False):
+                missing_order_files = []
+                for section in ("current", "continuativa"):
+                    sec = orders_summary.get(section, {})
+                    for fname in sec.get("output_files", []):
+                        p = orders_dir / fname
+                        if not p.exists():
+                            missing_order_files.append(str(p.name))
+
+                    full = sec.get("full", {})
+                    if isinstance(full, dict) and full.get("enabled", False):
+                        for fname in full.get("output_files", []):
+                            p = orders_dir / fname
+                            if not p.exists():
+                                missing_order_files.append(str(p.name))
+
+                report["metrics"]["orders_missing_output_files"] = len(missing_order_files)
+                if missing_order_files:
+                    report["errors"].append(f"Orders summary references missing files: {missing_order_files}")
+
+                current_math = orders_dir / "orders_current_previsione_math.csv"
+                if current_math.exists():
+                    df_cur = pd.read_csv(current_math)
+                    if "Da_Acquistare_Totale" in df_cur.columns:
+                        neg_cur = int((pd.to_numeric(df_cur["Da_Acquistare_Totale"], errors="coerce").fillna(0.0) < 0).sum())
+                        report["metrics"]["orders_current_negative_da_acq"] = neg_cur
+                        if neg_cur > 0:
+                            report["errors"].append(f"Negative Da_Acquistare_Totale in current orders file: {neg_cur}")
+
+                cont_math = orders_dir / "orders_continuativa_previsione_math.csv"
+                if cont_math.exists():
+                    df_cont = pd.read_csv(cont_math)
+                    if "Da_Acquistare_Totale" in df_cont.columns:
+                        neg_cont = int((pd.to_numeric(df_cont["Da_Acquistare_Totale"], errors="coerce").fillna(0.0) < 0).sum())
+                        report["metrics"]["orders_cont_negative_da_acq"] = neg_cont
+                        if neg_cont > 0:
+                            report["errors"].append(f"Negative Da_Acquistare_Totale in continuativa math file: {neg_cont}")
+
+                cont_rf = orders_dir / "orders_continuativa_previsione_rf.csv"
+                if cont_rf.exists():
+                    df_rf = pd.read_csv(cont_rf)
+                    if "Da_Acquistare_Totale" in df_rf.columns:
+                        neg_rf = int((pd.to_numeric(df_rf["Da_Acquistare_Totale"], errors="coerce").fillna(0.0) < 0).sum())
+                        report["metrics"]["orders_rf_negative_da_acq"] = neg_rf
+                        if neg_rf > 0:
+                            report["errors"].append(f"Negative Da_Acquistare_Totale in RF orders file: {neg_rf}")
+        except Exception as exc:
+            report["warnings"].append(f"Orders QA skipped due to parsing error: {exc}")
+    else:
+        report["metrics"]["orders_enabled"] = False
+
+    # Optional QA for ingest agent.
+    ingest_report_path = out / "ingest" / "ingest_report_latest.json"
+    if ingest_report_path.exists():
+        try:
+            ingest = json.loads(ingest_report_path.read_text(encoding="utf-8"))
+            report["metrics"]["ingest_processed_total"] = int(ingest.get("processed_total", 0))
+            report["metrics"]["ingest_ingested"] = int(ingest.get("ingested", 0))
+            report["metrics"]["ingest_quarantine"] = int(ingest.get("quarantine", 0))
+            report["metrics"]["ingest_errors"] = int(ingest.get("errors", 0))
+            if int(ingest.get("errors", 0)) > 0:
+                report["warnings"].append(
+                    f"Ingest report contains errors={ingest.get('errors', 0)}. "
+                    f"Check output/ingest/ingest_report_latest.json"
+                )
+        except Exception as exc:
+            report["warnings"].append(f"Ingest QA skipped due to parsing error: {exc}")
+    else:
+        report["metrics"]["ingest_processed_total"] = 0
+
     qa_path = out / "qa_report.json"
     qa_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
     print(json.dumps(report, indent=2, ensure_ascii=False))

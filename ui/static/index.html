@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>BARCA Control Center</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div>
+        <h1>BARCA Control Center</h1>
+        <p>Controllo operativo pipeline, ordini, trasferimenti e sincronizzazione database.</p>
+      </div>
+      <div class="top-actions">
+        <button id="refreshBtn" class="btn secondary">Aggiorna</button>
+        <button id="devModeBtn" class="btn ghost">Modalita sviluppatore: OFF</button>
+      </div>
+    </header>
+
+    <section class="status-row">
+      <article class="status-card">
+        <h3>Stato Servizio</h3>
+        <p id="healthText">--</p>
+      </article>
+      <article class="status-card">
+        <h3>Aggiornamento in corso</h3>
+        <p id="activeRunText">--</p>
+      </article>
+      <article class="status-card">
+        <h3>Database</h3>
+        <p id="dbText">--</p>
+      </article>
+    </section>
+
+    <nav class="view-nav" aria-label="Sezioni applicazione">
+      <button id="tabDashboard" class="view-tab active" type="button" data-view-target="dashboard">Dashboard</button>
+      <button id="tabOperations" class="view-tab" type="button" data-view-target="operations">Operazioni</button>
+      <button id="tabData" class="view-tab" type="button" data-view-target="data">Dati e Output</button>
+      <button id="tabDev" class="view-tab" type="button" data-view-target="dev">Sviluppo</button>
+    </nav>
+
+    <main class="main-grid">
+      <section id="businessDashboard" class="panel span-2 view-panel" data-view="dashboard">
+        <div class="panel-head">
+          <h2>Dashboard Operativa</h2>
+          <div class="dashboard-actions">
+            <select id="dashboardRunSelect"></select>
+            <button id="dashboardRefreshBtn" class="btn secondary" type="button">Aggiorna Dashboard</button>
+          </div>
+        </div>
+        <p id="dashboardSubtitle" class="muted">Seleziona un aggiornamento per analizzare distribuzione giacenze e ordini.</p>
+        <div id="dashboardRunContext" class="context-ribbon"></div>
+        <p id="dashboardWarn" class="alert hidden">--</p>
+        <div id="dashboardQuickFacts" class="quick-facts"></div>
+        <div id="dashboardLegend" class="dashboard-legend"></div>
+
+        <div id="dashboardKpis" class="kpi-grid"></div>
+        <div id="insightBoard" class="insight-grid"></div>
+        <div class="reading-guide">
+          <strong>Come leggere il cruscotto:</strong>
+          <span>`Conteggio` = numero di negozi, articoli o righe importate.</span>
+          <span>`Paia` = quantità fisiche suggerite, trasferite o ordinate.</span>
+          <span>`€` = valore economico stimato degli ordini.</span>
+          <span>`Sellout` = percentuale media di rotazione merce.</span>
+          <span>`Mancanza stimata` = domanda stimata maggiore dello stock dopo i movimenti.</span>
+          <span>`Confronto vs aggiornamento precedente` = differenza rispetto alla run DB immediatamente prima.</span>
+          <span>`25i/25e` = stagioni correnti, `25y/25g` = continuative.</span>
+          <span>`base`, `storico`, `ibrido` = i tre metodi di previsione ordini.</span>
+        </div>
+
+        <nav class="dash-section-nav" aria-label="Aree analitiche dashboard">
+          <button class="dash-section-tab active" type="button" data-dash-target="transfers">Trasferimenti</button>
+          <button class="dash-section-tab" type="button" data-dash-target="orders">Ordini</button>
+          <button class="dash-section-tab" type="button" data-dash-target="next">Prossima Corrente</button>
+          <button class="dash-section-tab" type="button" data-dash-target="critical">Criticita'</button>
+        </nav>
+
+        <section class="dash-section active" data-dash-section="transfers">
+          <div class="chart-grid">
+            <article class="chart-card">
+              <h3>Negozi che ricevono piu merce (paia)</h3>
+              <div id="chartTransferTo" class="bar-chart"></div>
+            </article>
+            <article class="chart-card">
+              <h3>Negozi che cedono piu merce (paia)</h3>
+              <div id="chartTransferFrom" class="bar-chart"></div>
+            </article>
+            <article class="chart-card chart-span-2">
+              <h3>Motivi principali dei trasferimenti (paia)</h3>
+              <div id="chartTransferReason" class="bar-chart"></div>
+            </article>
+          </div>
+
+          <article id="transferPanel" class="panel subpanel table-panel">
+            <h3>Trasferimenti suggeriti</h3>
+            <div class="table-tools">
+              <input id="transferTableSearch" type="text" placeholder="Cerca articolo / negozio / motivo" />
+              <div class="table-tools-actions">
+                <select id="transferTableRowLimit">
+                  <option value="20" selected>Top 20</option>
+                  <option value="50">Top 50</option>
+                  <option value="100">Top 100</option>
+                  <option value="200">Top 200</option>
+                </select>
+                <button id="transferTableShowAllBtn" class="btn secondary" type="button">Mostra Tutte</button>
+                <button id="transferTableFocusBtn" class="btn secondary" type="button">Schermo Intero</button>
+                <span id="transferTableInfo" class="muted table-info">0/0 righe</span>
+                <button id="transferExportCsvBtn" class="btn secondary" type="button">CSV</button>
+                <button id="transferExportXlsxBtn" class="btn secondary" type="button">Excel</button>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table id="transferTable">
+                <thead>
+                  <tr>
+                    <th class="sortable" data-key="article_code">Articolo</th>
+                    <th class="sortable" data-key="size">Taglia</th>
+                    <th class="sortable" data-key="from_shop_code">Da Negozio</th>
+                    <th class="sortable" data-key="to_shop_code">A Negozio</th>
+                    <th class="sortable" data-key="reason">Motivo</th>
+                    <th class="sortable" data-key="qty">Paia</th>
+                  </tr>
+                </thead>
+                <tbody id="transferTableBody"></tbody>
+              </table>
+            </div>
+          </article>
+        </section>
+
+        <section class="dash-section" data-dash-section="orders">
+          <div class="chart-grid">
+            <article class="chart-card">
+              <h3>Ordini per stagione e metodo (paia)</h3>
+              <div id="chartOrdersSeasonMode" class="bar-chart"></div>
+            </article>
+            <article class="chart-card">
+              <h3>Ordini per metodo (paia)</h3>
+              <div id="chartOrdersMode" class="bar-chart"></div>
+            </article>
+            <article class="chart-card chart-span-2">
+              <h3>Ordini per area (paia)</h3>
+              <div id="chartOrdersModule" class="bar-chart"></div>
+            </article>
+          </div>
+
+          <article id="ordersPanel" class="panel subpanel table-panel">
+            <h3>Ordini suggeriti</h3>
+            <div class="table-tools">
+              <input id="ordersTableSearch" type="text" placeholder="Cerca stagione / articolo / metodo" />
+              <div class="table-tools-actions">
+                <select id="ordersTableRowLimit">
+                  <option value="20" selected>Top 20</option>
+                  <option value="50">Top 50</option>
+                  <option value="100">Top 100</option>
+                  <option value="200">Top 200</option>
+                </select>
+                <button id="ordersTableShowAllBtn" class="btn secondary" type="button">Mostra Tutte</button>
+                <button id="ordersTableFocusBtn" class="btn secondary" type="button">Schermo Intero</button>
+                <span id="ordersTableInfo" class="muted table-info">0/0 righe</span>
+                <button id="ordersExportCsvBtn" class="btn secondary" type="button">CSV</button>
+                <button id="ordersExportXlsxBtn" class="btn secondary" type="button">Excel</button>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table id="ordersTable">
+                <thead>
+                  <tr>
+                    <th class="sortable" data-key="module">Area</th>
+                    <th class="sortable" data-key="season_code">Stagione</th>
+                    <th class="sortable" data-key="mode">Metodo</th>
+                    <th class="sortable" data-key="article_code">Articolo</th>
+                    <th class="sortable" data-key="totale_qty">Totale (paia)</th>
+                    <th class="sortable" data-key="predizione_vendite">Predizione (paia)</th>
+                    <th class="sortable" data-key="budget_acquisto">Budget (€)</th>
+                  </tr>
+                </thead>
+                <tbody id="ordersTableBody"></tbody>
+              </table>
+            </div>
+          </article>
+        </section>
+
+        <section class="dash-section" data-dash-section="next">
+          <div class="chart-grid">
+            <article class="chart-card chart-span-2">
+              <h3>Prossima stagione per categoria (paia)</h3>
+              <div id="chartNextCurrentCategory" class="bar-chart"></div>
+            </article>
+            <article class="chart-card chart-span-2">
+              <h3>Fabbisogno extra prossima stagione (paia)</h3>
+              <div id="chartNextCurrentDeltaCategory" class="bar-chart"></div>
+            </article>
+          </div>
+
+          <article id="nextCurrentPanel" class="panel subpanel table-panel">
+            <h3>Articoli candidati per la prossima stagione</h3>
+            <div class="table-tools">
+              <input id="nextCurrentTableSearch" type="text" placeholder="Cerca articolo / categoria / stagione" />
+              <div class="table-tools-actions">
+                <select id="nextCurrentTableRowLimit">
+                  <option value="20" selected>Top 20</option>
+                  <option value="50">Top 50</option>
+                  <option value="100">Top 100</option>
+                  <option value="200">Top 200</option>
+                </select>
+                <button id="nextCurrentTableShowAllBtn" class="btn secondary" type="button">Mostra Tutte</button>
+                <button id="nextCurrentTableFocusBtn" class="btn secondary" type="button">Schermo Intero</button>
+                <span id="nextCurrentTableInfo" class="muted table-info">0/0 righe</span>
+                <button id="nextCurrentExportCsvBtn" class="btn secondary" type="button">CSV</button>
+                <button id="nextCurrentExportXlsxBtn" class="btn secondary" type="button">Excel</button>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table id="nextCurrentTable">
+                <thead>
+                  <tr>
+                    <th class="sortable" data-key="from_cont_season">Stagione origine</th>
+                    <th class="sortable" data-key="article_code">Articolo</th>
+                    <th class="sortable" data-key="categoria">Categoria</th>
+                    <th class="sortable" data-key="tipologia">Tipologia</th>
+                    <th class="sortable" data-key="marchio">Marchio</th>
+                    <th class="sortable" data-key="colore">Colore</th>
+                    <th class="sortable" data-key="materiale">Materiale</th>
+                    <th class="sortable" data-key="venduto_periodo">Venduto recente (paia)</th>
+                    <th class="sortable" data-key="giacenza">Giacenza (paia)</th>
+                    <th class="sortable" data-key="applied_factor">Fattore (x)</th>
+                    <th class="sortable" data-key="predicted_current_qty">Pezzi stimati (paia)</th>
+                    <th class="sortable" data-key="delta_vs_stock">Extra vs stock (paia)</th>
+                    <th class="sortable" data-key="predicted_budget">Valore stimato (€)</th>
+                    <th class="sortable" data-key="transition_score">Priorita</th>
+                  </tr>
+                </thead>
+                <tbody id="nextCurrentTableBody"></tbody>
+              </table>
+            </div>
+          </article>
+        </section>
+
+        <section class="dash-section" data-dash-section="critical">
+          <div class="chart-grid">
+            <article class="chart-card chart-span-2">
+              <h3>Mancanza stimata per negozio (paia)</h3>
+              <div id="chartCriticalByShop" class="bar-chart"></div>
+            </article>
+          </div>
+
+          <article id="criticalPanel" class="panel subpanel table-panel">
+            <h3>Articoli con mancanza stimata</h3>
+            <div class="table-tools">
+              <input id="criticalTableSearch" type="text" placeholder="Cerca articolo / negozio" />
+              <div class="table-tools-actions">
+                <select id="criticalTableRowLimit">
+                  <option value="20" selected>Top 20</option>
+                  <option value="50">Top 50</option>
+                  <option value="100">Top 100</option>
+                  <option value="200">Top 200</option>
+                </select>
+                <button id="criticalTableShowAllBtn" class="btn secondary" type="button">Mostra Tutte</button>
+                <button id="criticalTableFocusBtn" class="btn secondary" type="button">Schermo Intero</button>
+                <span id="criticalTableInfo" class="muted table-info">0/0 righe</span>
+                <button id="criticalExportCsvBtn" class="btn secondary" type="button">CSV</button>
+                <button id="criticalExportXlsxBtn" class="btn secondary" type="button">Excel</button>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table id="criticalTable">
+                <thead>
+                  <tr>
+                    <th class="sortable" data-key="article_code">Articolo</th>
+                    <th class="sortable" data-key="shop_code">Negozio</th>
+                    <th class="sortable" data-key="demand_hybrid">Domanda stimata (paia)</th>
+                    <th class="sortable" data-key="stock_after">Stock dopo movimenti (paia)</th>
+                    <th class="sortable" data-key="deficit">Mancanza stimata (paia)</th>
+                  </tr>
+                </thead>
+                <tbody id="criticalTableBody"></tbody>
+              </table>
+            </div>
+          </article>
+        </section>
+      </section>
+
+      <section class="panel view-panel" data-view="operations">
+        <h2>Nuovo Aggiornamento</h2>
+        <form id="runForm" class="form-grid">
+          <label><input type="checkbox" id="sourceDb" checked /> Usa dati gia' presenti nel database</label>
+          <label><input type="checkbox" id="skipIngest" checked /> Non rileggere i file in ingresso</label>
+          <label><input type="checkbox" id="ordersSourceDb" checked /> Usa ordini gia' presenti nel database</label>
+          <label><input type="checkbox" id="skipOrders" /> Aggiorna solo giacenze e trasferimenti</label>
+          <label><input type="checkbox" id="syncDb" checked /> Aggiorna il database finale</label>
+          <label><input type="checkbox" id="createSchema" /> Applica o aggiorna la struttura tabelle</label>
+          <label><input type="checkbox" id="ordersMathOnly" /> Usa solo il metodo base per gli ordini</label>
+          <label class="inline-field">Copertura ordini
+            <input type="number" id="ordersCoverage" step="0.01" value="1.20" />
+          </label>
+          <label class="inline-field">Codice run dati vendita/stock
+            <input type="text" id="sourceDbRunId" placeholder="UUID opzionale" />
+          </label>
+          <label class="inline-field">Codice run ordini
+            <input type="text" id="ordersSourceDbRunId" placeholder="UUID opzionale" />
+          </label>
+          <label class="inline-field">Cartella file ingresso (opzionale)
+            <input type="text" id="incomingRoot" placeholder="C:\path\incoming" />
+          </label>
+          <label class="inline-field">Cartella file ordini (opzionale)
+            <input type="text" id="ordersRoot" placeholder="C:\path\orders" />
+          </label>
+          <div class="form-actions">
+            <button type="submit" class="btn primary">Avvia aggiornamento</button>
+            <p id="runFormMsg" class="muted"></p>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel view-panel" data-view="operations">
+        <h2>Aggiornamenti Recenti</h2>
+        <div class="runs-toolbar">
+          <input id="runsSearch" type="text" placeholder="Cerca aggiornamento / stagione / stato" />
+          <select id="runsSourceFilter">
+            <option value="all">Origine: tutte</option>
+            <option value="db">Solo database</option>
+            <option value="ui">Solo interfaccia</option>
+          </select>
+          <select id="runsStatusFilter">
+            <option value="">Stato: tutti</option>
+            <option value="running">In corso</option>
+            <option value="success">Completata</option>
+            <option value="failed">Errore</option>
+            <option value="stopped">Interrotta</option>
+            <option value="queued">In attesa</option>
+            <option value="completed">Completata (DB)</option>
+          </select>
+          <select id="runsSortBy">
+            <option value="started_at" selected>Ordina: inizio</option>
+            <option value="ended_at">Ordina: fine</option>
+            <option value="run_id">Ordina: codice</option>
+            <option value="status">Ordina: stato</option>
+            <option value="source">Ordina: origine</option>
+            <option value="run_type">Ordina: categoria</option>
+          </select>
+          <select id="runsSortDir">
+            <option value="desc" selected>Direzione: desc</option>
+            <option value="asc">Direzione: asc</option>
+          </select>
+          <select id="runsPageSize">
+            <option value="20">20 righe</option>
+            <option value="40" selected>40 righe</option>
+            <option value="80">80 righe</option>
+          </select>
+          <input id="runsTypeFilter" type="text" placeholder="Filtro categoria (es. aggiornamento)" />
+          <button id="runsClearFiltersBtn" class="btn secondary" type="button">Reset Filtri</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Codice run</th>
+                <th>Origine</th>
+                <th>Categoria</th>
+                <th>Contesto</th>
+                <th>Stato</th>
+                <th>Inizio</th>
+                <th>Fine</th>
+                <th>Exit</th>
+                <th>Azioni</th>
+              </tr>
+            </thead>
+            <tbody id="runsTableBody"></tbody>
+          </table>
+        </div>
+        <div class="runs-pager">
+          <button id="runsPrevPageBtn" class="btn secondary" type="button">Precedente</button>
+          <p id="runsPageInfo" class="muted">Pagina 1</p>
+          <button id="runsNextPageBtn" class="btn secondary" type="button">Successiva</button>
+        </div>
+      </section>
+
+      <section class="panel view-panel" data-view="data">
+        <h2>Output Principali</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>File</th>
+                <th>Esiste</th>
+                <th>Righe</th>
+                <th>Dimensione</th>
+                <th>Modifica</th>
+              </tr>
+            </thead>
+            <tbody id="outputsTableBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel view-panel" data-view="data">
+        <h2>Database Snapshot</h2>
+        <pre id="dbStatusBox" class="json-box">--</pre>
+      </section>
+
+      <section id="developerPanel" class="panel developer-only hidden span-2 view-panel" data-view="dev">
+        <h2>Debug Sviluppatore</h2>
+        <p class="muted">Visibile solo con modalita sviluppatore ON. Include comando di avvio e log raw.</p>
+        <div class="dev-grid">
+          <div>
+            <h3>Dettaglio Aggiornamento Selezionato</h3>
+            <pre id="selectedRunBox" class="json-box">Seleziona un aggiornamento dalla tabella.</pre>
+          </div>
+          <div>
+            <h3>Log Raw (tail)</h3>
+            <pre id="logsBox" class="log-box">Modalita sviluppatore OFF</pre>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -352,10 +352,11 @@ def _next_weekday_date(base_date: pd.Timestamp, weekday: int) -> pd.Timestamp:
 
 def _next_courier_2d_date(base_date: pd.Timestamp) -> pd.Timestamp:
     # Anchor Monday 2026-01-05; then every 2 days.
-    anchor = pd.Timestamp("2026-01-05")
-    delta = int((base_date.normalize() - anchor).days)
+    base_norm = base_date.normalize()
+    anchor = pd.Timestamp("2026-01-05", tz=base_norm.tz) if base_norm.tz is not None else pd.Timestamp("2026-01-05")
+    delta = int((base_norm - anchor).days)
     rem = delta % 2
-    return base_date.normalize() if rem == 0 else base_date.normalize() + pd.Timedelta(days=1)
+    return base_norm if rem == 0 else base_norm + pd.Timedelta(days=1)
 
 
 def _resolve_route_weekday(from_shop: str, to_shop: str) -> Optional[int]:
@@ -538,6 +539,7 @@ def run_allocation(clean_sales_csv: Path, clean_articles_csv: Path, shops_xlsx: 
             # donor priority: higher fascia number first (lower priority shop), then low periodo
             donors.append((int(float(fascia)) if not pd.isna(fascia) else 99, periodo.get((article, s), 0.0), s))
         donors.sort(key=lambda x: (-x[0], x[1]))
+        online_donors = sorted(donors, key=lambda x: (0 if x[2] == WAREHOUSE else 1, -x[0], x[1]))
 
         outlet = pick_outlet(meta, shops_for_article, demand, article)
 
@@ -558,16 +560,14 @@ def run_allocation(clean_sales_csv: Path, clean_articles_csv: Path, shops_xlsx: 
                     continue
 
                 moved = False
-                for _, _, donor in donors:
+                donors_for_recv = online_donors if recv == ONLINE else donors
+                for _, _, donor in donors_for_recv:
                     if donor == recv:
                         continue
                     if ops_budget_left(recv, ops_in_used, ops_in_budget) < 1.0:
                         ops_blocks += 1
                         break
                     if ops_budget_left(donor, ops_out_used, ops_out_budget) < 1.0:
-                        continue
-                    # online receive only from warehouse
-                    if recv == ONLINE and donor != WAREHOUSE:
                         continue
                     if donor != WAREHOUSE:
                         keep = donor_keep_min(meta, demand, article, donor)
@@ -607,15 +607,14 @@ def run_allocation(clean_sales_csv: Path, clean_articles_csv: Path, shops_xlsx: 
                 if free_capacity(recv, shop_total_stock, shop_capacity_target) < 1.0:
                     capacity_blocks += 1
                     break
-                for _, _, donor in donors:
+                donors_for_recv = online_donors if recv == ONLINE else donors
+                for _, _, donor in donors_for_recv:
                     if donor == recv:
                         continue
                     if ops_budget_left(recv, ops_in_used, ops_in_budget) < 1.0:
                         ops_blocks += 1
                         break
                     if ops_budget_left(donor, ops_out_used, ops_out_budget) < 1.0:
-                        continue
-                    if recv == ONLINE and donor != WAREHOUSE:
                         continue
                     if donor != WAREHOUSE:
                         keep = donor_keep_min(meta, demand, article, donor)

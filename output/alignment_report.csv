@@ -1,3 +1,1 @@
-kind,article,qty_signal,note
-drop_inert_stock_only_article,59/6058CTM,0.0,Removed inert stock-only article (all zero).
-add_synthetic_zero_sales,59/CAMP139,1.0,Added synthetic zero-sales rows for active stock-only article.
+

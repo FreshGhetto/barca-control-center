@@ -12,15 +12,15 @@
         18
       ],
       "suggested_transfers": [
-        7374,
+        7228,
         6
       ],
       "suggested_transfers_detailed": [
-        7705,
+        7708,
         6
       ],
       "features_after": [
-        12339,
+        12329,
         32
       ],
       "demand_diagnostics": [
@@ -28,7 +28,7 @@
         14
       ],
       "shipment_plan": [
-        7374,
+        7228,
         13
       ]
     },
@@ -43,11 +43,21 @@
     "shops_over_capacity": 0,
     "shops_over_inbound_budget": 0,
     "shops_over_outbound_budget": 0,
-    "qty_transfers": 7705.0,
-    "qty_shipment": 7705.0,
+    "qty_transfers": 7708.0,
+    "qty_shipment": 7708.0,
     "planned_missing_dispatch": 0,
     "planned_missing_eta": 0,
     "articles_only_in_sales": 0,
-    "articles_only_in_stock": 0
+    "articles_only_in_stock": 0,
+    "orders_enabled": true,
+    "orders_bundles_detected": 2,
+    "orders_missing_output_files": 0,
+    "orders_current_negative_da_acq": 0,
+    "orders_cont_negative_da_acq": 0,
+    "orders_rf_negative_da_acq": 0,
+    "ingest_processed_total": 0,
+    "ingest_ingested": 0,
+    "ingest_quarantine": 0,
+    "ingest_errors": 0
   }
 }

@@ -1,3 +1,7 @@
 pandas
 numpy
 openpyxl
+scikit-learn
+psycopg[binary]
+fastapi
+uvicorn[standard]
