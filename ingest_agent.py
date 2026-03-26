@@ -115,6 +115,13 @@ def _classify_file(path: Path, preview: str) -> Dict[str, Any]:
         return {"kind": "orders_sd_2", "target_group": "orders"}
 
     if "ANALISI ARTICOLI" in text:
+        if (
+            "RAFFRONTA CON VENDUTO NEL PERIODO" in text
+            and "COLORE" in text
+            and "MATERIALE" in text
+            and "MARCHIO" in text
+        ):
+            return {"kind": "orders_history_detail", "target_group": "orders"}
         if "NEGOZIO" in text and "FORNITORE" in text:
             return {"kind": "sales_report", "target_group": "distribution"}
         if "TIPOLOGIA" in text and "MARCHIO" in text:
@@ -158,6 +165,11 @@ def _target_path(root: Path, kind: str, report_date: Optional[dt.date], season_c
             if season_code:
                 return orders_dir / f"{season_code}_prezzo_acq-ven.csv"
             return orders_dir / "prezzo_acq-ven.csv"
+        if kind == "orders_history_detail":
+            history_dir = orders_dir / "history_detail"
+            if season_code:
+                return history_dir / f"{season_code}_articoli_venduto_periodo.csv"
+            return history_dir / "unknown_articoli_venduto_periodo.csv"
         if kind in {"orders_sd_1", "orders_sd_2", "orders_sd_3", "orders_sd_4"}:
             sd_num = kind.rsplit("_", 1)[-1]
             if not season_code:
@@ -264,4 +276,3 @@ def ingest_incoming(
         writer.writerows(rows)
 
     return summary
-

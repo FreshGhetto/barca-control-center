@@ -1,7 +1,11 @@
 pandas
 numpy
 openpyxl
+xlrd
 scikit-learn
 psycopg[binary]
 fastapi
 uvicorn[standard]
+python-multipart
+requests
+Pillow

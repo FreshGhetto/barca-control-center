@@ -4,13 +4,23 @@
 - `incoming/` → cartella drop raw (`csv`/`xlsx`) per ingest automatico
 - `input/` → file mensili in ingresso (`sales_YYYY-MM.csv`, `stock_YYYY-MM.csv`)
 - `input/orders/` → (opzionale) CSV progetto ordini (`*_sd_1.csv`, `*_sd_2.csv`, `*_sd_3.csv`)
+- `input/orders/history_detail/` → (opzionale) report `ANALISI ARTICOLI` con `Raffronta con venduto nel periodo` per arricchire storico ordini con marchio, colore, materiale e venduto periodo
 - `output/` → file generati dal motore (`clean_*`, `suggested_transfers.csv`, `features_after.csv`)
 - `config/` → configurazioni (`lista-negozi.xlsx`, opzionale `lista-negozi_integrato.xlsx`)
 - `data/raw_original/` → copie archiviate dei file raw originali con nome sorgente
 
+Capacita' negozi:
+- `config/lista-negozi_integrato.xlsx` e' la configurazione usata dal motore se presente.
+- `config/shop_capacity_overrides.csv` permette di forzare negozi specifici (es. `CO`) quando il file sorgente ha righe sporche o incoerenti.
+- Per rigenerarla dai file capacita' negozi usa:
+
+```bash
+python ops/rebuild_shop_capacity_config.py
+```
+
 ## Cosa fa
 - Esegue un **ingest agent** sui raw:
-  - riconosce automaticamente il tipo file (vendite, stock, ordini sd_1/2/3/4, listini/ricarichi)
+  - riconosce automaticamente il tipo file (vendite, stock, ordini sd_1/2/3/4, listini/ricarichi, storico articoli con venduto periodo)
   - converte eventuali Excel in CSV
   - rinomina in formato standard e deposita in `input/` e `input/orders/`
   - manda i file non riconosciuti in `incoming/_quarantine`
@@ -48,6 +58,7 @@
   - `WEB` = canale online (riceve solo da M4)
 - Modulo ordini integrato (opzionale):
   - rileva automaticamente i bundle stagionali `*_sd_1/2/3.csv`
+  - usa anche i report storici `ANALISI ARTICOLI` con `Raffronta con venduto nel periodo` per arricchire `fact_order_source`
   - produce previsione acquisti **modello matematico** per stagione corrente e continuativa
   - se presenti 3 stagioni continuative e `scikit-learn` installato, calcola anche **RF + Ibrido**
   - logga tutti gli step in `output/orders/orders_run_log.txt`

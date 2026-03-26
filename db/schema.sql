@@ -177,10 +177,22 @@ CREATE TABLE IF NOT EXISTS fact_order_source (
     venduto_periodo NUMERIC(14, 2),
     giacenza NUMERIC(14, 2),
     venduto_extra NUMERIC(14, 2),
+    fascia_prezzo TEXT,
+    prezzo_listino NUMERIC(14, 2),
     prezzo_acquisto NUMERIC(14, 2),
+    prezzo_vendita NUMERIC(14, 2),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (run_id, module, season_code, article_code)
 );
+
+ALTER TABLE IF EXISTS fact_order_source
+    ADD COLUMN IF NOT EXISTS fascia_prezzo TEXT;
+
+ALTER TABLE IF EXISTS fact_order_source
+    ADD COLUMN IF NOT EXISTS prezzo_listino NUMERIC(14, 2);
+
+ALTER TABLE IF EXISTS fact_order_source
+    ADD COLUMN IF NOT EXISTS prezzo_vendita NUMERIC(14, 2);
 
 CREATE TABLE IF NOT EXISTS fact_order_source_size (
     run_id UUID NOT NULL REFERENCES etl_run(run_id) ON DELETE CASCADE,
@@ -193,6 +205,60 @@ CREATE TABLE IF NOT EXISTS fact_order_source_size (
     PRIMARY KEY (run_id, module, season_code, article_code, size)
 );
 
+CREATE TABLE IF NOT EXISTS catalog_import_file_log (
+    run_id UUID NOT NULL REFERENCES etl_run(run_id) ON DELETE CASCADE,
+    file_name TEXT NOT NULL,
+    file_role TEXT NOT NULL,
+    season_code TEXT,
+    note TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS fact_catalog_article_store_snapshot (
+    run_id UUID NOT NULL REFERENCES etl_run(run_id) ON DELETE CASCADE,
+    source_file TEXT,
+    source_sheet TEXT,
+    season_code TEXT NOT NULL,
+    season_label TEXT,
+    supplier TEXT,
+    reparto TEXT,
+    categoria TEXT,
+    tipologia TEXT,
+    article_code TEXT NOT NULL REFERENCES dim_article(article_code) ON UPDATE CASCADE,
+    description TEXT,
+    color TEXT,
+    store_code TEXT NOT NULL,
+    is_total BOOLEAN NOT NULL DEFAULT FALSE,
+    synthetic_total BOOLEAN NOT NULL DEFAULT FALSE,
+    giac NUMERIC(14, 2),
+    con NUMERIC(14, 2),
+    ven NUMERIC(14, 2),
+    perc_ven NUMERIC(14, 4),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (run_id, season_code, article_code, store_code)
+);
+
+CREATE TABLE IF NOT EXISTS fact_catalog_article_store_size_snapshot (
+    run_id UUID NOT NULL REFERENCES etl_run(run_id) ON DELETE CASCADE,
+    season_code TEXT NOT NULL,
+    article_code TEXT NOT NULL REFERENCES dim_article(article_code) ON UPDATE CASCADE,
+    store_code TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    qty NUMERIC(14, 2) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (run_id, season_code, article_code, store_code, size)
+);
+
+CREATE TABLE IF NOT EXISTS fact_catalog_price_snapshot (
+    run_id UUID NOT NULL REFERENCES etl_run(run_id) ON DELETE CASCADE,
+    season_code TEXT NOT NULL,
+    article_code TEXT NOT NULL REFERENCES dim_article(article_code) ON UPDATE CASCADE,
+    price_listino NUMERIC(14, 2),
+    price_saldo NUMERIC(14, 2),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (run_id, season_code, article_code)
+);
+
 CREATE INDEX IF NOT EXISTS idx_sales_snapshot_shop ON fact_sales_snapshot (shop_code);
 CREATE INDEX IF NOT EXISTS idx_sales_snapshot_article ON fact_sales_snapshot (article_code);
 CREATE INDEX IF NOT EXISTS idx_stock_snapshot_shop ON fact_stock_snapshot (shop_code);
@@ -203,3 +269,99 @@ CREATE INDEX IF NOT EXISTS idx_order_forecast_article ON fact_order_forecast (ar
 CREATE INDEX IF NOT EXISTS idx_order_forecast_size_article ON fact_order_forecast_size (article_code);
 CREATE INDEX IF NOT EXISTS idx_order_source_article ON fact_order_source (article_code);
 CREATE INDEX IF NOT EXISTS idx_order_source_size_article ON fact_order_source_size (article_code);
+CREATE INDEX IF NOT EXISTS idx_catalog_article_store_run_season ON fact_catalog_article_store_snapshot (run_id, season_code);
+CREATE INDEX IF NOT EXISTS idx_catalog_article_store_article ON fact_catalog_article_store_snapshot (article_code);
+CREATE INDEX IF NOT EXISTS idx_catalog_article_store_store ON fact_catalog_article_store_snapshot (store_code);
+CREATE INDEX IF NOT EXISTS idx_catalog_article_store_key_run ON fact_catalog_article_store_snapshot (season_code, article_code, store_code, run_id);
+CREATE INDEX IF NOT EXISTS idx_catalog_article_store_size_article ON fact_catalog_article_store_size_snapshot (article_code);
+CREATE INDEX IF NOT EXISTS idx_catalog_article_store_size_key_run ON fact_catalog_article_store_size_snapshot (season_code, article_code, store_code, size, run_id);
+CREATE INDEX IF NOT EXISTS idx_catalog_price_run_season ON fact_catalog_price_snapshot (run_id, season_code);
+CREATE INDEX IF NOT EXISTS idx_catalog_price_article ON fact_catalog_price_snapshot (article_code);
+CREATE INDEX IF NOT EXISTS idx_catalog_price_key_run ON fact_catalog_price_snapshot (season_code, article_code, run_id);
+CREATE INDEX IF NOT EXISTS idx_catalog_import_file_log_run ON catalog_import_file_log (run_id, file_role);
+
+CREATE OR REPLACE VIEW vw_latest_catalog_import AS
+SELECT run_id, run_type, status, started_at, finished_at, metadata
+FROM etl_run
+WHERE run_type = 'catalog_import'
+  AND status = 'completed'
+ORDER BY COALESCE(finished_at, started_at) DESC
+LIMIT 1;
+
+CREATE OR REPLACE VIEW vw_catalog_article_store_current AS
+SELECT DISTINCT ON (s.season_code, s.article_code, s.store_code)
+    s.run_id,
+    s.source_file,
+    s.source_sheet,
+    s.season_code,
+    s.season_label,
+    s.supplier,
+    s.reparto,
+    s.categoria,
+    s.tipologia,
+    s.article_code,
+    s.description,
+    s.color,
+    s.store_code,
+    s.is_total,
+    s.synthetic_total,
+    s.giac,
+    s.con,
+    s.ven,
+    s.perc_ven,
+    s.created_at
+FROM fact_catalog_article_store_snapshot s
+JOIN etl_run r
+  ON r.run_id = s.run_id
+WHERE r.run_type = 'catalog_import'
+  AND r.status = 'completed'
+ORDER BY
+    s.season_code,
+    s.article_code,
+    s.store_code,
+    COALESCE(r.finished_at, r.started_at) DESC,
+    s.created_at DESC,
+    s.run_id DESC;
+
+CREATE OR REPLACE VIEW vw_catalog_article_store_size_current AS
+SELECT DISTINCT ON (s.season_code, s.article_code, s.store_code, s.size)
+    s.run_id,
+    s.season_code,
+    s.article_code,
+    s.store_code,
+    s.size,
+    s.qty,
+    s.created_at
+FROM fact_catalog_article_store_size_snapshot s
+JOIN etl_run r
+  ON r.run_id = s.run_id
+WHERE r.run_type = 'catalog_import'
+  AND r.status = 'completed'
+ORDER BY
+    s.season_code,
+    s.article_code,
+    s.store_code,
+    s.size,
+    COALESCE(r.finished_at, r.started_at) DESC,
+    s.created_at DESC,
+    s.run_id DESC;
+
+CREATE OR REPLACE VIEW vw_catalog_price_current AS
+SELECT DISTINCT ON (p.season_code, p.article_code)
+    p.run_id,
+    p.season_code,
+    p.article_code,
+    p.price_listino,
+    p.price_saldo,
+    p.created_at
+FROM fact_catalog_price_snapshot p
+JOIN etl_run r
+  ON r.run_id = p.run_id
+WHERE r.run_type = 'catalog_import'
+  AND r.status = 'completed'
+ORDER BY
+    p.season_code,
+    p.article_code,
+    COALESCE(r.finished_at, r.started_at) DESC,
+    p.created_at DESC,
+    p.run_id DESC;

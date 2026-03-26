@@ -12,6 +12,31 @@ const state = {
   dashboardRuns: [],
   dashboardRunId: null,
   dashboardData: null,
+  catalogStatus: null,
+  catalogRows: [],
+  catalogTotal: 0,
+  catalogSelected: null,
+  catalogImportJob: null,
+  catalogImportPollTimer: null,
+  catalogShowcaseJob: null,
+  catalogShowcasePollTimer: null,
+  catalogShowcaseLoading: false,
+  catalogQueuedFiles: [],
+  catalogFileSeq: 0,
+  catalogShowcaseFilters: {
+    seasons: [],
+    reparti: [],
+    categories: [],
+    seasonSearch: "",
+    repartoSearch: "",
+    categoriaSearch: "",
+  },
+  catalogFilters: {
+    search: "",
+    season: "",
+    reparto: "",
+    categoria: "",
+  },
   dashboardTableState: {
     transfer_proposals: { sortKey: "qty", sortDir: "desc", search: "", rowLimit: 20, showAll: false },
     order_proposals: { sortKey: "totale_qty", sortDir: "desc", search: "", rowLimit: 20, showAll: false },
@@ -48,6 +73,7 @@ const el = {
   runsPageInfo: document.getElementById("runsPageInfo"),
   tabDashboard: document.getElementById("tabDashboard"),
   tabOperations: document.getElementById("tabOperations"),
+  tabCatalog: document.getElementById("tabCatalog"),
   tabData: document.getElementById("tabData"),
   tabDev: document.getElementById("tabDev"),
   viewPanels: Array.from(document.querySelectorAll(".view-panel")),
@@ -69,9 +95,11 @@ const el = {
   chartOrdersSeasonMode: document.getElementById("chartOrdersSeasonMode"),
   chartOrdersModule: document.getElementById("chartOrdersModule"),
   chartOrdersMode: document.getElementById("chartOrdersMode"),
+  chartOrdersPriceBand: document.getElementById("chartOrdersPriceBand"),
   chartCriticalByShop: document.getElementById("chartCriticalByShop"),
   chartNextCurrentCategory: document.getElementById("chartNextCurrentCategory"),
   chartNextCurrentDeltaCategory: document.getElementById("chartNextCurrentDeltaCategory"),
+  chartNextCurrentPriceBand: document.getElementById("chartNextCurrentPriceBand"),
   transferPanel: document.getElementById("transferPanel"),
   ordersPanel: document.getElementById("ordersPanel"),
   criticalPanel: document.getElementById("criticalPanel"),
@@ -112,6 +140,61 @@ const el = {
   ordersTableFocusBtn: document.getElementById("ordersTableFocusBtn"),
   criticalTableFocusBtn: document.getElementById("criticalTableFocusBtn"),
   nextCurrentTableFocusBtn: document.getElementById("nextCurrentTableFocusBtn"),
+  catalogRefreshBtn: document.getElementById("catalogRefreshBtn"),
+  catalogImportForm: document.getElementById("catalogImportForm"),
+  catalogImportSubmitBtn: document.getElementById("catalogImportSubmitBtn"),
+  catalogFiles: document.getElementById("catalogFiles"),
+  catalogDropzone: document.getElementById("catalogDropzone"),
+  catalogClearFilesBtn: document.getElementById("catalogClearFilesBtn"),
+  catalogFileQueueSummary: document.getElementById("catalogFileQueueSummary"),
+  catalogFileQueue: document.getElementById("catalogFileQueue"),
+  catalogSheet: document.getElementById("catalogSheet"),
+  catalogCreateSchema: document.getElementById("catalogCreateSchema"),
+  catalogImportMsg: document.getElementById("catalogImportMsg"),
+  catalogImportProgressBox: document.getElementById("catalogImportProgressBox"),
+  catalogImportProgressBadge: document.getElementById("catalogImportProgressBadge"),
+  catalogImportProgressFill: document.getElementById("catalogImportProgressFill"),
+  catalogImportProgressText: document.getElementById("catalogImportProgressText"),
+  catalogImportProgressMeta: document.getElementById("catalogImportProgressMeta"),
+  catalogPhotoRoot: document.getElementById("catalogPhotoRoot"),
+  catalogSaveSettingsBtn: document.getElementById("catalogSaveSettingsBtn"),
+  catalogSettingsMsg: document.getElementById("catalogSettingsMsg"),
+  catalogSummary: document.getElementById("catalogSummary"),
+  catalogSearch: document.getElementById("catalogSearch"),
+  catalogSeasonFilter: document.getElementById("catalogSeasonFilter"),
+  catalogRepartoFilter: document.getElementById("catalogRepartoFilter"),
+  catalogCategoriaFilter: document.getElementById("catalogCategoriaFilter"),
+  catalogTableBody: document.getElementById("catalogTableBody"),
+  catalogDetailBox: document.getElementById("catalogDetailBox"),
+  catalogShowcaseForm: document.getElementById("catalogShowcaseForm"),
+  catalogShowcaseSubmitBtn: document.getElementById("catalogShowcaseSubmitBtn"),
+  catalogShowcaseExportMode: document.getElementById("catalogShowcaseExportMode"),
+  catalogShowcasePrimarySource: document.getElementById("catalogShowcasePrimarySource"),
+  catalogShowcasePhotoPosition: document.getElementById("catalogShowcasePhotoPosition"),
+  catalogShowcaseAllowVariants: document.getElementById("catalogShowcaseAllowVariants"),
+  catalogShowcaseFallback: document.getElementById("catalogShowcaseFallback"),
+  catalogShowcaseSeasonStatus: document.getElementById("catalogShowcaseSeasonStatus"),
+  catalogShowcaseRepartoStatus: document.getElementById("catalogShowcaseRepartoStatus"),
+  catalogShowcaseCategoriaStatus: document.getElementById("catalogShowcaseCategoriaStatus"),
+  catalogShowcaseSeasonSearch: document.getElementById("catalogShowcaseSeasonSearch"),
+  catalogShowcaseRepartoSearch: document.getElementById("catalogShowcaseRepartoSearch"),
+  catalogShowcaseCategoriaSearch: document.getElementById("catalogShowcaseCategoriaSearch"),
+  catalogShowcaseSeasonAll: document.getElementById("catalogShowcaseSeasonAll"),
+  catalogShowcaseRepartoAll: document.getElementById("catalogShowcaseRepartoAll"),
+  catalogShowcaseCategoriaAll: document.getElementById("catalogShowcaseCategoriaAll"),
+  catalogShowcaseSeasonClear: document.getElementById("catalogShowcaseSeasonClear"),
+  catalogShowcaseRepartoClear: document.getElementById("catalogShowcaseRepartoClear"),
+  catalogShowcaseCategoriaClear: document.getElementById("catalogShowcaseCategoriaClear"),
+  catalogShowcaseSeasonOptions: document.getElementById("catalogShowcaseSeasonOptions"),
+  catalogShowcaseRepartoOptions: document.getElementById("catalogShowcaseRepartoOptions"),
+  catalogShowcaseCategoriaOptions: document.getElementById("catalogShowcaseCategoriaOptions"),
+  catalogShowcaseManualCodes: document.getElementById("catalogShowcaseManualCodes"),
+  catalogShowcaseMsg: document.getElementById("catalogShowcaseMsg"),
+  catalogShowcaseProgressBox: document.getElementById("catalogShowcaseProgressBox"),
+  catalogShowcaseProgressBadge: document.getElementById("catalogShowcaseProgressBadge"),
+  catalogShowcaseProgressFill: document.getElementById("catalogShowcaseProgressFill"),
+  catalogShowcaseProgressText: document.getElementById("catalogShowcaseProgressText"),
+  catalogShowcaseProgressMeta: document.getElementById("catalogShowcaseProgressMeta"),
 };
 
 const DASHBOARD_TABLE_CONFIG = {
@@ -142,8 +225,19 @@ const DASHBOARD_TABLE_CONFIG = {
     infoEl: el.ordersTableInfo,
     exportCsvEl: el.ordersExportCsvBtn,
     exportXlsxEl: el.ordersExportXlsxBtn,
-    columns: ["module", "season_code", "mode", "article_code", "totale_qty", "predizione_vendite", "budget_acquisto"],
-    numericColumns: ["totale_qty", "predizione_vendite", "budget_acquisto"],
+    columns: [
+      "module",
+      "season_code",
+      "mode",
+      "article_code",
+      "fascia_prezzo",
+      "prezzo_listino",
+      "prezzo_vendita",
+      "totale_qty",
+      "predizione_vendite",
+      "budget_acquisto",
+    ],
+    numericColumns: ["prezzo_listino", "prezzo_vendita", "totale_qty", "predizione_vendite", "budget_acquisto"],
   },
   critical_articles: {
     key: "critical_articles",
@@ -175,11 +269,13 @@ const DASHBOARD_TABLE_CONFIG = {
     columns: [
       "from_cont_season",
       "article_code",
+      "fascia_prezzo",
       "categoria",
       "tipologia",
       "marchio",
       "colore",
       "materiale",
+      "prezzo_vendita",
       "venduto_periodo",
       "giacenza",
       "applied_factor",
@@ -189,6 +285,7 @@ const DASHBOARD_TABLE_CONFIG = {
       "transition_score",
     ],
     numericColumns: [
+      "prezzo_vendita",
       "venduto_periodo",
       "giacenza",
       "applied_factor",
@@ -283,6 +380,435 @@ function fmtFactor(v, digits = 2) {
   const n = Number(v);
   if (!Number.isFinite(n)) return "--";
   return `${fmtNum(n, digits)}x`;
+}
+
+function catalogFileFingerprint(file) {
+  return [
+    String(file?.name || "").trim().toLowerCase(),
+    Number(file?.size || 0),
+    Number(file?.lastModified || 0),
+  ].join("::");
+}
+
+function classifyCatalogQueuedFile(file) {
+  const name = String(file?.name || "").trim();
+  const lower = name.toLowerCase();
+  if (lower.endsWith(".xls") || lower.endsWith(".xlsx")) {
+    return {
+      label: "Excel catalogo",
+      hint: "Parse articoli e stock per negozio",
+      tone: "excel",
+    };
+  }
+  if (lower.endsWith(".csv")) {
+    return {
+      label: "CSV prezzi",
+      hint: "Listino o saldo riconosciuti automaticamente",
+      tone: "csv",
+    };
+  }
+  return {
+    label: "Non supportato",
+    hint: "Usa solo file .xls, .xlsx o .csv",
+    tone: "invalid",
+  };
+}
+
+function setCatalogImportMessage(message, { isError = false, isHtml = false } = {}) {
+  if (!el.catalogImportMsg) return;
+  el.catalogImportMsg.classList.toggle("error-text", !!isError);
+  if (isHtml) {
+    el.catalogImportMsg.innerHTML = message || "";
+    return;
+  }
+  el.catalogImportMsg.textContent = message || "";
+}
+
+function isCatalogImportActive(job = state.catalogImportJob) {
+  return !!job && ["queued", "running"].includes(String(job.status || "").toLowerCase());
+}
+
+function clearCatalogImportPoller() {
+  if (state.catalogImportPollTimer) {
+    window.clearTimeout(state.catalogImportPollTimer);
+    state.catalogImportPollTimer = null;
+  }
+}
+
+function catalogImportStatusLabel(status) {
+  return (
+    {
+      queued: "In coda",
+      running: "In corso",
+      success: "Completato",
+      failed: "Errore",
+    }[String(status || "").toLowerCase()] || "Stato"
+  );
+}
+
+function catalogImportStageLabel(stage) {
+  return (
+    {
+      queued: "In attesa",
+      starting: "Avvio",
+      schema: "Schema DB",
+      parsing_excel: "Parsing Excel",
+      parsing_price: "Parsing CSV prezzi",
+      preparing_rows: "Preparazione dati",
+      writing_dim_shop: "Scrittura negozi",
+      writing_dim_article: "Scrittura articoli",
+      writing_store_snapshot: "Snapshot articoli/negozi",
+      writing_size_snapshot: "Snapshot taglie",
+      writing_price_snapshot: "Scrittura prezzi",
+      writing_file_log: "Log import",
+      external_running: "Import backend in corso",
+      completed: "Completato",
+      failed: "Errore",
+    }[String(stage || "").toLowerCase()] || (stage || "Import")
+  );
+}
+
+function renderCatalogImportJob(job) {
+  state.catalogImportJob = job || null;
+  const locked = isCatalogImportActive(job) || String(job?.status || "").toLowerCase() === "running";
+
+  if (el.catalogImportSubmitBtn) {
+    el.catalogImportSubmitBtn.disabled = !!locked;
+    el.catalogImportSubmitBtn.textContent = locked ? "Import in corso..." : "Importa Catalogo nel DB";
+  }
+  if (el.catalogFiles) el.catalogFiles.disabled = !!locked;
+  if (el.catalogSheet) el.catalogSheet.disabled = !!locked;
+  if (el.catalogCreateSchema) el.catalogCreateSchema.disabled = !!locked;
+  if (el.catalogDropzone) el.catalogDropzone.classList.toggle("disabled", !!locked);
+
+  renderCatalogQueuedFiles();
+
+  if (!el.catalogImportProgressBox || !el.catalogImportProgressFill || !el.catalogImportProgressText || !el.catalogImportProgressMeta) {
+    return;
+  }
+  if (!job) {
+    el.catalogImportProgressBox.classList.add("hidden");
+    return;
+  }
+
+  el.catalogImportProgressBox.classList.remove("hidden");
+  if (el.catalogImportProgressBadge) {
+    const statusKey = String(job.status || "queued").toLowerCase();
+    el.catalogImportProgressBadge.textContent = catalogImportStatusLabel(statusKey);
+    el.catalogImportProgressBadge.className = `catalog-import-badge ${statusKey}`;
+  }
+
+  const progressValue = Number(job.progress || 0);
+  const pct = Number.isFinite(progressValue) ? Math.max(0, Math.min(100, progressValue)) : 0;
+  el.catalogImportProgressFill.style.width = `${pct}%`;
+  el.catalogImportProgressText.textContent = [catalogImportStageLabel(job.stage), job.message].filter(Boolean).join(" · ");
+
+  const meta = [];
+  const classification = job.classification || {};
+  if (classification.excel_count != null || classification.price_count != null) {
+    meta.push(`${fmtNum(classification.excel_count || 0, 0)} Excel`);
+    meta.push(`${fmtNum(classification.price_count || 0, 0)} CSV prezzi`);
+  }
+  if (job.file_name) meta.push(`File: ${job.file_name}`);
+  if (job.current && job.total) meta.push(`File fase: ${job.current}/${job.total}`);
+  if (job.rows_done && job.rows_total) meta.push(`Righe DB: ${fmtNum(job.rows_done, 0)}/${fmtNum(job.rows_total, 0)}`);
+  if (job.run_id) meta.push(`Run DB: #${shortRunCode(job.run_id)}`);
+  if (job.started_at) meta.push(`Avvio: ${fmtDateCompact(job.started_at)}`);
+  if (job.ended_at) meta.push(`Fine: ${fmtDateCompact(job.ended_at)}`);
+  if (job.error) meta.push(`Errore: ${job.error}`);
+  el.catalogImportProgressMeta.innerHTML = meta.map((item) => `<span>${escHtml(item)}</span>`).join("");
+}
+
+function isCatalogShowcaseActive(job = state.catalogShowcaseJob) {
+  return !!job && ["queued", "running"].includes(String(job.status || "").toLowerCase());
+}
+
+function clearCatalogShowcasePoller() {
+  if (state.catalogShowcasePollTimer) {
+    window.clearTimeout(state.catalogShowcasePollTimer);
+    state.catalogShowcasePollTimer = null;
+  }
+}
+
+function catalogShowcaseStageLabel(stage) {
+  return (
+    {
+      queued: "In attesa",
+      starting: "Avvio",
+      loading_catalog: "Lettura catalogo",
+      filtering_articles: "Selezione articoli",
+      indexing_local_images: "Indicizzazione foto",
+      preparing_export: "Preparazione export",
+      rendering_articles: "Generazione articoli",
+      building_html: "Composizione HTML",
+      writing_reports: "Scrittura report",
+      creating_zip: "Creazione ZIP",
+      completed: "Completato",
+      failed: "Errore",
+    }[String(stage || "").toLowerCase()] || (stage || "Catalogo vetrina")
+  );
+}
+
+function renderCatalogShowcaseJob(job) {
+  if (!job) {
+    const shouldClear = !state.catalogShowcaseJob || isCatalogShowcaseActive(state.catalogShowcaseJob);
+    if (!shouldClear) return;
+    state.catalogShowcaseJob = null;
+    renderCatalogShowcaseProgress({ visible: false });
+    return;
+  }
+
+  state.catalogShowcaseJob = job;
+  const statusKey = String(job.status || "queued").toLowerCase();
+  const progressValue = Number(job.progress || 0);
+  const pct = Number.isFinite(progressValue) ? Math.max(0, Math.min(100, progressValue)) : 0;
+  const filters = job.filters || {};
+  const details = [];
+  const selectedSeasons = Array.isArray(filters.selected_seasons) ? filters.selected_seasons : [];
+  const selectedReparti = Array.isArray(filters.selected_reparti) ? filters.selected_reparti : [];
+  const selectedCategories = Array.isArray(filters.selected_categories) ? filters.selected_categories : [];
+  const selectedSuppliers = Array.isArray(filters.selected_suppliers) ? filters.selected_suppliers : [];
+
+  details.push(job.primary_source === "local" ? "Sorgente foto: archivio locale" : "Sorgente foto: sito BARCA");
+  details.push(`Formato: ${String(job.export_mode || "both").toUpperCase()}`);
+  if (job.requested != null) details.push(`Articoli selezionati: ${fmtNum(job.requested || 0, 0)}`);
+  if (job.current && job.total) details.push(`Articoli elaborati: ${fmtNum(job.current, 0)}/${fmtNum(job.total, 0)}`);
+  if (job.current_article) {
+    const seasonPrefix = job.current_season ? `${job.current_season} • ` : "";
+    details.push(`In lavorazione: ${seasonPrefix}${job.current_article}`);
+  }
+  details.push(`${fmtNum(job.exported_html_images || 0, 0)} immagini HTML`);
+  details.push(`${fmtNum(job.exported_jpg || 0, 0)} JPG`);
+  details.push(`${fmtNum(job.used_local || 0, 0)} foto locali`);
+  if (job.used_web) details.push(`${fmtNum(job.used_web || 0, 0)} foto web`);
+  if (job.missing_images) details.push(`${fmtNum(job.missing_images || 0, 0)} foto mancanti`);
+  if (selectedSeasons.length) details.push(`${selectedSeasons.length} stagioni`);
+  if (selectedReparti.length) details.push(`${selectedReparti.length} reparti`);
+  if (selectedCategories.length) details.push(`${selectedCategories.length} categorie`);
+  if (selectedSuppliers.length) details.push(`${selectedSuppliers.length} fornitori`);
+  if (job.started_at) details.push(`Avvio: ${fmtDateCompact(job.started_at)}`);
+  if (job.ended_at) details.push(`Fine: ${fmtDateCompact(job.ended_at)}`);
+  if (job.error) details.push(`Errore: ${job.error}`);
+
+  renderCatalogShowcaseProgress({
+    visible: true,
+    status: statusKey,
+    message: [catalogShowcaseStageLabel(job.stage), `${fmtNum(pct, 0)}%`, job.message].filter(Boolean).join(" · "),
+    details,
+    indeterminate: false,
+    progress: pct,
+  });
+}
+
+function renderCatalogShowcaseTerminalMessage(job) {
+  if (!job) return;
+  const status = String(job.status || "").toLowerCase();
+  if (status === "success") {
+    const summary = job.summary || {};
+    const links = [
+      job?.download_url
+        ? `<a href="${escHtml(job.download_url)}" target="_blank" rel="noopener">Scarica ZIP</a>`
+        : "",
+      job?.html_preview_url
+        ? `<a href="${escHtml(job.html_preview_url)}" target="_blank" rel="noopener">Apri HTML</a>`
+        : "",
+    ].filter(Boolean);
+    const html = [
+      `Generazione completata: ${fmtNum(summary.requested || 0, 0)} articoli richiesti, `,
+      `${fmtNum(summary.exported_jpg || 0, 0)} JPG, `,
+      `${fmtNum(summary.exported_html_images || 0, 0)} immagini HTML, `,
+      `${fmtNum(summary.missing_images || 0, 0)} foto mancanti.`,
+      links.length ? ` <span class="catalog-showcase-links">${links.join(" · ")}</span>` : "",
+      summary.article_source_note
+        ? `<span class="catalog-showcase-note">${escHtml(summary.article_source_note)}</span>`
+        : "",
+    ].join("");
+    setCatalogShowcaseMessage(html, { isHtml: true });
+    return;
+  }
+  if (status === "failed") {
+    setCatalogShowcaseMessage(
+      `Errore catalogo vetrina: ${job?.error || job?.message || "errore sconosciuto"}`,
+      { isError: true },
+    );
+  }
+}
+
+async function refreshLatestCatalogShowcaseJob() {
+  try {
+    const out = await api("/api/catalog/showcase/jobs/latest");
+    const job = out?.job || null;
+    if (job) {
+      renderCatalogShowcaseJob(job);
+      renderCatalogShowcaseTerminalMessage(job);
+      return job;
+    }
+  } catch {}
+  return null;
+}
+
+function renderCatalogQueuedFiles() {
+  if (!el.catalogFileQueue || !el.catalogFileQueueSummary) return;
+  const items = state.catalogQueuedFiles || [];
+  const locked = isCatalogImportActive();
+  const excelCount = items.filter((item) => item.kind?.tone === "excel").length;
+  const csvCount = items.filter((item) => item.kind?.tone === "csv").length;
+  const totalBytes = items.reduce((sum, item) => sum + Number(item.file?.size || 0), 0);
+
+  el.catalogFileQueueSummary.innerHTML = items.length
+    ? `
+      <div class="catalog-file-summary-pills">
+        <span class="catalog-file-summary-pill">${escHtml(String(items.length))} file</span>
+        <span class="catalog-file-summary-pill">${escHtml(String(excelCount))} Excel</span>
+        <span class="catalog-file-summary-pill">${escHtml(String(csvCount))} CSV</span>
+        <span class="catalog-file-summary-pill">${escHtml(fmtBytes(totalBytes))}</span>
+      </div>
+      <div class="catalog-file-summary-note">
+        Se scegli altri file da un'altra cartella, verranno aggiunti a questa coda.
+      </div>
+    `
+    : `
+      <div class="catalog-file-summary-note">
+        Nessun file in coda. Aggiungi uno o più export del gestionale per iniziare.
+      </div>
+    `;
+
+  if (!items.length) {
+    el.catalogFileQueue.innerHTML = `
+      <div class="catalog-file-empty">
+        Nessun file selezionato. La coda resta attiva finché non importi o la svuoti manualmente.
+      </div>
+    `;
+    if (el.catalogClearFilesBtn) el.catalogClearFilesBtn.disabled = true;
+    return;
+  }
+
+  el.catalogFileQueue.innerHTML = items
+    .map((item) => {
+      const file = item.file || {};
+      const kind = item.kind || {};
+      const modifiedAt =
+        Number.isFinite(Number(file.lastModified)) && Number(file.lastModified) > 0
+          ? fmtDateCompact(file.lastModified)
+          : "--";
+      const disabledAttr = locked ? "disabled" : "";
+      return `
+        <article class="catalog-file-card">
+          <div class="catalog-file-main">
+            <div class="catalog-file-name">${escHtml(file.name || "--")}</div>
+            <div class="catalog-file-meta">
+              <span class="catalog-file-kind ${escHtml(kind.tone || "generic")}">${escHtml(kind.label || "File")}</span>
+              <span>${escHtml(fmtBytes(file.size))}</span>
+              <span>${escHtml(modifiedAt)}</span>
+            </div>
+            <div class="catalog-file-hint">${escHtml(kind.hint || "")}</div>
+          </div>
+          <button type="button" class="catalog-file-remove" data-remove-catalog-file="${escHtml(item.id)}" aria-label="Rimuovi file" ${disabledAttr}>
+            ×
+          </button>
+        </article>
+      `;
+    })
+    .join("");
+
+  if (el.catalogClearFilesBtn) el.catalogClearFilesBtn.disabled = locked || items.length === 0;
+}
+
+function clearCatalogQueuedFiles({ clearMessage = false } = {}) {
+  state.catalogQueuedFiles = [];
+  renderCatalogQueuedFiles();
+  if (el.catalogFiles) {
+    el.catalogFiles.value = "";
+  }
+  if (clearMessage) {
+    setCatalogImportMessage("");
+  }
+}
+
+function removeCatalogQueuedFile(fileId) {
+  state.catalogQueuedFiles = (state.catalogQueuedFiles || []).filter((item) => item.id !== fileId);
+  renderCatalogQueuedFiles();
+}
+
+function appendCatalogQueuedFiles(fileList) {
+  if (isCatalogImportActive()) return;
+  const incoming = Array.from(fileList || []);
+  if (!incoming.length) return;
+
+  let added = 0;
+  let duplicates = 0;
+  let skipped = 0;
+  const existing = new Set((state.catalogQueuedFiles || []).map((item) => item.fingerprint));
+
+  incoming.forEach((file) => {
+    const kind = classifyCatalogQueuedFile(file);
+    if (kind.tone === "invalid") {
+      skipped += 1;
+      return;
+    }
+    const fingerprint = catalogFileFingerprint(file);
+    if (existing.has(fingerprint)) {
+      duplicates += 1;
+      return;
+    }
+    state.catalogFileSeq += 1;
+    state.catalogQueuedFiles.push({
+      id: `catalog_file_${state.catalogFileSeq}`,
+      fingerprint,
+      file,
+      kind,
+    });
+    existing.add(fingerprint);
+    added += 1;
+  });
+
+  renderCatalogQueuedFiles();
+  if (el.catalogFiles) {
+    el.catalogFiles.value = "";
+  }
+
+  const msgParts = [];
+  if (added) msgParts.push(`aggiunti ${added}`);
+  if (duplicates) msgParts.push(`saltati ${duplicates} duplicati`);
+  if (skipped) msgParts.push(`ignorati ${skipped} non supportati`);
+  if (msgParts.length) {
+    setCatalogImportMessage(`Coda file aggiornata: ${msgParts.join(", ")}.`);
+  }
+}
+
+function handleCatalogFileSelection() {
+  appendCatalogQueuedFiles(el.catalogFiles?.files || []);
+}
+
+function bindCatalogDropzone() {
+  if (!el.catalogDropzone) return;
+  const activate = (on) => el.catalogDropzone.classList.toggle("dragover", !!on);
+  el.catalogDropzone.addEventListener("click", (evt) => {
+    if (isCatalogImportActive()) return;
+    if (evt.target?.closest?.(".catalog-dropzone-btn")) return;
+    el.catalogFiles?.click();
+  });
+  el.catalogDropzone.addEventListener("keydown", (evt) => {
+    if (isCatalogImportActive()) return;
+    if (evt.key !== "Enter" && evt.key !== " ") return;
+    evt.preventDefault();
+    el.catalogFiles?.click();
+  });
+  ["dragenter", "dragover"].forEach((eventName) => {
+    el.catalogDropzone.addEventListener(eventName, (evt) => {
+      evt.preventDefault();
+      activate(true);
+    });
+  });
+  ["dragleave", "dragend"].forEach((eventName) => {
+    el.catalogDropzone.addEventListener(eventName, () => activate(false));
+  });
+  el.catalogDropzone.addEventListener("drop", (evt) => {
+    evt.preventDefault();
+    activate(false);
+    if (isCatalogImportActive()) return;
+    appendCatalogQueuedFiles(evt.dataTransfer?.files || []);
+  });
 }
 
 function unitBadgeLabel(unit) {
@@ -851,17 +1377,17 @@ function renderDashboardKpis(kpis, kpiDeltas = {}) {
 
   cards.push({
     key: "season_qty_delta_pct",
-    label: "Trend ultima stagione",
+    label: "Trend coppia stagionale",
     unit: "percent",
-    description: "Variazione del volume della stagione più recente rispetto alla precedente.",
+    description: "Variazione del volume della coppia stagionale più recente rispetto alla stessa coppia dell'anno precedente.",
     value:
       kpis.season_qty_delta_pct == null
         ? "--"
         : `${Number(kpis.season_qty_delta_pct) > 0 ? "+" : ""}${fmtPercentValue(kpis.season_qty_delta_pct, 1)}`,
     seasonalText:
       kpis.season_latest_code && kpis.season_prev_code
-        ? `stg ${kpis.season_latest_code} vs ${kpis.season_prev_code}`
-        : "stagioni insufficienti",
+        ? `${kpis.season_latest_code} vs ${kpis.season_prev_code}`
+        : "storia stagionale insufficiente",
   });
 
   el.dashboardKpis.innerHTML = cards
@@ -1050,6 +1576,7 @@ function formatDashboardCellValue(tableKey, key, raw, row) {
     if (key === "module") return friendlyModuleLabel(raw);
     if (key === "season_code") return friendlySeasonLabel(raw, row?.module || null);
     if (key === "mode") return friendlyModeLabel(raw);
+    if (key === "prezzo_listino" || key === "prezzo_vendita") return fmtCurrency(raw, 2);
     if (key === "totale_qty" || key === "predizione_vendite") return fmtPairs(raw, 2);
     if (key === "budget_acquisto") return fmtCurrency(raw, 2);
     return fmt(raw);
@@ -1062,6 +1589,7 @@ function formatDashboardCellValue(tableKey, key, raw, row) {
 
   if (tableKey === "next_current_candidates") {
     if (key === "from_cont_season") return friendlySeasonLabel(raw, "continuativa");
+    if (key === "prezzo_vendita") return fmtCurrency(raw, 2);
     if (key === "venduto_periodo" || key === "giacenza" || key === "predicted_current_qty" || key === "delta_vs_stock") return fmtPairs(raw, 2);
     if (key === "predicted_budget") return fmtCurrency(raw, 2);
     if (key === "applied_factor") return fmtFactor(raw, 2);
@@ -1339,7 +1867,36 @@ async function api(url, options = {}) {
 async function loadSettings() {
   const settings = await api("/api/settings");
   state.developerMode = !!settings.developer_mode;
+  if (el.catalogPhotoRoot) {
+    el.catalogPhotoRoot.value = settings.catalog_photo_root || "";
+  }
+  if (el.catalogSettingsMsg) {
+    el.catalogSettingsMsg.textContent = settings.catalog_photo_root
+      ? `Percorso attuale: ${settings.catalog_photo_root}`
+      : "Percorso foto non impostato.";
+  }
   renderDeveloperMode();
+}
+
+async function saveCatalogSettings() {
+  if (!el.catalogSettingsMsg) return;
+  el.catalogSettingsMsg.textContent = "Salvataggio impostazioni catalogo...";
+  try {
+    const out = await api("/api/settings/catalog", {
+      method: "POST",
+      body: JSON.stringify({
+        catalog_photo_root: el.catalogPhotoRoot?.value?.trim() || "",
+      }),
+    });
+    if (el.catalogPhotoRoot) {
+      el.catalogPhotoRoot.value = out.catalog_photo_root || "";
+    }
+    el.catalogSettingsMsg.textContent = out.catalog_photo_root
+      ? `Percorso foto salvato: ${out.catalog_photo_root}`
+      : "Percorso foto catalogo rimosso.";
+  } catch (err) {
+    el.catalogSettingsMsg.textContent = `Errore impostazioni catalogo: ${err.message}`;
+  }
 }
 
 function renderDeveloperMode() {
@@ -1491,6 +2048,688 @@ async function refreshOutputs() {
   }
 }
 
+function renderCatalogSummary(status) {
+  if (!el.catalogSummary) return;
+  if (!status?.available) {
+    el.catalogSummary.innerHTML = `
+      <article class="catalog-summary-card">
+        <span class="catalog-summary-label">Catalogo</span>
+        <strong class="catalog-summary-value">Non disponibile</strong>
+        <span class="catalog-summary-note">${escHtml(status?.reason || "Nessuna importazione catalogo disponibile.")}</span>
+      </article>
+    `;
+    return;
+  }
+
+  const run = status.run || {};
+  const counts = status.counts || {};
+  const seasonCount = Array.isArray(status?.facets?.seasons) ? status.facets.seasons.length : 0;
+  el.catalogSummary.innerHTML = [
+    {
+      label: "Ultima importazione",
+      value: run.run_id ? `#${shortRunCode(run.run_id)}` : "--",
+      note: run.finished_at ? `fine ${fmtDate(run.finished_at)}` : "run catalogo più recente",
+    },
+    {
+      label: "Stagioni",
+      value: fmtNum(seasonCount, 0),
+      note: seasonCount ? `${(status.facets.seasons || []).join(", ")}` : "nessuna stagione",
+    },
+    {
+      label: "Articoli",
+      value: fmtNum(counts.articles, 0),
+      note: "righe articolo (XX) nello stato corrente del catalogo",
+    },
+    {
+      label: "Prezzi",
+      value: fmtNum(counts.prices, 0),
+      note: "articoli con prezzo listino/saldo importati",
+    },
+  ]
+    .map(
+      (card) => `
+        <article class="catalog-summary-card">
+          <span class="catalog-summary-label">${escHtml(card.label)}</span>
+          <strong class="catalog-summary-value">${escHtml(card.value)}</strong>
+          <span class="catalog-summary-note">${escHtml(card.note)}</span>
+        </article>
+      `,
+    )
+    .join("");
+}
+
+function catalogShowcaseFilterMeta(group) {
+  return (
+    {
+      seasons: {
+        searchKey: "seasonSearch",
+        optionsEl: el.catalogShowcaseSeasonOptions,
+        statusEl: el.catalogShowcaseSeasonStatus,
+        allLabel: "Tutte le stagioni incluse",
+        emptySearchLabel: "Nessuna stagione trovata con questo filtro.",
+      },
+      reparti: {
+        searchKey: "repartoSearch",
+        optionsEl: el.catalogShowcaseRepartoOptions,
+        statusEl: el.catalogShowcaseRepartoStatus,
+        allLabel: "Tutti i reparti inclusi",
+        emptySearchLabel: "Nessun reparto trovato con questo filtro.",
+      },
+      categories: {
+        searchKey: "categoriaSearch",
+        optionsEl: el.catalogShowcaseCategoriaOptions,
+        statusEl: el.catalogShowcaseCategoriaStatus,
+        allLabel: "Tutte le categorie incluse",
+        emptySearchLabel: "Nessuna categoria trovata con questo filtro.",
+      },
+    }[group] || null
+  );
+}
+
+function normalizeCatalogShowcaseItems(items) {
+  return Array.isArray(items)
+    ? items.map((item) => String(item || "").trim()).filter((item) => item)
+    : [];
+}
+
+function getCatalogShowcaseAvailableItems(group, facets = state.catalogStatus?.facets || {}) {
+  if (group === "seasons") return normalizeCatalogShowcaseItems(facets?.seasons);
+  if (group === "reparti") return normalizeCatalogShowcaseItems(facets?.reparti);
+  if (group === "categories") return normalizeCatalogShowcaseItems(facets?.categorie);
+  return [];
+}
+
+function pruneCatalogShowcaseSelections(facets) {
+  ["seasons", "reparti", "categories"].forEach((group) => {
+    const available = new Set(getCatalogShowcaseAvailableItems(group, facets));
+    state.catalogShowcaseFilters[group] = (state.catalogShowcaseFilters[group] || []).filter((item) => available.has(item));
+  });
+}
+
+function setCatalogShowcaseFilterStatus(group, selectedCount, totalCount) {
+  const meta = catalogShowcaseFilterMeta(group);
+  if (!meta?.statusEl) return;
+  if (!totalCount) {
+    meta.statusEl.textContent = "Nessuna voce disponibile";
+    return;
+  }
+  if (!selectedCount) {
+    meta.statusEl.textContent = meta.allLabel;
+    return;
+  }
+  if (selectedCount === totalCount) {
+    meta.statusEl.textContent = `Tutte le ${totalCount} voci selezionate`;
+    return;
+  }
+  meta.statusEl.textContent = `${selectedCount} selezionate su ${totalCount}`;
+}
+
+function renderCatalogShowcaseFilterGroup(group, items) {
+  const meta = catalogShowcaseFilterMeta(group);
+  if (!meta?.optionsEl) return;
+  const selected = state.catalogShowcaseFilters[group] || [];
+  const selectedSet = new Set(selected);
+  const searchTerm = normalizeText(state.catalogShowcaseFilters[meta.searchKey] || "");
+  const visibleItems = items.filter((item) => !searchTerm || normalizeText(item).includes(searchTerm));
+
+  setCatalogShowcaseFilterStatus(group, selected.length, items.length);
+
+  if (!items.length) {
+    meta.optionsEl.innerHTML = `<div class="catalog-filter-empty">Nessuna voce disponibile.</div>`;
+    return;
+  }
+
+  if (!visibleItems.length) {
+    meta.optionsEl.innerHTML = `<div class="catalog-filter-empty">${escHtml(meta.emptySearchLabel)}</div>`;
+    return;
+  }
+
+  meta.optionsEl.innerHTML = visibleItems
+    .map((item) => {
+      const active = selectedSet.has(item);
+      return `
+        <button
+          type="button"
+          class="catalog-filter-option ${active ? "active" : ""}"
+          data-showcase-filter-group="${escHtml(group)}"
+          data-showcase-filter-value="${escHtml(item)}"
+          aria-pressed="${active ? "true" : "false"}"
+        >
+          <span class="catalog-filter-option-check">${active ? "✓" : ""}</span>
+          <span class="catalog-filter-option-label">${escHtml(item)}</span>
+        </button>
+      `;
+    })
+    .join("");
+}
+
+function renderCatalogShowcaseFilters(facets) {
+  pruneCatalogShowcaseSelections(facets);
+  renderCatalogShowcaseFilterGroup("seasons", getCatalogShowcaseAvailableItems("seasons", facets));
+  renderCatalogShowcaseFilterGroup("reparti", getCatalogShowcaseAvailableItems("reparti", facets));
+  renderCatalogShowcaseFilterGroup("categories", getCatalogShowcaseAvailableItems("categories", facets));
+}
+
+function toggleCatalogShowcaseFilterValue(group, value) {
+  const raw = String(value || "").trim();
+  if (!raw) return;
+  const current = new Set(state.catalogShowcaseFilters[group] || []);
+  if (current.has(raw)) current.delete(raw);
+  else current.add(raw);
+  state.catalogShowcaseFilters[group] = Array.from(current).sort((a, b) => a.localeCompare(b, "it"));
+  renderCatalogShowcaseFilters(state.catalogStatus?.facets || {});
+}
+
+function setCatalogShowcaseFilterSelection(group, values) {
+  state.catalogShowcaseFilters[group] = normalizeCatalogShowcaseItems(values).sort((a, b) => a.localeCompare(b, "it"));
+  renderCatalogShowcaseFilters(state.catalogStatus?.facets || {});
+}
+
+function setCatalogShowcaseFilterSearch(group, value) {
+  const meta = catalogShowcaseFilterMeta(group);
+  if (!meta) return;
+  state.catalogShowcaseFilters[meta.searchKey] = String(value || "");
+  renderCatalogShowcaseFilters(state.catalogStatus?.facets || {});
+}
+
+function resetCatalogShowcaseFilter(group) {
+  const meta = catalogShowcaseFilterMeta(group);
+  if (!meta) return;
+  state.catalogShowcaseFilters[group] = [];
+  state.catalogShowcaseFilters[meta.searchKey] = "";
+  if (group === "seasons" && el.catalogShowcaseSeasonSearch) el.catalogShowcaseSeasonSearch.value = "";
+  if (group === "reparti" && el.catalogShowcaseRepartoSearch) el.catalogShowcaseRepartoSearch.value = "";
+  if (group === "categories" && el.catalogShowcaseCategoriaSearch) el.catalogShowcaseCategoriaSearch.value = "";
+  renderCatalogShowcaseFilters(state.catalogStatus?.facets || {});
+}
+
+function setCatalogShowcaseMessage(message, { isError = false, isHtml = false } = {}) {
+  if (!el.catalogShowcaseMsg) return;
+  el.catalogShowcaseMsg.classList.toggle("error-text", !!isError);
+  if (isHtml) {
+    el.catalogShowcaseMsg.innerHTML = message || "";
+    return;
+  }
+  el.catalogShowcaseMsg.textContent = message || "";
+}
+
+function renderCatalogShowcaseProgress({
+  visible = false,
+  status = "queued",
+  message = "",
+  details = [],
+  indeterminate = false,
+  progress = null,
+} = {}) {
+  const statusKey = String(status || "queued").toLowerCase();
+  state.catalogShowcaseLoading = visible && ["queued", "running"].includes(statusKey);
+  if (el.catalogShowcaseSubmitBtn) {
+    el.catalogShowcaseSubmitBtn.disabled = state.catalogShowcaseLoading;
+    el.catalogShowcaseSubmitBtn.textContent = state.catalogShowcaseLoading
+      ? "Generazione in corso..."
+      : "Genera Catalogo Vetrina";
+  }
+
+  if (
+    !el.catalogShowcaseProgressBox ||
+    !el.catalogShowcaseProgressBadge ||
+    !el.catalogShowcaseProgressFill ||
+    !el.catalogShowcaseProgressText ||
+    !el.catalogShowcaseProgressMeta
+  ) {
+    return;
+  }
+
+  if (!visible) {
+    el.catalogShowcaseProgressBox.classList.add("hidden");
+    el.catalogShowcaseProgressFill.className = "catalog-import-progress-fill";
+    el.catalogShowcaseProgressFill.style.width = "0%";
+    el.catalogShowcaseProgressMeta.innerHTML = "";
+    return;
+  }
+
+  el.catalogShowcaseProgressBox.classList.remove("hidden");
+  el.catalogShowcaseProgressBadge.textContent = catalogImportStatusLabel(statusKey);
+  el.catalogShowcaseProgressBadge.className = `catalog-import-badge ${statusKey}`;
+
+  const fillClasses = ["catalog-import-progress-fill"];
+  if (indeterminate) fillClasses.push("indeterminate");
+  if (statusKey === "success") fillClasses.push("success");
+  if (statusKey === "failed") fillClasses.push("failed");
+  el.catalogShowcaseProgressFill.className = fillClasses.join(" ");
+  const pct = Number.isFinite(Number(progress)) ? Math.max(0, Math.min(100, Number(progress))) : statusKey === "success" ? 100 : 0;
+  el.catalogShowcaseProgressFill.style.width = indeterminate ? "42%" : `${pct}%`;
+  el.catalogShowcaseProgressText.textContent = message || "Generazione catalogo vetrina";
+  el.catalogShowcaseProgressMeta.innerHTML = (Array.isArray(details) ? details : [])
+    .filter(Boolean)
+    .map((item) => `<span>${escHtml(item)}</span>`)
+    .join("");
+}
+
+function renderCatalogFilters(facets) {
+  const seasonValue = state.catalogFilters.season || "";
+  const repartoValue = state.catalogFilters.reparto || "";
+  const categoriaValue = state.catalogFilters.categoria || "";
+  const seasons = Array.isArray(facets?.seasons) ? facets.seasons : [];
+  const reparti = Array.isArray(facets?.reparti) ? facets.reparti : [];
+  const categorie = Array.isArray(facets?.categorie) ? facets.categorie : [];
+  if (el.catalogSeasonFilter) {
+    el.catalogSeasonFilter.innerHTML =
+      `<option value="">Stagione: tutte</option>` +
+      seasons.map((item) => `<option value="${escHtml(item)}">${escHtml(item)}</option>`).join("");
+    el.catalogSeasonFilter.value = seasons.includes(seasonValue) ? seasonValue : "";
+    state.catalogFilters.season = el.catalogSeasonFilter.value || "";
+  }
+  if (el.catalogRepartoFilter) {
+    el.catalogRepartoFilter.innerHTML =
+      `<option value="">Reparto: tutti</option>` +
+      reparti.map((item) => `<option value="${escHtml(item)}">${escHtml(item)}</option>`).join("");
+    el.catalogRepartoFilter.value = reparti.includes(repartoValue) ? repartoValue : "";
+    state.catalogFilters.reparto = el.catalogRepartoFilter.value || "";
+  }
+  if (el.catalogCategoriaFilter) {
+    el.catalogCategoriaFilter.innerHTML =
+      `<option value="">Categoria: tutte</option>` +
+      categorie.map((item) => `<option value="${escHtml(item)}">${escHtml(item)}</option>`).join("");
+    el.catalogCategoriaFilter.value = categorie.includes(categoriaValue) ? categoriaValue : "";
+    state.catalogFilters.categoria = el.catalogCategoriaFilter.value || "";
+  }
+  renderCatalogShowcaseFilters(facets);
+}
+
+function renderCatalogTable() {
+  if (!el.catalogTableBody) return;
+  if (!state.catalogRows || state.catalogRows.length === 0) {
+    el.catalogTableBody.innerHTML = `<tr class='empty-row'><td colspan='12'>Nessun articolo catalogo disponibile per i filtri selezionati.</td></tr>`;
+    return;
+  }
+  el.catalogTableBody.innerHTML = state.catalogRows
+    .map((row) => {
+      const key = `${row.season_code}__${row.article_code}`;
+      const selected =
+        state.catalogSelected &&
+        state.catalogSelected.article_code === row.article_code &&
+        state.catalogSelected.season_code === row.season_code;
+      return `
+        <tr data-catalog-row="${escHtml(key)}" style="${selected ? "background:#edf5f0;" : ""}">
+          <td>${escHtml(row.season_code || "--")}</td>
+          <td>${escHtml(row.article_code || "--")}</td>
+          <td>${escHtml([row.description, row.color].filter(Boolean).join(" • ") || "--")}</td>
+          <td>${escHtml(row.supplier || "--")}</td>
+          <td>${escHtml(row.reparto || "--")}</td>
+          <td>${escHtml(row.categoria || "--")}</td>
+          <td>${escHtml(fmtNum(row.giac, 0))}</td>
+          <td>${escHtml(fmtNum(row.con, 0))}</td>
+          <td>${escHtml(fmtNum(row.ven, 0))}</td>
+          <td>${escHtml(fmtPercentValue(row.perc_ven, 1))}</td>
+          <td>${escHtml(row.price_listino == null ? "--" : fmtCurrency(row.price_listino, 2))}</td>
+          <td>${escHtml(row.price_saldo == null ? "--" : fmtCurrency(row.price_saldo, 2))}</td>
+        </tr>
+      `;
+    })
+    .join("");
+
+  el.catalogTableBody.querySelectorAll("tr[data-catalog-row]").forEach((rowEl) => {
+    rowEl.addEventListener("click", () => {
+      const token = rowEl.dataset.catalogRow || "";
+      const [season_code, article_code] = token.split("__");
+      if (!season_code || !article_code) return;
+      state.catalogSelected = { season_code, article_code };
+      renderCatalogTable();
+      refreshCatalogDetail();
+    });
+  });
+}
+
+function renderCatalogDetail(detail) {
+  if (!el.catalogDetailBox) return;
+  if (!detail) {
+    el.catalogDetailBox.innerHTML = "Seleziona un articolo dalla tabella.";
+    return;
+  }
+  if (!detail.available) {
+    el.catalogDetailBox.innerHTML = `<div class="catalog-empty">${escHtml(detail.reason || "Dettaglio non disponibile.")}</div>`;
+    return;
+  }
+  const summary = detail.summary || {};
+  const stores = Array.isArray(detail.stores) ? detail.stores : [];
+  const sizeKeys = [];
+  stores.forEach((store) => {
+    Object.keys(store.sizes || {}).forEach((size) => {
+      if (!sizeKeys.includes(size)) sizeKeys.push(size);
+    });
+  });
+  sizeKeys.sort((a, b) => Number(a) - Number(b));
+
+  const metaHtml = `
+    <div class="catalog-detail-head">
+      <div>
+        <div class="catalog-detail-code">${escHtml(summary.article_code || "--")}</div>
+        <div class="catalog-detail-desc">${escHtml([summary.description, summary.color].filter(Boolean).join(" • ") || "--")}</div>
+      </div>
+      <div class="catalog-detail-tags">
+        <span class="tag">${escHtml(summary.season_code || "--")}</span>
+        <span class="tag">${escHtml(summary.reparto || "--")}</span>
+        <span class="tag">${escHtml(summary.categoria || "--")}</span>
+      </div>
+    </div>
+    <div class="catalog-detail-meta">
+      <div><span>Fornitore</span><strong>${escHtml(summary.supplier || "--")}</strong></div>
+      <div><span>Tipologia</span><strong>${escHtml(summary.tipologia || "--")}</strong></div>
+      <div><span>GIAC</span><strong>${escHtml(fmtNum(summary.giac, 0))}</strong></div>
+      <div><span>CON</span><strong>${escHtml(fmtNum(summary.con, 0))}</strong></div>
+      <div><span>VEN</span><strong>${escHtml(fmtNum(summary.ven, 0))}</strong></div>
+      <div><span>%VEN</span><strong>${escHtml(fmtPercentValue(summary.perc_ven, 1))}</strong></div>
+      <div><span>Listino</span><strong>${escHtml(summary.price_listino == null ? "--" : fmtCurrency(summary.price_listino, 2))}</strong></div>
+      <div><span>Saldo</span><strong>${escHtml(summary.price_saldo == null ? "--" : fmtCurrency(summary.price_saldo, 2))}</strong></div>
+    </div>
+  `;
+
+  let storesHtml = "<div class='catalog-empty'>Nessun dettaglio negozio disponibile.</div>";
+  if (stores.length > 0) {
+    const header = ["NEG", "GIAC", "CON", "VEN", "%VEN", ...sizeKeys]
+      .map((cell) => `<th>${escHtml(cell)}</th>`)
+      .join("");
+    const rowsHtml = stores
+      .map((store) => {
+        const sizeCells = sizeKeys
+          .map((size) => `<td>${escHtml(fmtNum((store.sizes || {})[size] || 0, 0))}</td>`)
+          .join("");
+        return `
+          <tr>
+            <td>${escHtml(store.store_code || "--")}</td>
+            <td>${escHtml(fmtNum(store.giac, 0))}</td>
+            <td>${escHtml(fmtNum(store.con, 0))}</td>
+            <td>${escHtml(fmtNum(store.ven, 0))}</td>
+            <td>${escHtml(fmtPercentValue(store.perc_ven, 1))}</td>
+            ${sizeCells}
+          </tr>
+        `;
+      })
+      .join("");
+    storesHtml = `
+      <div class="table-wrap">
+        <table class="catalog-detail-table">
+          <thead><tr>${header}</tr></thead>
+          <tbody>${rowsHtml}</tbody>
+        </table>
+      </div>
+    `;
+  }
+
+  el.catalogDetailBox.innerHTML = metaHtml + storesHtml;
+}
+
+async function refreshCatalogStatus() {
+  const out = await api("/api/catalog/status");
+  state.catalogStatus = out;
+  renderCatalogSummary(out);
+  renderCatalogFilters(out?.facets || {});
+  return out;
+}
+
+async function refreshCatalogArticles() {
+  const qs = new URLSearchParams({
+    limit: "250",
+    offset: "0",
+    search: state.catalogFilters.search || "",
+    season_code: state.catalogFilters.season || "",
+    reparto: state.catalogFilters.reparto || "",
+    categoria: state.catalogFilters.categoria || "",
+  });
+  const out = await api(`/api/catalog/articles?${qs.toString()}`);
+  state.catalogRows = out.rows || [];
+  state.catalogTotal = Number(out.total || state.catalogRows.length || 0);
+  if (
+    state.catalogSelected &&
+    !state.catalogRows.some(
+      (row) =>
+        row.article_code === state.catalogSelected.article_code &&
+        row.season_code === state.catalogSelected.season_code,
+    )
+  ) {
+    state.catalogSelected = null;
+  }
+  renderCatalogTable();
+  await refreshCatalogDetail();
+}
+
+async function refreshCatalogDetail() {
+  if (!state.catalogSelected) {
+    renderCatalogDetail(null);
+    return;
+  }
+  const qs = new URLSearchParams({
+    article_code: state.catalogSelected.article_code,
+    season_code: state.catalogSelected.season_code,
+  });
+  const out = await api(`/api/catalog/article-detail?${qs.toString()}`);
+  renderCatalogDetail(out);
+}
+
+async function refreshCatalog() {
+  try {
+    const status = await refreshCatalogStatus();
+    if (!status?.available) {
+      state.catalogRows = [];
+      renderCatalogTable();
+      renderCatalogDetail(null);
+      return;
+    }
+    await refreshCatalogArticles();
+  } catch (err) {
+    renderCatalogSummary({ available: false, reason: err.message });
+    state.catalogRows = [];
+    renderCatalogTable();
+    renderCatalogDetail({ available: false, reason: err.message });
+  }
+}
+
+async function refreshActiveCatalogImportJob() {
+  try {
+    const out = await api("/api/catalog/import-jobs/active");
+    renderCatalogImportJob(out?.job || null);
+    const job = out?.job || null;
+    clearCatalogImportPoller();
+    if (job && job.job_id && isCatalogImportActive(job)) {
+      state.catalogImportPollTimer = window.setTimeout(() => pollCatalogImportJob(job.job_id), 1200);
+    } else if (job && !job.job_id && String(job.status || "").toLowerCase() === "running") {
+      state.catalogImportPollTimer = window.setTimeout(refreshActiveCatalogImportJob, 2500);
+    }
+  } catch {
+    renderCatalogImportJob(null);
+  }
+}
+
+async function pollCatalogImportJob(jobId) {
+  clearCatalogImportPoller();
+  try {
+    const job = await api(`/api/catalog/import-jobs/${encodeURIComponent(jobId)}`);
+    renderCatalogImportJob(job);
+    if (isCatalogImportActive(job)) {
+      state.catalogImportPollTimer = window.setTimeout(() => pollCatalogImportJob(jobId), 1200);
+      return;
+    }
+    if (String(job.status || "").toLowerCase() === "success") {
+      clearCatalogQueuedFiles();
+      setCatalogImportMessage(
+        `Import catalogo completato #${shortRunCode(job.run_id)}. Excel ${job.classification?.excel_count || 0}, CSV ${job.classification?.price_count || 0}.`,
+      );
+      await refreshCatalog();
+      return;
+    }
+    if (String(job.status || "").toLowerCase() === "failed") {
+      setCatalogImportMessage(`Errore import catalogo: ${job.error || job.message || "errore sconosciuto"}`, { isError: true });
+      return;
+    }
+  } catch (err) {
+    setCatalogImportMessage(`Errore stato import catalogo: ${err.message}`, { isError: true });
+    renderCatalogImportJob(null);
+  }
+}
+
+async function refreshActiveCatalogShowcaseJob() {
+  try {
+    const out = await api("/api/catalog/showcase/jobs/active");
+    const job = out?.job || null;
+    if (job) {
+      renderCatalogShowcaseJob(job);
+    } else {
+      const latest = await refreshLatestCatalogShowcaseJob();
+      if (!latest && (!state.catalogShowcaseJob || isCatalogShowcaseActive(state.catalogShowcaseJob))) {
+        renderCatalogShowcaseJob(null);
+      }
+    }
+    clearCatalogShowcasePoller();
+    if (job && job.job_id && isCatalogShowcaseActive(job)) {
+      state.catalogShowcasePollTimer = window.setTimeout(() => pollCatalogShowcaseJob(job.job_id), 900);
+    }
+  } catch (err) {
+    if (isCatalogShowcaseActive()) {
+      setCatalogShowcaseMessage(`Errore stato catalogo vetrina: ${err.message}`, { isError: true });
+    }
+  }
+}
+
+async function pollCatalogShowcaseJob(jobId) {
+  clearCatalogShowcasePoller();
+  try {
+    const job = await api(`/api/catalog/showcase/jobs/${encodeURIComponent(jobId)}`);
+    renderCatalogShowcaseJob(job);
+    if (isCatalogShowcaseActive(job)) {
+      state.catalogShowcasePollTimer = window.setTimeout(() => pollCatalogShowcaseJob(jobId), 900);
+      return;
+    }
+
+    if (String(job?.status || "").toLowerCase() === "success") {
+      renderCatalogShowcaseTerminalMessage(job);
+      return;
+    }
+    if (String(job?.status || "").toLowerCase() === "failed") {
+      renderCatalogShowcaseTerminalMessage(job);
+    }
+  } catch (err) {
+    const latest = await refreshLatestCatalogShowcaseJob();
+    if (latest) return;
+    setCatalogShowcaseMessage(`Errore stato catalogo vetrina: ${err.message}`, { isError: true });
+  }
+}
+
+async function startCatalogImport(evt) {
+  evt.preventDefault();
+  if (isCatalogImportActive()) {
+    setCatalogImportMessage("Esiste gia' un import catalogo in corso.", { isError: true });
+    return;
+  }
+  const queuedFiles = (state.catalogQueuedFiles || []).map((item) => item.file).filter(Boolean);
+  const hasFiles = queuedFiles.length > 0;
+  if (!hasFiles) {
+    setCatalogImportMessage("Carica almeno un file catalogo (.xls/.xlsx/.csv).", { isError: true });
+    return;
+  }
+  const fd = new FormData();
+  queuedFiles.forEach((file) => fd.append("files", file));
+  fd.append("sheet", el.catalogSheet?.value?.trim() || "Situazione Articoli");
+  fd.append("create_schema", el.catalogCreateSchema?.checked ? "true" : "false");
+
+  setCatalogImportMessage("Import catalogo in corso...");
+  try {
+    const res = await fetch("/api/catalog/import", {
+      method: "POST",
+      body: fd,
+    });
+    const txt = await res.text();
+    let payload = {};
+    try {
+      payload = txt ? JSON.parse(txt) : {};
+    } catch {
+      payload = { raw: txt };
+    }
+    if (!res.ok) {
+      throw new Error(payload.detail || payload.raw || `HTTP ${res.status}`);
+    }
+    renderCatalogImportJob(payload?.job || null);
+    const job = payload?.job || null;
+    const ignoredCount = Number(job?.classification?.ignored_count || 0);
+    const ignoredMsg = ignoredCount ? `, ignorati ${ignoredCount}` : "";
+    setCatalogImportMessage(`Import catalogo avviato. Excel ${job?.classification?.excel_count || 0}, CSV ${job?.classification?.price_count || 0}${ignoredMsg}.`);
+    if (job?.job_id) {
+      await pollCatalogImportJob(job.job_id);
+    }
+  } catch (err) {
+    setCatalogImportMessage(`Errore import catalogo: ${err.message}`, { isError: true });
+  }
+}
+
+async function startCatalogShowcaseExport(evt) {
+  evt.preventDefault();
+  if (isCatalogShowcaseActive()) {
+    setCatalogShowcaseMessage("Generazione catalogo vetrina gia' in corso...");
+    return;
+  }
+  if (!state.catalogStatus?.available) {
+    setCatalogShowcaseMessage("Importa prima il catalogo nel database.", { isError: true });
+    return;
+  }
+
+  const payload = {
+    run_id: null,
+    export_mode: el.catalogShowcaseExportMode?.value || "both",
+    primary_source: el.catalogShowcasePrimarySource?.value || "local",
+    allow_fallback: !!el.catalogShowcaseFallback?.checked,
+    selected_seasons: state.catalogShowcaseFilters.seasons || [],
+    selected_reparti: state.catalogShowcaseFilters.reparti || [],
+    selected_categories: state.catalogShowcaseFilters.categories || [],
+    manual_codes_text: el.catalogShowcaseManualCodes?.value || "",
+    photo_root: el.catalogPhotoRoot?.value?.trim() || "",
+    photo_position: el.catalogShowcasePhotoPosition?.value?.trim() || "xl",
+    allow_position_variants: !!el.catalogShowcaseAllowVariants?.checked,
+  };
+
+  const filtersSummary = [
+    payload.selected_seasons.length ? `${payload.selected_seasons.length} stagioni` : "tutte le stagioni",
+    payload.selected_reparti.length ? `${payload.selected_reparti.length} reparti` : "tutti i reparti",
+    payload.selected_categories.length ? `${payload.selected_categories.length} categorie` : "tutte le categorie",
+  ].join(" • ");
+
+  setCatalogShowcaseMessage("Generazione catalogo vetrina avviata...");
+  renderCatalogShowcaseProgress({
+    visible: true,
+    status: "queued",
+    message: "Catalogo vetrina in coda...",
+    details: [
+      filtersSummary,
+      payload.primary_source === "local" ? "Sorgente foto: archivio locale" : "Sorgente foto: sito BARCA",
+      `Formato: ${String(payload.export_mode || "both").toUpperCase()}`,
+    ],
+    indeterminate: false,
+    progress: 0,
+  });
+  try {
+    const out = await api("/api/catalog/showcase/jobs", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    const job = out?.job || null;
+    renderCatalogShowcaseJob(job);
+    if (job?.job_id) {
+      await pollCatalogShowcaseJob(job.job_id);
+      return;
+    }
+    throw new Error("Job catalogo vetrina non restituito dal server.");
+  } catch (err) {
+    renderCatalogShowcaseProgress({
+      visible: true,
+      status: "failed",
+      message: "Errore durante la generazione del catalogo vetrina.",
+      details: [err.message || "errore sconosciuto"],
+      indeterminate: false,
+      progress: 100,
+    });
+    setCatalogShowcaseMessage(`Errore catalogo vetrina: ${err.message}`, { isError: true });
+  }
+}
+
 async function loadDashboardRuns() {
   try {
     const out = await api("/api/dashboard/runs?limit=200");
@@ -1547,9 +2786,11 @@ async function refreshDashboard() {
       renderBarChart(el.chartOrdersSeasonMode, [], { unit: "pairs" });
       renderBarChart(el.chartOrdersModule, [], { unit: "pairs" });
       renderBarChart(el.chartOrdersMode, [], { unit: "pairs" });
+      renderBarChart(el.chartOrdersPriceBand, [], { unit: "pairs" });
       renderBarChart(el.chartCriticalByShop, [], { unit: "pairs" });
       renderBarChart(el.chartNextCurrentCategory, [], { unit: "pairs" });
       renderBarChart(el.chartNextCurrentDeltaCategory, [], { unit: "pairs" });
+      renderBarChart(el.chartNextCurrentPriceBand, [], { unit: "pairs" });
       renderAllDashboardTables();
       if (el.dashboardSubtitle) {
         el.dashboardSubtitle.textContent = "Connessione DB non disponibile.";
@@ -1571,9 +2812,11 @@ async function refreshDashboard() {
       renderBarChart(el.chartOrdersSeasonMode, [], { unit: "pairs" });
       renderBarChart(el.chartOrdersModule, [], { unit: "pairs" });
       renderBarChart(el.chartOrdersMode, [], { unit: "pairs" });
+      renderBarChart(el.chartOrdersPriceBand, [], { unit: "pairs" });
       renderBarChart(el.chartCriticalByShop, [], { unit: "pairs" });
       renderBarChart(el.chartNextCurrentCategory, [], { unit: "pairs" });
       renderBarChart(el.chartNextCurrentDeltaCategory, [], { unit: "pairs" });
+      renderBarChart(el.chartNextCurrentPriceBand, [], { unit: "pairs" });
       renderAllDashboardTables();
       if (el.dashboardSubtitle) {
         el.dashboardSubtitle.textContent = "Nessun aggiornamento caricabile per dashboard.";
@@ -1609,9 +2852,11 @@ async function refreshDashboard() {
     renderBarChart(el.chartOrdersSeasonMode, out.charts?.orders_by_season_mode || [], { unit: "pairs", digits: 2 });
     renderBarChart(el.chartOrdersModule, out.charts?.orders_by_module || [], { unit: "pairs", digits: 2 });
     renderBarChart(el.chartOrdersMode, out.charts?.orders_by_mode || [], { unit: "pairs", digits: 2 });
+    renderBarChart(el.chartOrdersPriceBand, out.charts?.orders_by_price_band || [], { unit: "pairs", digits: 2 });
     renderBarChart(el.chartCriticalByShop, out.charts?.critical_by_shop || [], { unit: "pairs", digits: 2 });
     renderBarChart(el.chartNextCurrentCategory, out.charts?.next_current_by_category || [], { unit: "pairs", digits: 2 });
     renderBarChart(el.chartNextCurrentDeltaCategory, out.charts?.next_current_delta_positive_by_category || [], { unit: "pairs", digits: 2 });
+    renderBarChart(el.chartNextCurrentPriceBand, out.charts?.next_current_by_price_band || [], { unit: "pairs", digits: 2 });
     renderAllDashboardTables();
   } catch (err) {
     setDashboardWarn(`Errore dashboard: ${err.message}`);
@@ -1726,7 +2971,15 @@ async function refreshSelectedRunDetails() {
 }
 
 async function refreshAll(includeDashboard = false) {
-  await Promise.all([refreshHealth(), refreshDb(), refreshOutputs(), refreshRuns()]);
+  await Promise.all([
+    refreshHealth(),
+    refreshDb(),
+    refreshOutputs(),
+    refreshRuns(),
+    refreshCatalog(),
+    refreshActiveCatalogImportJob(),
+    refreshActiveCatalogShowcaseJob(),
+  ]);
   await refreshSelectedRunDetails();
   if (includeDashboard) {
     await loadDashboardRuns();
@@ -1794,9 +3047,55 @@ function initEvents() {
   const limitVal = Number(el.runsPageSize?.value || "40");
   state.runsLimit = Number.isFinite(limitVal) && limitVal > 0 ? limitVal : 40;
   initDashboardTableControls();
+  bindCatalogDropzone();
   el.refreshBtn.addEventListener("click", () => refreshAll(true));
   el.devModeBtn.addEventListener("click", toggleDeveloperMode);
   el.runForm.addEventListener("submit", startRun);
+  el.catalogImportForm?.addEventListener("submit", startCatalogImport);
+  el.catalogFiles?.addEventListener("change", handleCatalogFileSelection);
+  el.catalogClearFilesBtn?.addEventListener("click", () => clearCatalogQueuedFiles({ clearMessage: true }));
+  el.catalogFileQueue?.addEventListener("click", (evt) => {
+    const removeBtn = evt.target?.closest?.("[data-remove-catalog-file]");
+    if (!removeBtn) return;
+    const fileId = removeBtn.getAttribute("data-remove-catalog-file");
+    if (!fileId) return;
+    removeCatalogQueuedFile(fileId);
+  });
+  el.catalogShowcaseForm?.addEventListener("submit", startCatalogShowcaseExport);
+  el.catalogShowcaseSeasonSearch?.addEventListener("input", () =>
+    setCatalogShowcaseFilterSearch("seasons", el.catalogShowcaseSeasonSearch.value || ""),
+  );
+  el.catalogShowcaseRepartoSearch?.addEventListener("input", () =>
+    setCatalogShowcaseFilterSearch("reparti", el.catalogShowcaseRepartoSearch.value || ""),
+  );
+  el.catalogShowcaseCategoriaSearch?.addEventListener("input", () =>
+    setCatalogShowcaseFilterSearch("categories", el.catalogShowcaseCategoriaSearch.value || ""),
+  );
+  el.catalogShowcaseSeasonAll?.addEventListener("click", () =>
+    setCatalogShowcaseFilterSelection("seasons", getCatalogShowcaseAvailableItems("seasons")),
+  );
+  el.catalogShowcaseRepartoAll?.addEventListener("click", () =>
+    setCatalogShowcaseFilterSelection("reparti", getCatalogShowcaseAvailableItems("reparti")),
+  );
+  el.catalogShowcaseCategoriaAll?.addEventListener("click", () =>
+    setCatalogShowcaseFilterSelection("categories", getCatalogShowcaseAvailableItems("categories")),
+  );
+  el.catalogShowcaseSeasonClear?.addEventListener("click", () => resetCatalogShowcaseFilter("seasons"));
+  el.catalogShowcaseRepartoClear?.addEventListener("click", () => resetCatalogShowcaseFilter("reparti"));
+  el.catalogShowcaseCategoriaClear?.addEventListener("click", () => resetCatalogShowcaseFilter("categories"));
+  [el.catalogShowcaseSeasonOptions, el.catalogShowcaseRepartoOptions, el.catalogShowcaseCategoriaOptions].forEach(
+    (container) => {
+      container?.addEventListener("click", (evt) => {
+        const option = evt.target?.closest?.("[data-showcase-filter-group][data-showcase-filter-value]");
+        if (!option) return;
+        toggleCatalogShowcaseFilterValue(
+          option.getAttribute("data-showcase-filter-group"),
+          option.getAttribute("data-showcase-filter-value"),
+        );
+      });
+    },
+  );
+  el.catalogSaveSettingsBtn?.addEventListener("click", saveCatalogSettings);
   el.viewTabs.forEach((btn) => {
     btn.addEventListener("click", () => setActiveView(btn.dataset.viewTarget));
   });
@@ -1843,6 +3142,23 @@ function initEvents() {
     await loadDashboardRuns();
     await refreshDashboard();
   });
+  el.catalogRefreshBtn?.addEventListener("click", refreshCatalog);
+  el.catalogSearch?.addEventListener("input", () => {
+    state.catalogFilters.search = el.catalogSearch.value || "";
+    refreshCatalogArticles();
+  });
+  el.catalogSeasonFilter?.addEventListener("change", () => {
+    state.catalogFilters.season = el.catalogSeasonFilter.value || "";
+    refreshCatalogArticles();
+  });
+  el.catalogRepartoFilter?.addEventListener("change", () => {
+    state.catalogFilters.reparto = el.catalogRepartoFilter.value || "";
+    refreshCatalogArticles();
+  });
+  el.catalogCategoriaFilter?.addEventListener("change", () => {
+    state.catalogFilters.categoria = el.catalogCategoriaFilter.value || "";
+    refreshCatalogArticles();
+  });
   window.addEventListener("keydown", (evt) => {
     if (evt.key === "Escape" && state.fullscreenTableKey) {
       toggleTableFullscreen(state.fullscreenTableKey, false);
@@ -1852,6 +3168,9 @@ function initEvents() {
 
 async function init() {
   initEvents();
+  renderCatalogQueuedFiles();
+  renderCatalogImportJob(null);
+  renderCatalogShowcaseJob(null);
   renderDashboardLegend();
   renderDashboardQuickFacts({});
   renderDashboardKpis({}, {});

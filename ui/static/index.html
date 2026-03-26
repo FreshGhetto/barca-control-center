@@ -37,6 +37,7 @@
     <nav class="view-nav" aria-label="Sezioni applicazione">
       <button id="tabDashboard" class="view-tab active" type="button" data-view-target="dashboard">Dashboard</button>
       <button id="tabOperations" class="view-tab" type="button" data-view-target="operations">Operazioni</button>
+      <button id="tabCatalog" class="view-tab" type="button" data-view-target="catalog">Catalogo</button>
       <button id="tabData" class="view-tab" type="button" data-view-target="data">Dati e Output</button>
       <button id="tabDev" class="view-tab" type="button" data-view-target="dev">Sviluppo</button>
     </nav>
@@ -66,7 +67,7 @@
           <span>`Sellout` = percentuale media di rotazione merce.</span>
           <span>`Mancanza stimata` = domanda stimata maggiore dello stock dopo i movimenti.</span>
           <span>`Confronto vs aggiornamento precedente` = differenza rispetto alla run DB immediatamente prima.</span>
-          <span>`25i/25e` = stagioni correnti, `25y/25g` = continuative.</span>
+          <span>Sigle stagioni: `I/Y` = inverno, `E/G` = estate. `Y` e `G` indicano i continuativi.</span>
           <span>`base`, `storico`, `ibrido` = i tre metodi di previsione ordini.</span>
         </div>
 
@@ -143,6 +144,10 @@
               <h3>Ordini per area (paia)</h3>
               <div id="chartOrdersModule" class="bar-chart"></div>
             </article>
+            <article class="chart-card chart-span-2">
+              <h3>Ordini per fascia prezzo (paia)</h3>
+              <div id="chartOrdersPriceBand" class="bar-chart"></div>
+            </article>
           </div>
 
           <article id="ordersPanel" class="panel subpanel table-panel">
@@ -171,6 +176,9 @@
                     <th class="sortable" data-key="season_code">Stagione</th>
                     <th class="sortable" data-key="mode">Metodo</th>
                     <th class="sortable" data-key="article_code">Articolo</th>
+                    <th class="sortable" data-key="fascia_prezzo">Fascia Prezzo</th>
+                    <th class="sortable" data-key="prezzo_listino">Listino (€)</th>
+                    <th class="sortable" data-key="prezzo_vendita">Vendita (€)</th>
                     <th class="sortable" data-key="totale_qty">Totale (paia)</th>
                     <th class="sortable" data-key="predizione_vendite">Predizione (paia)</th>
                     <th class="sortable" data-key="budget_acquisto">Budget (€)</th>
@@ -191,6 +199,10 @@
             <article class="chart-card chart-span-2">
               <h3>Fabbisogno extra prossima stagione (paia)</h3>
               <div id="chartNextCurrentDeltaCategory" class="bar-chart"></div>
+            </article>
+            <article class="chart-card chart-span-2">
+              <h3>Prossima stagione per fascia prezzo (paia)</h3>
+              <div id="chartNextCurrentPriceBand" class="bar-chart"></div>
             </article>
           </div>
 
@@ -218,12 +230,14 @@
                   <tr>
                     <th class="sortable" data-key="from_cont_season">Stagione origine</th>
                     <th class="sortable" data-key="article_code">Articolo</th>
+                    <th class="sortable" data-key="fascia_prezzo">Fascia Prezzo</th>
                     <th class="sortable" data-key="categoria">Categoria</th>
                     <th class="sortable" data-key="tipologia">Tipologia</th>
                     <th class="sortable" data-key="marchio">Marchio</th>
                     <th class="sortable" data-key="colore">Colore</th>
                     <th class="sortable" data-key="materiale">Materiale</th>
-                    <th class="sortable" data-key="venduto_periodo">Venduto recente (paia)</th>
+                    <th class="sortable" data-key="prezzo_vendita">Vendita (€)</th>
+                    <th class="sortable" data-key="venduto_periodo">Venduto finestra stagionale (paia)</th>
                     <th class="sortable" data-key="giacenza">Giacenza (paia)</th>
                     <th class="sortable" data-key="applied_factor">Fattore (x)</th>
                     <th class="sortable" data-key="predicted_current_qty">Pezzi stimati (paia)</th>
@@ -374,6 +388,204 @@
           <button id="runsPrevPageBtn" class="btn secondary" type="button">Precedente</button>
           <p id="runsPageInfo" class="muted">Pagina 1</p>
           <button id="runsNextPageBtn" class="btn secondary" type="button">Successiva</button>
+        </div>
+      </section>
+
+      <section class="panel span-2 view-panel" data-view="catalog">
+        <div class="panel-head">
+          <h2>Catalogo Stagionale</h2>
+          <button id="catalogRefreshBtn" class="btn secondary" type="button">Aggiorna Catalogo</button>
+        </div>
+        <p class="muted">
+          Importa i file esportati dal gestionale direttamente nel database BARCA.
+          Gli Excel `.xls/.xlsx` vengono letti come catalogo, i `.csv` vengono riconosciuti automaticamente come `listino` o `saldo` dal contenuto, anche se il nome file non viene cambiato.
+          La consultazione usa sempre l'ultimo valore importato per stagione, articolo e negozio, mantenendo lo storico dei run.
+        </p>
+
+        <form id="catalogImportForm" class="form-grid catalog-form">
+          <div class="catalog-import-layout">
+            <article id="catalogDropzone" class="catalog-dropzone" aria-label="Aggiungi file catalogo" tabindex="0">
+              <div class="catalog-dropzone-kicker">Import guidato</div>
+              <h3>Aggiungi file catalogo e prezzi</h3>
+              <p>
+                Puoi selezionare i file più volte anche da cartelle diverse: i nuovi file vengono aggiunti alla coda,
+                non sostituiscono quelli già scelti.
+              </p>
+              <label class="btn secondary catalog-dropzone-btn">
+                Scegli file
+                <input id="catalogFiles" class="catalog-native-file-input" type="file" accept=".xls,.xlsx,.csv" multiple />
+              </label>
+              <span class="catalog-dropzone-note">Supportati: `.xls`, `.xlsx`, `.csv`. Puoi anche trascinarli qui.</span>
+            </article>
+
+            <article class="panel subpanel catalog-file-stage">
+              <div class="panel-head">
+                <h3>File in coda</h3>
+                <button id="catalogClearFilesBtn" type="button" class="btn secondary">Svuota coda</button>
+              </div>
+              <div id="catalogFileQueueSummary" class="catalog-file-queue-summary"></div>
+              <div id="catalogFileQueue" class="catalog-file-queue"></div>
+            </article>
+          </div>
+          <label class="inline-field">Foglio Excel
+            <input id="catalogSheet" type="text" value="Situazione Articoli" placeholder="Situazione Articoli oppure 0" />
+          </label>
+          <label><input type="checkbox" id="catalogCreateSchema" checked /> Applica o aggiorna la struttura tabelle catalogo</label>
+          <div class="form-actions">
+            <button id="catalogImportSubmitBtn" type="submit" class="btn primary">Importa Catalogo nel DB</button>
+            <p id="catalogImportMsg" class="muted"></p>
+          </div>
+        </form>
+        <article id="catalogImportProgressBox" class="panel subpanel catalog-import-progress hidden">
+          <div class="panel-head">
+            <h3>Avanzamento Import Catalogo</h3>
+            <span id="catalogImportProgressBadge" class="catalog-import-badge">In attesa</span>
+          </div>
+          <div class="catalog-import-progress-bar">
+            <div id="catalogImportProgressFill" class="catalog-import-progress-fill"></div>
+          </div>
+          <div id="catalogImportProgressText" class="catalog-import-progress-text">Nessun import catalogo in corso.</div>
+          <div id="catalogImportProgressMeta" class="catalog-import-progress-meta"></div>
+        </article>
+        <p class="muted">`Foglio Excel`: lascia `Situazione Articoli` per gli export standard. `0` significa "primo foglio" del file.</p>
+
+        <div class="form-grid catalog-form">
+          <label class="inline-field">Cartella foto indicizzate
+            <input id="catalogPhotoRoot" type="text" placeholder="E:\FOTO_WEB_INDICIZZATE" />
+          </label>
+          <div class="form-actions">
+            <button id="catalogSaveSettingsBtn" type="button" class="btn secondary">Salva Impostazioni Catalogo</button>
+            <p id="catalogSettingsMsg" class="muted"></p>
+          </div>
+        </div>
+
+        <div id="catalogSummary" class="catalog-summary-grid"></div>
+
+        <article class="panel subpanel catalog-showcase-panel">
+          <div class="panel-head">
+            <h3>Catalogo Vetrina</h3>
+          </div>
+          <p class="muted">
+            Genera cataloghi `HTML`, `JPG` o entrambi dai dati presenti nel database.
+            Se non selezioni stagioni, reparti o categorie, il sistema usa tutto il catalogo corrente.
+          </p>
+          <form id="catalogShowcaseForm" class="form-grid catalog-form">
+            <label class="inline-field">Formato output
+              <select id="catalogShowcaseExportMode">
+                <option value="both" selected>HTML + JPG</option>
+                <option value="html">Solo HTML</option>
+                <option value="jpg">Solo JPG</option>
+              </select>
+            </label>
+            <label class="inline-field">Sorgente primaria foto
+              <select id="catalogShowcasePrimarySource">
+                <option value="local" selected>Archivio locale</option>
+                <option value="web">Sito BARCA</option>
+              </select>
+            </label>
+            <label class="inline-field">Posizione foto
+              <input id="catalogShowcasePhotoPosition" type="text" value="xl" placeholder="xl" />
+            </label>
+            <label><input type="checkbox" id="catalogShowcaseAllowVariants" checked /> Accetta varianti posizione (`xl_1`, `xl-2`, ...)</label>
+            <label><input type="checkbox" id="catalogShowcaseFallback" /> Se manca la foto, prova anche l'altra sorgente</label>
+            <div class="catalog-filter-panel">
+              <div class="catalog-filter-head">
+                <div>
+                  <div class="catalog-filter-title">Filtra stagioni</div>
+                  <div id="catalogShowcaseSeasonStatus" class="catalog-filter-status">Tutte le stagioni</div>
+                </div>
+                <div class="catalog-filter-actions">
+                  <button id="catalogShowcaseSeasonAll" type="button" class="btn secondary compact">Tutte</button>
+                  <button id="catalogShowcaseSeasonClear" type="button" class="btn secondary compact">Reset</button>
+                </div>
+              </div>
+              <input id="catalogShowcaseSeasonSearch" type="text" placeholder="Cerca stagione" />
+              <div id="catalogShowcaseSeasonOptions" class="catalog-filter-options"></div>
+            </div>
+            <div class="catalog-filter-panel">
+              <div class="catalog-filter-head">
+                <div>
+                  <div class="catalog-filter-title">Filtra reparti</div>
+                  <div id="catalogShowcaseRepartoStatus" class="catalog-filter-status">Tutti i reparti</div>
+                </div>
+                <div class="catalog-filter-actions">
+                  <button id="catalogShowcaseRepartoAll" type="button" class="btn secondary compact">Tutti</button>
+                  <button id="catalogShowcaseRepartoClear" type="button" class="btn secondary compact">Reset</button>
+                </div>
+              </div>
+              <input id="catalogShowcaseRepartoSearch" type="text" placeholder="Cerca reparto" />
+              <div id="catalogShowcaseRepartoOptions" class="catalog-filter-options"></div>
+            </div>
+            <div class="catalog-filter-panel catalog-filter-panel-wide">
+              <div class="catalog-filter-head">
+                <div>
+                  <div class="catalog-filter-title">Filtra categorie</div>
+                  <div id="catalogShowcaseCategoriaStatus" class="catalog-filter-status">Tutte le categorie</div>
+                </div>
+                <div class="catalog-filter-actions">
+                  <button id="catalogShowcaseCategoriaAll" type="button" class="btn secondary compact">Tutte</button>
+                  <button id="catalogShowcaseCategoriaClear" type="button" class="btn secondary compact">Reset</button>
+                </div>
+              </div>
+              <input id="catalogShowcaseCategoriaSearch" type="text" placeholder="Cerca categoria" />
+              <div id="catalogShowcaseCategoriaOptions" class="catalog-filter-options"></div>
+            </div>
+            <label class="inline-field">Codici manuali opzionali
+              <textarea id="catalogShowcaseManualCodes" rows="5" placeholder="48/0005CBL&#10;48/01144BE"></textarea>
+            </label>
+            <div class="form-actions">
+              <button id="catalogShowcaseSubmitBtn" type="submit" class="btn primary">Genera Catalogo Vetrina</button>
+              <p id="catalogShowcaseMsg" class="muted"></p>
+            </div>
+          </form>
+          <article id="catalogShowcaseProgressBox" class="panel subpanel catalog-showcase-progress hidden">
+            <div class="panel-head">
+              <h3>Avanzamento Catalogo Vetrina</h3>
+              <span id="catalogShowcaseProgressBadge" class="catalog-import-badge">In attesa</span>
+            </div>
+            <div class="catalog-import-progress-bar">
+              <div id="catalogShowcaseProgressFill" class="catalog-import-progress-fill"></div>
+            </div>
+            <div id="catalogShowcaseProgressText" class="catalog-import-progress-text">Nessuna generazione catalogo in corso.</div>
+            <div id="catalogShowcaseProgressMeta" class="catalog-import-progress-meta"></div>
+          </article>
+          <p class="muted">Puoi filtrare cliccando direttamente le voci. `Reset` toglie il filtro e include tutto. I codici manuali sono opzionali: se lasci il campo vuoto, il catalogo usa solo i filtri selezionati.</p>
+        </article>
+
+        <div class="runs-toolbar">
+          <input id="catalogSearch" type="text" placeholder="Cerca articolo / descrizione / fornitore" />
+          <select id="catalogSeasonFilter"></select>
+          <select id="catalogRepartoFilter"></select>
+          <select id="catalogCategoriaFilter"></select>
+        </div>
+
+        <div class="catalog-grid">
+          <div class="table-wrap">
+            <table id="catalogTable">
+              <thead>
+                <tr>
+                  <th>Stagione</th>
+                  <th>Articolo</th>
+                  <th>Descrizione</th>
+                  <th>Fornitore</th>
+                  <th>Reparto</th>
+                  <th>Categoria</th>
+                  <th>GIAC</th>
+                  <th>CON</th>
+                  <th>VEN</th>
+                  <th>%VEN</th>
+                  <th>Listino</th>
+                  <th>Saldo</th>
+                </tr>
+              </thead>
+              <tbody id="catalogTableBody"></tbody>
+            </table>
+          </div>
+
+          <article class="panel subpanel">
+            <h3>Dettaglio Articolo</h3>
+            <div id="catalogDetailBox" class="catalog-detail-box">Seleziona un articolo dalla tabella.</div>
+          </article>
         </div>
       </section>
 

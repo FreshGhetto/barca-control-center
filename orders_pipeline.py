@@ -135,6 +135,63 @@ def discover_order_bundles(root: Path) -> Dict[str, Any]:
     }
 
 
+def _bundle_module(code: str) -> Optional[str]:
+    season_char = next((ch for ch in reversed(str(code).strip().lower()) if ch.isalpha()), "")
+    if season_char in ("i", "e"):
+        return "current"
+    if season_char in ("y", "g"):
+        return "continuativa"
+    return None
+
+
+def _bundle_token(code: str) -> str:
+    text = re.sub(r"[^a-z0-9]+", "_", str(code or "").strip().lower()).strip("_")
+    return text or "unknown"
+
+
+def _export_historical_source_bundles(
+    bundles: List[SeasonBundle],
+    *,
+    output_orders: Path,
+    logger: StepLogger,
+) -> List[Dict[str, Any]]:
+    history_dir = output_orders / "history_source"
+    history_dir.mkdir(parents=True, exist_ok=True)
+
+    jobs: List[Dict[str, Any]] = []
+    for bundle in sorted(bundles, key=lambda item: _season_sort_key(item.code)):
+        module = _bundle_module(bundle.code)
+        if not module:
+            continue
+        df_input = _estrai_matematico(bundle.totali, bundle.colori, bundle.taglie)
+        if bundle.listino and bundle.listino.exists():
+            df_listino = _estrai_listino_fasce(bundle.listino)
+            df_input = pd.merge(df_input, df_listino, on="Codice_Articolo", how="left")
+        if bundle.prezzi and bundle.prezzi.exists():
+            df_prezzi = _estrai_prezzi_acquisto(bundle.prezzi)
+            df_input = pd.merge(df_input, df_prezzi, on="Codice_Articolo", how="left")
+        df_input = _apply_price_band(df_input)
+        file_name = f"orders_source_{_bundle_token(bundle.code)}.csv"
+        out_path = history_dir / file_name
+        _save_csv(df_input, out_path)
+        jobs.append(
+            {
+                "season": bundle.code,
+                "module": module,
+                "file": f"history_source/{file_name}",
+                "articles_input": int(len(df_input)),
+                "listino_file": str(bundle.listino) if bundle.listino else "",
+                "prezzi_file": str(bundle.prezzi) if bundle.prezzi else "",
+            }
+        )
+
+    if jobs:
+        logger.log(f"Storico sorgenti ordini: esportati {len(jobs)} bundle stagionali.")
+    else:
+        logger.log("Storico sorgenti ordini: nessun bundle esportato.")
+    return jobs
+
+
 def _normalizza_taglia(v: str) -> str:
     v = str(v).strip()
     v = v.replace("½", "5").replace("\xbd", "5").replace("�", "5")
@@ -531,18 +588,186 @@ def _estrai_prezzi_acquisto(file_prezzi: Path) -> pd.DataFrame:
                 v = val.strip().split()[0] if val.strip().split() else ""
                 if "/" in v and any(c.isdigit() for c in v) and not re.match(r"^\d{2}/\d{2}/\d{4}$", v):
                     codice = v
+                    prezzo_acquisto = None
+                    prezzo_vendita = None
                     if j + 1 < len(elements):
                         try:
-                            prezzo = float(elements[j + 1].strip().replace(".", "").replace(",", "."))
-                            data.append({"Codice_Articolo": codice, "Prezzo_Acquisto": prezzo})
+                            prezzo_acquisto = float(elements[j + 1].strip().replace(".", "").replace(",", "."))
                         except Exception:
-                            pass
+                            prezzo_acquisto = None
+                    if j + 2 < len(elements):
+                        try:
+                            prezzo_vendita = float(elements[j + 2].strip().replace(".", "").replace(",", "."))
+                        except Exception:
+                            prezzo_vendita = None
+                    data.append(
+                        {
+                            "Codice_Articolo": codice,
+                            "Prezzo_Acquisto": prezzo_acquisto,
+                            "Prezzo_Vendita": prezzo_vendita,
+                        }
+                    )
                     break
     return pd.DataFrame(data).drop_duplicates(subset=["Codice_Articolo"])
 
 
+def _estrai_listino_fasce(file_listino: Path) -> pd.DataFrame:
+    data = []
+    current_fascia = None
+    with open(file_listino, "r", encoding="utf-8", errors="replace") as f:
+        for row in csv.reader(f):
+            art_idx = None
+            for j, val in enumerate(row):
+                if val.strip() == "ARTICOLO":
+                    art_idx = j
+                    break
+            if art_idx is None:
+                continue
+            elements = row[art_idx + 1 :]
+            if "TOTALI :" in elements:
+                elements = elements[: elements.index("TOTALI :")]
+
+            article_indices = [
+                j
+                for j, val in enumerate(elements)
+                if "/" in (val.strip().split()[0] if val.strip().split() else "")
+                and any(c.isdigit() for c in (val.strip().split()[0] if val.strip().split() else ""))
+                and not re.match(r"^\d{2}/\d{2}/\d{4}$", val.strip().split()[0])
+            ]
+            last_idx = 0
+            for idx in article_indices:
+                pre_chunk = elements[last_idx:idx]
+                pre_elements = [
+                    e.strip()
+                    for e in pre_chunk
+                    if e.strip()
+                    and not re.match(r"^-?\d+(?:,\d+)?$|^%$", e.strip())
+                    and not e.startswith("SUBTOTALE")
+                    and not e.startswith("VALORE")
+                    and not e.startswith("COSTO")
+                ]
+                if pre_elements:
+                    current_fascia = pre_elements[-1]
+
+                codice = elements[idx].strip().split()[0]
+                prezzo_listino = None
+                if idx + 1 < len(elements):
+                    try:
+                        prezzo_listino = float(elements[idx + 1].strip().replace(".", "").replace(",", "."))
+                    except Exception:
+                        prezzo_listino = None
+
+                data.append(
+                    {
+                        "Codice_Articolo": codice,
+                        "Fascia_Prezzo": re.sub(r"\s+", " ", current_fascia).strip() if current_fascia else None,
+                        "Prezzo_Listino": prezzo_listino,
+                    }
+                )
+                last_idx = idx + 1
+
+    return pd.DataFrame(data).drop_duplicates(subset=["Codice_Articolo"])
+
+
+def _is_valid_price_band(value: Any) -> bool:
+    try:
+        if pd.isna(value):
+            return False
+    except Exception:
+        pass
+    text = str(value).strip()
+    return bool(re.match(r"^\d+\s*-\s*\d+$", text))
+
+
+def _price_band_label(value: Any) -> Optional[str]:
+    try:
+        price = float(value)
+    except Exception:
+        return None
+    if not np.isfinite(price) or price <= 0:
+        return None
+    whole = int(price)
+    if whole < 20:
+        return "0-19"
+    upper = (whole // 10) * 10 + 9
+    lower = upper - 9
+    return f"{lower}-{upper}"
+
+
+def _apply_price_band(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    if "Fascia_Prezzo" not in out.columns:
+        out["Fascia_Prezzo"] = None
+
+    base_price = pd.Series(np.nan, index=out.index, dtype="float64")
+    for col in ("Prezzo_Listino", "Prezzo_Vendita", "Prezzo_Acquisto"):
+        if col not in out.columns:
+            continue
+        values = pd.to_numeric(out[col], errors="coerce")
+        base_price = base_price.where(base_price.notna(), values)
+
+    derived = base_price.map(_price_band_label)
+    current_band = out["Fascia_Prezzo"].map(lambda v: "" if pd.isna(v) else str(v).strip())
+    needs_fill = current_band.eq("") | ~current_band.map(_is_valid_price_band)
+    out.loc[needs_fill, "Fascia_Prezzo"] = derived.loc[needs_fill]
+    return out
+
+
 def _is_mezza_taglia(taglia: str) -> bool:
     return len(taglia) == 3 and taglia.endswith("5") and taglia[:2].isdigit()
+
+
+def _rebalance_nonnegative_allocations(
+    df: pd.DataFrame,
+    *,
+    total_col: str,
+    allocation_cols: List[str],
+    preferred_sizes: Optional[pd.Series] = None,
+) -> None:
+    if df.empty or total_col not in df.columns or not allocation_cols:
+        return
+
+    preferred_sizes = preferred_sizes if isinstance(preferred_sizes, pd.Series) else pd.Series("", index=df.index)
+
+    for idx_row in df.index:
+        try:
+            target_total = max(0, int(round(float(df.loc[idx_row, total_col]))))
+        except Exception:
+            target_total = 0
+
+        values: Dict[str, int] = {}
+        for col in allocation_cols:
+            try:
+                values[col] = max(0, int(round(float(df.loc[idx_row, col]))))
+            except Exception:
+                values[col] = 0
+
+        current_sum = sum(values.values())
+        preferred_size = str(preferred_sizes.get(idx_row, "") or "").strip()
+        preferred_col = f"Acquistare_{preferred_size}" if preferred_size else ""
+        if preferred_col not in values:
+            preferred_col = next((col for col, val in values.items() if val > 0), allocation_cols[0])
+
+        if current_sum > target_total:
+            excess = current_sum - target_total
+            reduction_order = sorted(
+                allocation_cols,
+                key=lambda col: (values.get(col, 0), 0 if col != preferred_col else -1),
+                reverse=True,
+            )
+            for col in reduction_order:
+                if excess <= 0:
+                    break
+                dec = min(values.get(col, 0), excess)
+                values[col] = values.get(col, 0) - dec
+                excess -= dec
+        elif current_sum < target_total:
+            values[preferred_col] = values.get(preferred_col, 0) + (target_total - current_sum)
+
+        for col in allocation_cols:
+            df.loc[idx_row, col] = max(0, int(values.get(col, 0)))
 
 
 def _run_math_forecast(df_input: pd.DataFrame, fattore_copertura: float, is_continuativa: bool) -> Dict[str, Any]:
@@ -597,6 +822,13 @@ def _run_math_forecast(df_input: pd.DataFrame, fattore_copertura: float, is_cont
             col_acq_m = f"Acquistare_{taglia_migliore[idx_row]}"
             df_m.loc[idx_row, col_acq_m] = max(0, int(df_m.loc[idx_row, col_acq_m]) + diff)
 
+    _rebalance_nonnegative_allocations(
+        df_m,
+        total_col="Da_Acquistare_Totale",
+        allocation_cols=colonne_acquistare,
+        preferred_sizes=taglia_migliore,
+    )
+
     colonne_finali = (
         [
             "Codice_Articolo",
@@ -611,7 +843,10 @@ def _run_math_forecast(df_input: pd.DataFrame, fattore_copertura: float, is_cont
             "Giacenza",
             "Predizione_Vendite",
             "Da_Acquistare_Totale",
+            "Fascia_Prezzo",
+            "Prezzo_Listino",
             "Prezzo_Acquisto",
+            "Prezzo_Vendita",
         ]
         + colonne_acquistare
     )
@@ -747,12 +982,25 @@ def _run_rf_and_hybrid(
             risultato_rf.loc[idx_row, col_fix] = max(0, int(risultato_rf.loc[idx_row, col_fix]) + diff)
     risultato_rf = risultato_rf.drop(columns=["_somma_acq", "_diff_acq"])
 
-    if "Prezzo_Acquisto" in df_math_latest.columns:
+    _rebalance_nonnegative_allocations(
+        risultato_rf,
+        total_col="Da_Acquistare_Totale",
+        allocation_cols=acq_cols_rf,
+        preferred_sizes=taglia_top_rf,
+    )
+
+    enrich_cols_rf = [
+        c
+        for c in ("Fascia_Prezzo", "Prezzo_Listino", "Prezzo_Acquisto", "Prezzo_Vendita")
+        if c in df_math_latest.columns
+    ]
+    if enrich_cols_rf:
         risultato_rf = risultato_rf.merge(
-            df_math_latest[["Codice_Articolo", "Prezzo_Acquisto"]].drop_duplicates(),
+            df_math_latest[["Codice_Articolo"] + enrich_cols_rf].drop_duplicates(),
             on="Codice_Articolo",
             how="left",
         )
+    if "Prezzo_Acquisto" in risultato_rf.columns:
         risultato_rf["Budget_Acquisto"] = (risultato_rf["Da_Acquistare_Totale"] * risultato_rf["Prezzo_Acquisto"]).round(2)
 
     df_mat_for_ib = df_math_latest.drop(columns=[c for c in ("Prezzo_Acquisto", "Budget_Acquisto") if c in df_math_latest.columns], errors="ignore")
@@ -811,6 +1059,14 @@ def _run_rf_and_hybrid(
             df_ib.loc[idx_row, col_fix] = max(0, int(df_ib.loc[idx_row, col_fix]) + diff)
     df_ib["Ibrido_Totale"] = df_ib[col_ibrido].sum(axis=1).astype(int)
 
+    _rebalance_nonnegative_allocations(
+        df_ib,
+        total_col="Ibrido_Totale_Grezzo",
+        allocation_cols=col_ibrido,
+        preferred_sizes=taglia_top,
+    )
+    df_ib["Ibrido_Totale"] = df_ib[col_ibrido].sum(axis=1).astype(int)
+
     desc_col = next((c for c in ("Descrizione_Math", "Descrizione_x", "Descrizione") if c in df_ib.columns), None)
     cat_col = next((c for c in ("Categoria_Math", "Categoria_x", "Categoria") if c in df_ib.columns), None)
     tip_col = next((c for c in ("Tipologia_Math", "Tipologia_x", "Tipologia") if c in df_ib.columns), None)
@@ -825,12 +1081,18 @@ def _run_rf_and_hybrid(
     new_names = ["Codice_Articolo"] + extra_names + (["Descrizione"] if desc_col else []) + ["Math_Totale", "RF_Totale", "Ibrido_Totale"] + [f"Ibrido_{t}" for t in taglie_ib]
     df_ibrido.columns = new_names
 
-    if "Prezzo_Acquisto" in df_math_latest.columns:
+    enrich_cols_ib = [
+        c
+        for c in ("Fascia_Prezzo", "Prezzo_Listino", "Prezzo_Acquisto", "Prezzo_Vendita")
+        if c in df_math_latest.columns
+    ]
+    if enrich_cols_ib:
         df_ibrido = df_ibrido.merge(
-            df_math_latest[["Codice_Articolo", "Prezzo_Acquisto"]].drop_duplicates(),
+            df_math_latest[["Codice_Articolo"] + enrich_cols_ib].drop_duplicates(),
             on="Codice_Articolo",
             how="left",
         )
+    if "Prezzo_Acquisto" in df_ibrido.columns:
         df_ibrido["Budget_Acquisto"] = (df_ibrido["Ibrido_Totale"] * df_ibrido["Prezzo_Acquisto"]).round(2)
 
     return {
@@ -884,18 +1146,30 @@ def run_orders_pipeline(
         "orders_root": str(orders_root),
         "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
         "bundles_detected": [b.code for b in bundles_all],
+        "historical_sources": [],
         "current": {},
         "continuativa": {},
     }
+
+    summary["historical_sources"] = _export_historical_source_bundles(
+        bundles_all,
+        output_orders=output_orders,
+        logger=logger,
+    )
 
     current_bundle: Optional[SeasonBundle] = discovered["current_latest"]
     if current_bundle:
         logger.log(f"Corrente: uso stagione {current_bundle.code}")
         df_input = _estrai_matematico(current_bundle.totali, current_bundle.colori, current_bundle.taglie)
+        if current_bundle.listino and current_bundle.listino.exists():
+            logger.log(f"Corrente: merge listino/fasce da {current_bundle.listino.name}")
+            df_listino = _estrai_listino_fasce(current_bundle.listino)
+            df_input = pd.merge(df_input, df_listino, on="Codice_Articolo", how="left")
         if current_bundle.prezzi and current_bundle.prezzi.exists():
             logger.log(f"Corrente: merge prezzi acquisto da {current_bundle.prezzi.name}")
             df_prezzi = _estrai_prezzi_acquisto(current_bundle.prezzi)
             df_input = pd.merge(df_input, df_prezzi, on="Codice_Articolo", how="left")
+        df_input = _apply_price_band(df_input)
 
         math_res = _run_math_forecast(df_input, fattore_copertura=fattore_copertura, is_continuativa=False)
         _save_csv(df_input, output_orders / "orders_current_dati_originali.csv")
@@ -909,6 +1183,7 @@ def run_orders_pipeline(
             "articles_input": int(len(df_input)),
             "futuri_continuativi": int(len(math_res["scope"])),
             "totale_math": int(math_res["totale"]),
+            "listino_file": str(current_bundle.listino) if current_bundle.listino else "",
             "prezzi_file": str(current_bundle.prezzi) if current_bundle.prezzi else "",
             "output_files": [
                 "orders_current_dati_originali.csv",
@@ -924,10 +1199,15 @@ def run_orders_pipeline(
     if cont_bundle:
         logger.log(f"Continuativa: uso stagione latest {cont_bundle.code} (math)")
         df_input = _estrai_matematico(cont_bundle.totali, cont_bundle.colori, cont_bundle.taglie)
+        if cont_bundle.listino and cont_bundle.listino.exists():
+            logger.log(f"Continuativa: merge listino/fasce da {cont_bundle.listino.name}")
+            df_listino = _estrai_listino_fasce(cont_bundle.listino)
+            df_input = pd.merge(df_input, df_listino, on="Codice_Articolo", how="left")
         if cont_bundle.prezzi and cont_bundle.prezzi.exists():
             logger.log(f"Continuativa: merge prezzi acquisto da {cont_bundle.prezzi.name}")
             df_prezzi = _estrai_prezzi_acquisto(cont_bundle.prezzi)
             df_input = pd.merge(df_input, df_prezzi, on="Codice_Articolo", how="left")
+        df_input = _apply_price_band(df_input)
 
         math_res = _run_math_forecast(df_input, fattore_copertura=fattore_copertura, is_continuativa=True)
         _save_csv(df_input, output_orders / "orders_continuativa_dati_originali.csv")
@@ -938,6 +1218,7 @@ def run_orders_pipeline(
             "season": cont_bundle.code,
             "articles_input": int(len(df_input)),
             "totale_math": int(math_res["totale"]),
+            "listino_file": str(cont_bundle.listino) if cont_bundle.listino else "",
             "prezzi_file": str(cont_bundle.prezzi) if cont_bundle.prezzi else "",
             "output_files": [
                 "orders_continuativa_dati_originali.csv",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -62,6 +63,22 @@ def _pick_orders_source_run_id(conn, explicit_run_id: Optional[str]) -> str:
 
 def _safe_num(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce").fillna(0.0)
+
+
+def _season_sort_key(code: str) -> tuple[int, int, str]:
+    raw = str(code or "").strip().lower()
+    m = re.search(r"(\d{2,4})", raw)
+    year = int(m.group(1)) if m else -1
+    if 0 <= year < 100:
+        year += 2000
+    season_char = next((ch for ch in reversed(raw) if ch.isalpha()), "")
+    season_rank = {"y": 0, "g": 0, "i": 1, "e": 1}.get(season_char, 9)
+    return year, season_rank, raw
+
+
+def _season_token(code: str) -> str:
+    text = re.sub(r"[^a-z0-9]+", "_", str(code or "").strip().lower()).strip("_")
+    return text or "unknown"
 
 
 def _build_forecast_df(
@@ -155,8 +172,11 @@ def _build_source_df(
     source_size_df: pd.DataFrame,
     *,
     module: str,
+    season_code: Optional[str] = None,
 ) -> Optional[pd.DataFrame]:
     m = source_main_df[source_main_df["module"] == module].copy()
+    if season_code:
+        m = m[m["season_code"].astype(str).str.strip() == str(season_code).strip()]
     if m.empty:
         return None
     m = m.sort_values(["article_code"]).reset_index(drop=True)
@@ -175,10 +195,18 @@ def _build_source_df(
             "Venduto_Extra": _safe_num(m["venduto_extra"]).round().astype(int),
         }
     )
+    if "fascia_prezzo" in m.columns and m["fascia_prezzo"].notna().any():
+        out["Fascia_Prezzo"] = m["fascia_prezzo"].fillna("")
+    if "prezzo_listino" in m.columns and m["prezzo_listino"].notna().any():
+        out["Prezzo_Listino"] = pd.to_numeric(m["prezzo_listino"], errors="coerce")
     if m["prezzo_acquisto"].notna().any():
         out["Prezzo_Acquisto"] = pd.to_numeric(m["prezzo_acquisto"], errors="coerce")
+    if "prezzo_vendita" in m.columns and m["prezzo_vendita"].notna().any():
+        out["Prezzo_Vendita"] = pd.to_numeric(m["prezzo_vendita"], errors="coerce")
 
     s = source_size_df[source_size_df["module"] == module].copy()
+    if season_code:
+        s = s[s["season_code"].astype(str).str.strip() == str(season_code).strip()]
     if not s.empty:
         s["size"] = pd.to_numeric(s["size"], errors="coerce")
         s = s.dropna(subset=["size"])
@@ -212,7 +240,10 @@ def _build_source_df(
         "Venduto_Periodo",
         "Giacenza",
         "Venduto_Extra",
+        "Fascia_Prezzo",
+        "Prezzo_Listino",
         "Prezzo_Acquisto",
+        "Prezzo_Vendita",
     ]
     ordered = [c for c in priority_cols if c in out.columns] + vend_size_cols
     remaining = [c for c in out.columns if c not in ordered]
@@ -293,7 +324,10 @@ def export_orders_outputs_from_db(
               venduto_periodo,
               giacenza,
               venduto_extra,
-              prezzo_acquisto
+              fascia_prezzo,
+              prezzo_listino,
+              prezzo_acquisto,
+              prezzo_vendita
             FROM fact_order_source
             WHERE run_id = %s::uuid
             ORDER BY module, article_code
@@ -365,13 +399,57 @@ def export_orders_outputs_from_db(
         "current": output_orders / "orders_current_dati_originali.csv",
         "continuativa": output_orders / "orders_continuativa_dati_originali.csv",
     }
+    module_seasons: Dict[str, List[str]] = {}
+    for module in ("current", "continuativa"):
+        vals = (
+            source_main_df.loc[source_main_df["module"] == module, "season_code"]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .tolist()
+        )
+        uniq: List[str] = []
+        for val in vals:
+            if val and val not in uniq:
+                uniq.append(val)
+        module_seasons[module] = sorted(uniq, key=_season_sort_key)
+
+    latest_source_season = {
+        module: (seasons[-1] if seasons else None)
+        for module, seasons in module_seasons.items()
+    }
+
     for module, path in source_file_map.items():
-        df_src = _build_source_df(source_main_df, source_size_df, module=module)
+        df_src = _build_source_df(
+            source_main_df,
+            source_size_df,
+            module=module,
+            season_code=latest_source_season.get(module),
+        )
         if df_src is None or df_src.empty:
             continue
         df_src.to_csv(path, index=False)
         source_written[module] = path
         source_rows[module] = int(len(df_src))
+
+    historical_sources: List[Dict[str, Any]] = []
+    history_dir = output_orders / "history_source"
+    history_dir.mkdir(parents=True, exist_ok=True)
+    for module, seasons in module_seasons.items():
+        for season in seasons:
+            df_src = _build_source_df(source_main_df, source_size_df, module=module, season_code=season)
+            if df_src is None or df_src.empty:
+                continue
+            out_path = history_dir / f"orders_source_{_season_token(season)}.csv"
+            df_src.to_csv(out_path, index=False)
+            historical_sources.append(
+                {
+                    "module": module,
+                    "season": season,
+                    "file": f"history_source/{out_path.name}",
+                    "articles_input": int(len(df_src)),
+                }
+            )
 
     def _season_for(module: str) -> str:
         vals = pd.concat(
@@ -381,8 +459,13 @@ def export_orders_outputs_from_db(
             ],
             ignore_index=True,
         )
-        vals = vals.dropna().astype(str).str.strip().tolist()
-        return vals[0] if vals else "unknown"
+        uniq = []
+        for val in vals.dropna().astype(str).str.strip().tolist():
+            if val and val not in uniq:
+                uniq.append(val)
+        if not uniq:
+            return "unknown"
+        return sorted(uniq, key=_season_sort_key)[-1]
 
     current_files = [p.name for k, p in written.items() if k[0] == "current"]
     continuativa_files = [p.name for k, p in written.items() if k[0] == "continuativa" and k[1] == "math"]
@@ -404,6 +487,7 @@ def export_orders_outputs_from_db(
         "source_run_id": run_id,
         "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
         "bundles_detected": sorted(season_values),
+        "historical_sources": historical_sources,
         "current": {
             "season": _season_for("current"),
             "articles_input": source_rows.get("current", rows_count.get(("current", "math"), 0)),

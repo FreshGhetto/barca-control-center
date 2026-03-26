@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import os
+import re
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
 import pandas as pd
 
 try:
@@ -72,6 +75,15 @@ def _txt(v: Any) -> Optional[str]:
     return s if s else None
 
 
+def _class_label(v: Any) -> Optional[str]:
+    s = _txt(v)
+    if not s:
+        return None
+    if s in {":", "-", "--", "N/D", "ND", "N.D.", "NULL"}:
+        return None
+    return s
+
+
 def _article(v: Any) -> Optional[str]:
     s = _txt(v)
     return s.upper() if s else None
@@ -104,6 +116,17 @@ def _i(v: Any) -> Optional[int]:
     return int(round(x)) if x is not None else None
 
 
+def _clamp_num(v: Any, *, low: Optional[float] = None, high: Optional[float] = None) -> Optional[float]:
+    x = _f(v)
+    if x is None:
+        return None
+    if low is not None:
+        x = max(float(low), x)
+    if high is not None:
+        x = min(float(high), x)
+    return float(x)
+
+
 def _b(v: Any) -> Optional[bool]:
     if v is None:
         return None
@@ -134,6 +157,17 @@ def _dt(v: Any):
 def _size(col: str) -> Optional[int]:
     suf = col.split("_")[-1]
     return int(suf) if suf.isdigit() else None
+
+
+def _season_sort_key(code: str) -> Tuple[int, int, str]:
+    raw = str(code or "").strip().lower()
+    m = re.search(r"(\d{2,4})", raw)
+    year = int(m.group(1)) if m else -1
+    if 0 <= year < 100:
+        year += 2000
+    season_char = next((ch for ch in reversed(raw) if ch.isalpha()), "")
+    season_rank = {"y": 0, "g": 0, "i": 1, "e": 1}.get(season_char, 9)
+    return year, season_rank, raw
 
 
 def _cfg_shops(root: Path) -> Dict[str, Dict[str, Any]]:
@@ -179,9 +213,93 @@ def _merge_art(dest: Dict[str, Dict[str, Optional[str]]], code: Any, row: Dict[s
         {"description": None, "categoria": None, "tipologia": None, "marchio": None, "colore": None, "materiale": None},
     )
     for k in rec.keys():
-        v = _txt(row.get(k))
+        v = _class_label(row.get(k)) if k in {"categoria", "tipologia"} else _txt(row.get(k))
         if v and not rec[k]:
             rec[k] = v
+
+
+def _fill_missing_classifications(
+    frames: List[Tuple[pd.DataFrame, Dict[str, Any]]],
+) -> List[Tuple[pd.DataFrame, Dict[str, Any]]]:
+    if not frames:
+        return frames
+
+    samples: List[pd.DataFrame] = []
+    for df, _meta in frames:
+        if df is None or df.empty:
+            continue
+        work = df.copy()
+        if "Codice_Articolo" not in work.columns:
+            continue
+        work["Codice_Articolo"] = work["Codice_Articolo"].map(_article)
+        work["Categoria"] = work.get("Categoria", pd.Series(index=work.index, dtype="object")).map(_class_label)
+        work["Tipologia"] = work.get("Tipologia", pd.Series(index=work.index, dtype="object")).map(_class_label)
+        work["Marchio"] = work.get("Marchio", pd.Series(index=work.index, dtype="object")).map(_txt)
+        work["Descrizione"] = work.get("Descrizione", pd.Series(index=work.index, dtype="object")).map(_txt)
+        samples.append(work[["Codice_Articolo", "Categoria", "Tipologia", "Marchio", "Descrizione"]])
+
+    if not samples:
+        return frames
+
+    source_df = pd.concat(samples, ignore_index=True).drop_duplicates()
+
+    article_cat: Dict[str, str] = {}
+    article_tip: Dict[str, str] = {}
+    article_groups = source_df.groupby("Codice_Articolo", dropna=True)
+    for article_code, grp in article_groups:
+        cats = {v for v in grp["Categoria"].dropna().tolist() if v}
+        tips = {v for v in grp["Tipologia"].dropna().tolist() if v}
+        if len(cats) == 1:
+            article_cat[str(article_code)] = next(iter(cats))
+        if len(tips) == 1:
+            article_tip[str(article_code)] = next(iter(tips))
+
+    pair_cat: Dict[Tuple[str, str], str] = {}
+    pair_tip: Dict[Tuple[str, str], str] = {}
+    pair_df = source_df.dropna(subset=["Marchio", "Descrizione"]).copy()
+    if not pair_df.empty:
+        for key, grp in pair_df.groupby(["Marchio", "Descrizione"], dropna=True):
+            cats = {v for v in grp["Categoria"].dropna().tolist() if v}
+            tips = {v for v in grp["Tipologia"].dropna().tolist() if v}
+            if len(cats) == 1:
+                pair_cat[(str(key[0]), str(key[1]))] = next(iter(cats))
+            if len(tips) == 1:
+                pair_tip[(str(key[0]), str(key[1]))] = next(iter(tips))
+
+    out_frames: List[Tuple[pd.DataFrame, Dict[str, Any]]] = []
+    for df, meta in frames:
+        if df is None or df.empty or "Codice_Articolo" not in df.columns:
+            out_frames.append((df, meta))
+            continue
+        out = df.copy()
+        out["Codice_Articolo"] = out["Codice_Articolo"].map(_article)
+        out["Marchio"] = out.get("Marchio", pd.Series(index=out.index, dtype="object")).map(_txt)
+        out["Descrizione"] = out.get("Descrizione", pd.Series(index=out.index, dtype="object")).map(_txt)
+        out["Categoria"] = out.get("Categoria", pd.Series(index=out.index, dtype="object")).map(_class_label)
+        out["Tipologia"] = out.get("Tipologia", pd.Series(index=out.index, dtype="object")).map(_class_label)
+
+        for idx in out.index:
+            article_code = _article(out.at[idx, "Codice_Articolo"])
+            marchio = _txt(out.at[idx, "Marchio"])
+            descr = _txt(out.at[idx, "Descrizione"])
+            pair_key = (marchio, descr) if marchio and descr else None
+
+            if not _class_label(out.at[idx, "Categoria"]):
+                fill_cat = article_cat.get(article_code) if article_code else None
+                if not fill_cat and pair_key:
+                    fill_cat = pair_cat.get(pair_key)
+                if fill_cat:
+                    out.at[idx, "Categoria"] = fill_cat
+
+            if not _class_label(out.at[idx, "Tipologia"]):
+                fill_tip = article_tip.get(article_code) if article_code else None
+                if not fill_tip and pair_key:
+                    fill_tip = pair_tip.get(pair_key)
+                if fill_tip:
+                    out.at[idx, "Tipologia"] = fill_tip
+
+        out_frames.append((out, meta))
+    return out_frames
 
 
 def _order_jobs(out_orders: Path, summary: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -216,6 +334,612 @@ def _order_source_jobs(out_orders: Path, summary: Dict[str, Any]) -> List[Dict[s
     return out
 
 
+def _order_output_path(out_orders: Path, file_ref: Any) -> Optional[Path]:
+    file_txt = _txt(file_ref)
+    if not file_txt:
+        return None
+    p = Path(file_txt)
+    if not p.is_absolute():
+        p = out_orders / p
+    return p
+
+
+def _order_source_history_jobs(out_orders: Path, summary: Dict[str, Any]) -> List[Dict[str, Any]]:
+    items = summary.get("historical_sources") if isinstance(summary, dict) else []
+    if not isinstance(items, list):
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        module = _txt(item.get("module"))
+        season = _txt(item.get("season"))
+        path = _order_output_path(out_orders, item.get("file"))
+        if not module or not season or path is None or not path.exists():
+            continue
+        out.append({"path": path, "module": module, "season": season})
+    return out
+
+
+def _season_module_from_code(code: Any) -> Optional[str]:
+    raw = (_txt(code) or "").lower()
+    if not raw:
+        return None
+    season_char = next((ch for ch in reversed(raw) if ch.isalpha()), "")
+    if season_char in {"i", "e"}:
+        return "current"
+    if season_char in {"y", "g"}:
+        return "continuativa"
+    return None
+
+
+def _catalog_source_history_frames(
+    dsn: str,
+    existing_keys: Sequence[Tuple[str, str]],
+) -> Tuple[List[Tuple[pd.DataFrame, Dict[str, str]]], List[Dict[str, Any]]]:
+    normalized_keys = {
+        ((str(module or "").strip().lower()), (str(season or "").strip().lower()))
+        for module, season in existing_keys
+        if str(module or "").strip() and str(season or "").strip()
+    }
+
+    sql = """
+        SELECT
+          s.season_code,
+          s.article_code,
+          COALESCE(NULLIF(s.categoria, ''), a.categoria) AS categoria,
+          COALESCE(NULLIF(s.tipologia, ''), a.tipologia) AS tipologia,
+          a.marchio,
+          s.color AS colore,
+          a.materiale,
+          COALESCE(NULLIF(s.description, ''), a.description) AS descrizione,
+          COALESCE(s.ven, 0) AS venduto_qty,
+          COALESCE(s.giac, 0) AS giacenza,
+          p.price_listino,
+          p.price_saldo
+        FROM vw_catalog_article_store_current s
+        LEFT JOIN dim_article a
+          ON a.article_code = s.article_code
+        LEFT JOIN vw_catalog_price_current p
+          ON p.season_code = s.season_code
+         AND p.article_code = s.article_code
+        WHERE s.store_code = 'XX'
+          AND s.season_code IS NOT NULL
+          AND UPPER(s.season_code) <> 'UNKNOWN'
+        ORDER BY s.season_code, s.article_code
+    """
+
+    frames: List[Tuple[pd.DataFrame, Dict[str, str]]] = []
+    jobs: List[Dict[str, Any]] = []
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+
+    if not rows:
+        return frames, jobs
+
+    raw_df = pd.DataFrame(
+        rows,
+        columns=[
+            "season_code",
+            "article_code",
+            "categoria",
+            "tipologia",
+            "marchio",
+            "colore",
+            "materiale",
+            "descrizione",
+            "venduto_qty",
+            "giacenza",
+            "price_listino",
+            "price_saldo",
+        ],
+    )
+
+    for season_code, season_df in raw_df.groupby("season_code", sort=True):
+        season_txt = _txt(season_code)
+        module = _season_module_from_code(season_txt)
+        if not season_txt or not module:
+            continue
+        normalized_key = (module.lower(), season_txt.lower())
+        if normalized_key in normalized_keys:
+            continue
+
+        out_df = pd.DataFrame(
+            {
+                "Codice_Articolo": season_df["article_code"].map(_article),
+                "Categoria": season_df["categoria"].map(_txt),
+                "Tipologia": season_df["tipologia"].map(_txt),
+                "Marchio": season_df["marchio"].map(_txt),
+                "Colore": season_df["colore"].map(_txt),
+                "Materiale": season_df["materiale"].map(_txt),
+                "Descrizione": season_df["descrizione"].map(_txt),
+                # Il catalogo storico non separa venduto periodo/totale come i bundle ordini.
+                # Per il confronto stagionale usiamo il venduto accumulato del report per entrambi.
+                "Venduto_Totale": pd.to_numeric(season_df["venduto_qty"], errors="coerce").fillna(0.0),
+                "Venduto_Periodo": pd.to_numeric(season_df["venduto_qty"], errors="coerce").fillna(0.0),
+                "Giacenza": pd.to_numeric(season_df["giacenza"], errors="coerce").fillna(0.0),
+                "Venduto_Extra": 0.0,
+                "Fascia_Prezzo": None,
+                "Prezzo_Listino": pd.to_numeric(season_df["price_listino"], errors="coerce"),
+                "Prezzo_Vendita": pd.to_numeric(season_df["price_saldo"], errors="coerce"),
+            }
+        )
+        out_df = _apply_price_band(out_df)
+        out_df = out_df[out_df["Codice_Articolo"].notna()].copy()
+        if out_df.empty:
+            continue
+        frames.append((out_df, {"module": module, "season": season_txt, "source": "catalog_snapshot"}))
+        jobs.append(
+            {
+                "module": module,
+                "season": season_txt,
+                "source": "catalog_snapshot",
+                "file": f"catalog://vw_catalog_article_store_current/{season_txt}",
+                "rows": int(len(out_df)),
+            }
+        )
+
+    return frames, jobs
+
+
+def _catalog_price_snapshot_df(dsn: str) -> pd.DataFrame:
+    sql = """
+        SELECT
+          season_code,
+          article_code,
+          price_listino,
+          price_saldo
+        FROM vw_catalog_price_current
+        WHERE season_code IS NOT NULL
+          AND article_code IS NOT NULL
+    """
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+    if not rows:
+        return pd.DataFrame(columns=["season_code", "article_code", "price_listino", "price_saldo"])
+    df = pd.DataFrame(rows, columns=["season_code", "article_code", "price_listino", "price_saldo"])
+    df["season_code"] = df["season_code"].map(lambda v: (_txt(v) or "").upper())
+    df["article_code"] = df["article_code"].map(_article)
+    return df
+
+
+def _read_csv_head(path: Path, max_chars: int = 8192) -> str:
+    try:
+        with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+            return f.read(max_chars)
+    except Exception:
+        return ""
+
+
+def _extract_season_code(text: str, filename: str) -> Optional[str]:
+    m = re.search(r"STAGIONE[:\s]*([0-9]{2}[A-Z])", str(text or ""), flags=re.IGNORECASE)
+    if m:
+        return m.group(1).lower()
+    m = re.search(r"([0-9]{2}[a-zA-Z])(?:_|$)", str(filename or ""), flags=re.IGNORECASE)
+    if m:
+        return m.group(1).lower()
+    return None
+
+
+def _parse_csv_number(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    text = text.replace(".", "").replace(",", ".")
+    try:
+        number = float(text)
+    except Exception:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _parse_csv_int(value: Any) -> Optional[int]:
+    number = _parse_csv_number(value)
+    return int(round(number)) if number is not None else None
+
+
+def _discover_order_detail_reports(root: Path) -> List[Dict[str, Any]]:
+    orders_root = root / "input" / "orders"
+    if not orders_root.exists():
+        return []
+
+    reports_by_season: Dict[str, Dict[str, Any]] = {}
+    for path in orders_root.rglob("*.csv"):
+        name = path.name.lower()
+        if re.search(r"_sd_[1-4]\.csv$", name):
+            continue
+        if name.endswith("prezzo_acq-ven.csv"):
+            continue
+        head = _read_csv_head(path)
+        upper = head.upper()
+        if "ANALISI ARTICOLI" not in upper:
+            continue
+        if "RAFFRONTA CON VENDUTO NEL PERIODO" not in upper:
+            continue
+        if "COLORE" not in upper or "MATERIALE" not in upper or "MARCHIO" not in upper:
+            continue
+        season = _extract_season_code(head, path.name)
+        module = _season_module_from_code(season)
+        if not season or not module:
+            continue
+        candidate = {
+            "path": path,
+            "season": season,
+            "module": module,
+        }
+        current = reports_by_season.get(season)
+        if current is None or path.stat().st_mtime > current["path"].stat().st_mtime:
+            reports_by_season[season] = candidate
+
+    return [
+        reports_by_season[season]
+        for season in sorted(reports_by_season.keys(), key=_season_sort_key)
+    ]
+
+
+def _discover_native_order_bundle_seasons(root: Path) -> set[str]:
+    orders_root = root / "input" / "orders"
+    if not orders_root.exists():
+        return set()
+
+    pattern = re.compile(r"^(?P<season>.+?)_sd_(?P<part>[1234])\.csv$", re.IGNORECASE)
+    grouped: Dict[str, set[int]] = {}
+    for path in orders_root.glob("*.csv"):
+        match = pattern.match(path.name)
+        if not match:
+            continue
+        season = (_txt(match.group("season")) or "").lower()
+        part = int(match.group("part"))
+        grouped.setdefault(season, set()).add(part)
+
+    return {season for season, parts in grouped.items() if {1, 2, 3}.issubset(parts)}
+
+
+def _parse_order_detail_report(path: Path) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    current_reparto = current_colore = current_materiale = current_marchio = None
+
+    with open(path, "r", encoding="utf-8-sig", errors="replace", newline="") as f:
+        for row in csv.reader(f):
+            if "ARTICOLO" not in row:
+                continue
+            elements = row[row.index("ARTICOLO") + 1 :]
+            if "TOTALI :" in elements:
+                elements = elements[: elements.index("TOTALI :")]
+            article_indices = [
+                idx
+                for idx, val in enumerate(elements)
+                if "/" in (val.strip().split()[0] if val.strip().split() else "")
+                and any(c.isdigit() for c in (val.strip().split()[0] if val.strip().split() else ""))
+            ]
+            last_idx = 0
+            for idx in article_indices:
+                pre_chunk = elements[last_idx:idx]
+                pre_elements = [
+                    item.strip()
+                    for item in pre_chunk
+                    if item.strip()
+                    and not re.match(r"^-?\d+(?:,\d+)?$|^%$", item.strip())
+                    and not item.startswith("SUBTOTALE")
+                    and not item.startswith("VALORE")
+                    and not item.startswith("COSTO")
+                ]
+                if len(pre_elements) >= 1:
+                    current_marchio = pre_elements[-1]
+                if len(pre_elements) >= 2:
+                    current_materiale = pre_elements[-2]
+                if len(pre_elements) >= 3:
+                    current_colore = pre_elements[-3]
+                if len(pre_elements) >= 4:
+                    current_reparto = pre_elements[-4]
+
+                raw_article = elements[idx].strip()
+                if not raw_article:
+                    last_idx = idx + 1
+                    continue
+                code = raw_article.split()[0].strip()
+                if not _article(code):
+                    last_idx = idx + 1
+                    continue
+                description = re.sub(r"\s+", " ", raw_article[len(code) :].strip()) or None
+                rows.append(
+                    {
+                        "Codice_Articolo": _article(code),
+                        "Categoria": None,
+                        "Tipologia": None,
+                        "Marchio": re.sub(r"\s+", " ", current_marchio).strip() if current_marchio else None,
+                        "Colore": re.sub(r"\s+", " ", current_colore).strip() if current_colore else None,
+                        "Materiale": re.sub(r"\s+", " ", current_materiale).strip() if current_materiale else None,
+                        "Descrizione": description,
+                        "Venduto_Totale": _parse_csv_int(elements[idx + 2]) if idx + 2 < len(elements) else None,
+                        "Venduto_Periodo": _parse_csv_int(elements[idx + 3]) if idx + 3 < len(elements) else None,
+                        "Giacenza": _parse_csv_int(elements[idx + 4]) if idx + 4 < len(elements) else None,
+                        "Venduto_Extra": 0,
+                        "Prezzo_Listino": None,
+                        "Prezzo_Acquisto": None,
+                        "Prezzo_Vendita": None,
+                        "Fascia_Prezzo": None,
+                        "_Reparto": re.sub(r"\s+", " ", current_reparto).strip() if current_reparto else None,
+                    }
+                )
+                last_idx = idx + 1
+
+    columns = [
+        "Codice_Articolo",
+        "Categoria",
+        "Tipologia",
+        "Marchio",
+        "Colore",
+        "Materiale",
+        "Descrizione",
+        "Venduto_Totale",
+        "Venduto_Periodo",
+        "Giacenza",
+        "Venduto_Extra",
+        "Prezzo_Listino",
+        "Prezzo_Acquisto",
+        "Prezzo_Vendita",
+        "Fascia_Prezzo",
+    ]
+    if not rows:
+        return pd.DataFrame(columns=columns)
+
+    df = pd.DataFrame(rows)
+    for col in ("Venduto_Totale", "Venduto_Periodo", "Giacenza", "Venduto_Extra"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    def _first_non_empty(series: pd.Series) -> Optional[str]:
+        for value in series:
+            text = _txt(value)
+            if text:
+                return text
+        return None
+
+    agg = {
+        "Categoria": _first_non_empty,
+        "Tipologia": _first_non_empty,
+        "Marchio": _first_non_empty,
+        "Colore": _first_non_empty,
+        "Materiale": _first_non_empty,
+        "Descrizione": _first_non_empty,
+        "Venduto_Totale": "max",
+        "Venduto_Periodo": "max",
+        "Giacenza": "max",
+        "Venduto_Extra": "max",
+        "Prezzo_Listino": "max",
+        "Prezzo_Acquisto": "max",
+        "Prezzo_Vendita": "max",
+        "Fascia_Prezzo": _first_non_empty,
+    }
+    out = df.groupby("Codice_Articolo", as_index=False).agg(agg)
+    for col in ("Venduto_Totale", "Venduto_Periodo", "Giacenza", "Venduto_Extra"):
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+    return out.reindex(columns=columns)
+
+
+def _order_detail_history_frames(root: Path) -> Tuple[List[Tuple[pd.DataFrame, Dict[str, Any]]], List[Dict[str, Any]]]:
+    frames: List[Tuple[pd.DataFrame, Dict[str, Any]]] = []
+    jobs: List[Dict[str, Any]] = []
+    for item in _discover_order_detail_reports(root):
+        df = _parse_order_detail_report(item["path"])
+        if df.empty:
+            continue
+        meta = {
+            "module": item["module"],
+            "season": item["season"],
+            "source": "detail_report",
+            "path": item["path"],
+        }
+        frames.append((df, meta))
+        jobs.append(
+            {
+                "module": item["module"],
+                "season": item["season"],
+                "source": "detail_report",
+                "file": str(item["path"]),
+                "rows": int(len(df)),
+            }
+        )
+    return frames, jobs
+
+
+def _overlay_order_detail(
+    base: pd.DataFrame,
+    detail: pd.DataFrame,
+    *,
+    detail_authoritative: bool = False,
+) -> pd.DataFrame:
+    if detail is None or detail.empty:
+        return base.copy() if base is not None else pd.DataFrame()
+    if base is None or base.empty:
+        return detail.copy()
+
+    out = detail.copy() if detail_authoritative else base.copy()
+    det = detail.copy()
+    base_df = base.copy()
+    out["Codice_Articolo"] = out.get("Codice_Articolo", pd.Series(dtype="object")).map(_article)
+    det["Codice_Articolo"] = det.get("Codice_Articolo", pd.Series(dtype="object")).map(_article)
+    base_df["Codice_Articolo"] = base_df.get("Codice_Articolo", pd.Series(dtype="object")).map(_article)
+    out = out[out["Codice_Articolo"].notna()].copy()
+    det = det[det["Codice_Articolo"].notna()].copy()
+    base_df = base_df[base_df["Codice_Articolo"].notna()].copy()
+
+    out = out.set_index("Codice_Articolo")
+    det = det.set_index("Codice_Articolo")
+    base_df = base_df.set_index("Codice_Articolo")
+    target_index = det.index if detail_authoritative else out.index.union(det.index)
+    out = out.reindex(target_index)
+    det = det.reindex(target_index)
+    base_df = base_df.reindex(target_index)
+
+    for col in det.columns.union(base_df.columns):
+        if col not in out.columns:
+            out[col] = pd.NA
+
+    for col in ("Marchio", "Colore", "Materiale", "Descrizione"):
+        if col not in out.columns:
+            out[col] = pd.NA
+        if col not in det.columns:
+            continue
+        preferred = det[col].apply(_txt)
+        fallback = base_df[col].apply(_txt) if col in base_df.columns else out[col].apply(_txt)
+        out[col] = preferred.where(preferred.notna(), fallback)
+
+    for col in ("Categoria", "Tipologia", "Fascia_Prezzo"):
+        if col not in out.columns:
+            out[col] = pd.NA
+        preferred = out[col].apply(_txt)
+        fallback = base_df[col].apply(_txt) if col in base_df.columns else (
+            det[col].apply(_txt) if col in det.columns else pd.Series(pd.NA, index=out.index, dtype="object")
+        )
+        out[col] = preferred.where(preferred.notna(), fallback)
+
+    for col in ("Venduto_Totale", "Venduto_Periodo", "Giacenza"):
+        if col not in out.columns:
+            out[col] = pd.NA
+        if col not in det.columns:
+            continue
+        preferred = pd.to_numeric(det[col], errors="coerce")
+        fallback = pd.to_numeric(base_df[col], errors="coerce") if col in base_df.columns else pd.to_numeric(out[col], errors="coerce")
+        out[col] = preferred.where(preferred.notna(), fallback)
+
+    for col in ("Venduto_Extra", "Prezzo_Listino", "Prezzo_Acquisto", "Prezzo_Vendita"):
+        if col not in out.columns:
+            out[col] = pd.NA
+        preferred = pd.to_numeric(out[col], errors="coerce")
+        if col in base_df.columns:
+            fallback = pd.to_numeric(base_df[col], errors="coerce")
+        elif col in det.columns:
+            fallback = pd.to_numeric(det[col], errors="coerce")
+        else:
+            fallback = pd.Series(np.nan, index=out.index, dtype="float64")
+        out[col] = preferred.where(preferred.notna(), fallback)
+
+    out = out.reset_index()
+    return _apply_price_band(out)
+
+
+def _merge_order_source_frames(
+    base_frames: List[Tuple[pd.DataFrame, Dict[str, Any]]],
+    detail_frames: List[Tuple[pd.DataFrame, Dict[str, Any]]],
+    *,
+    native_bundle_seasons: Optional[set[str]] = None,
+) -> List[Tuple[pd.DataFrame, Dict[str, Any]]]:
+    merged: Dict[Tuple[str, str], Tuple[pd.DataFrame, Dict[str, Any]]] = {}
+    native_bundle_seasons = {str(s).strip().lower() for s in (native_bundle_seasons or set()) if str(s).strip()}
+
+    for df, meta in base_frames:
+        key = ((_txt(meta.get("module")) or "").lower(), (_txt(meta.get("season")) or "").lower())
+        if not all(key):
+            continue
+        merged[key] = (df.copy(), dict(meta))
+
+    for detail_df, detail_meta in detail_frames:
+        key = ((_txt(detail_meta.get("module")) or "").lower(), (_txt(detail_meta.get("season")) or "").lower())
+        if not all(key):
+            continue
+        if key in merged:
+            base_df, base_meta = merged[key]
+            base_source = (_txt(base_meta.get("source")) or "orders_source").lower()
+            season_key = key[1]
+            merged[key] = (
+                _overlay_order_detail(
+                    base_df,
+                    detail_df,
+                    detail_authoritative=(base_source == "catalog_snapshot" or season_key not in native_bundle_seasons),
+                ),
+                base_meta,
+            )
+        else:
+            merged[key] = (detail_df.copy(), dict(detail_meta))
+
+    return [
+        merged[key]
+        for key in sorted(merged.keys(), key=lambda item: _season_sort_key(item[1]))
+    ]
+
+
+def _is_valid_price_band(value: Any) -> bool:
+    text = _txt(value) or ""
+    return bool(re.match(r"^\d+\s*-\s*\d+$", text))
+
+
+def _price_band_label(value: Any) -> Optional[str]:
+    x = _f(value)
+    if x is None or x <= 0:
+        return None
+    whole = int(x)
+    if whole < 20:
+        return "0-19"
+    upper = (whole // 10) * 10 + 9
+    lower = upper - 9
+    return f"{lower}-{upper}"
+
+
+def _apply_price_band(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    if "Fascia_Prezzo" not in out.columns:
+        out["Fascia_Prezzo"] = None
+    out["Fascia_Prezzo"] = out["Fascia_Prezzo"].astype("object")
+
+    base_price = pd.Series(pd.NA, index=out.index, dtype="object")
+    for col in ("Prezzo_Listino", "Prezzo_Vendita", "Prezzo_Acquisto"):
+        if col not in out.columns:
+            continue
+        values = pd.to_numeric(out[col], errors="coerce")
+        base_price = base_price.where(base_price.notna(), values)
+
+    derived = base_price.map(_price_band_label)
+    current_band = out["Fascia_Prezzo"].map(lambda v: _txt(v) or "")
+    needs_fill = current_band.eq("") | ~current_band.map(_is_valid_price_band)
+    out.loc[needs_fill, "Fascia_Prezzo"] = derived.loc[needs_fill]
+    return out
+
+
+def _enrich_order_source_frame(
+    df: pd.DataFrame,
+    meta: Dict[str, Any],
+    catalog_prices: pd.DataFrame,
+) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    out = df.copy()
+    out["Codice_Articolo"] = out.get("Codice_Articolo", pd.Series(dtype="object")).map(_article)
+    season = (_txt(meta.get("season")) or "").upper()
+    if not season or catalog_prices.empty:
+        return out
+
+    price_slice = catalog_prices.loc[catalog_prices["season_code"] == season, ["article_code", "price_listino", "price_saldo"]]
+    if price_slice.empty:
+        return out
+
+    out = out.merge(price_slice, left_on="Codice_Articolo", right_on="article_code", how="left")
+    if "Prezzo_Listino" not in out.columns:
+        out["Prezzo_Listino"] = None
+    if "Prezzo_Vendita" not in out.columns:
+        out["Prezzo_Vendita"] = None
+    out["Prezzo_Listino"] = pd.to_numeric(out["Prezzo_Listino"], errors="coerce").where(
+        pd.to_numeric(out["Prezzo_Listino"], errors="coerce").notna(),
+        pd.to_numeric(out["price_listino"], errors="coerce"),
+    )
+    out["Prezzo_Vendita"] = pd.to_numeric(out["Prezzo_Vendita"], errors="coerce").where(
+        pd.to_numeric(out["Prezzo_Vendita"], errors="coerce").notna(),
+        pd.to_numeric(out["price_saldo"], errors="coerce"),
+    )
+    out = out.drop(columns=["article_code", "price_listino", "price_saldo"], errors="ignore")
+    return _apply_price_band(out)
+
+
 def run_db_sync(
     root: Path,
     *,
@@ -241,7 +965,32 @@ def run_db_sync(
     jobs = _order_jobs(out_orders, ord_summary)
     ord_frames = [(_read_csv(j["path"]), j) for j in jobs]
     source_jobs = _order_source_jobs(out_orders, ord_summary)
-    ord_source_frames = [(_read_csv(j["path"]), j) for j in source_jobs]
+    history_source_jobs = _order_source_history_jobs(out_orders, ord_summary)
+
+    merged_source_jobs: List[Dict[str, Any]] = []
+    seen_source_keys = set()
+    for job in source_jobs + history_source_jobs:
+        key = (job.get("module"), job.get("season"))
+        if key in seen_source_keys:
+            continue
+        seen_source_keys.add(key)
+        merged_source_jobs.append(job)
+
+    catalog_price_df = _catalog_price_snapshot_df(dsn)
+    raw_ord_source_frames = [(_read_csv(j["path"]), j) for j in merged_source_jobs]
+    catalog_history_frames, catalog_history_jobs = _catalog_source_history_frames(
+        dsn,
+        [(j.get("module"), j.get("season")) for j in merged_source_jobs],
+    )
+    detail_history_frames, detail_history_jobs = _order_detail_history_frames(root)
+    native_bundle_seasons = _discover_native_order_bundle_seasons(root)
+    merged_ord_source_frames = _merge_order_source_frames(
+        raw_ord_source_frames + catalog_history_frames,
+        detail_history_frames,
+        native_bundle_seasons=native_bundle_seasons,
+    )
+    merged_ord_source_frames = _fill_missing_classifications(merged_ord_source_frames)
+    ord_source_frames = [(_enrich_order_source_frame(df, meta, catalog_price_df), meta) for df, meta in merged_ord_source_frames]
 
     cfg = _cfg_shops(root)
     shop_codes = set(cfg.keys())
@@ -300,8 +1049,8 @@ def run_db_sync(
             continue
         sales_map[(a, s)] = (
             run_id, _dt(r.get("snapshot_at")), a, s, _f(r.get("Consegnato_Qty")), _f(r.get("Venduto_Qty")),
-            _f(r.get("Periodo_Qty")), _f(r.get("Altro_Venduto_Qty")), _f(r.get("Sellout_Percent")),
-            _f(r.get("Sellout_Clamped")), _f(r.get("Valore_1")), _f(r.get("Valore_2")), _f(r.get("Valore_3")), _f(r.get("Valore_4")),
+            _f(r.get("Periodo_Qty")), _f(r.get("Altro_Venduto_Qty")), _clamp_num(r.get("Sellout_Percent"), low=0.0, high=250.0),
+            _clamp_num(r.get("Sellout_Clamped"), low=0.0, high=100.0), _f(r.get("Valore_1")), _f(r.get("Valore_2")), _f(r.get("Valore_3")), _f(r.get("Valore_4")),
         )
     sales_rows = list(sales_map.values())
 
@@ -312,7 +1061,7 @@ def run_db_sync(
             continue
         stock_map[(a, s)] = (
             run_id, _dt(r.get("snapshot_at")), a, s, _f(r.get("Ricevuto")), _f(r.get("Giacenza")), _f(r.get("Consegnato")), _f(r.get("Venduto")),
-            _f(r.get("Sellout_Percent")), _f(r.get("Size_35")), _f(r.get("Size_36")), _f(r.get("Size_37")), _f(r.get("Size_38")),
+            _clamp_num(r.get("Sellout_Percent"), low=0.0, high=250.0), _f(r.get("Size_35")), _f(r.get("Size_36")), _f(r.get("Size_37")), _f(r.get("Size_38")),
             _f(r.get("Size_39")), _f(r.get("Size_40")), _f(r.get("Size_41")), _f(r.get("Size_42")), _f(r.get("Valore_Giac")),
         )
     stock_rows = list(stock_map.values())
@@ -356,11 +1105,11 @@ def run_db_sync(
             if not a:
                 continue
             ord_main[(module, season, mode, a)] = (
-                run_id, module, season, mode, a, _f(r.get(tot_col)),
-                _f(r.get(pred_col)) if pred_col else None, _f(r.get("Prezzo_Acquisto")), _f(r.get("Budget_Acquisto")),
+                run_id, module, season, mode, a, _clamp_num(r.get(tot_col), low=0.0),
+                _clamp_num(r.get(pred_col), low=0.0) if pred_col else None, _clamp_num(r.get("Prezzo_Acquisto"), low=0.0), _clamp_num(r.get("Budget_Acquisto"), low=0.0),
             )
             for c in size_cols:
-                z, q = _size(c), _f(r.get(c))
+                z, q = _size(c), _clamp_num(r.get(c), low=0.0)
                 if z is None or q is None:
                     continue
                 k = (module, season, mode, a, int(z))
@@ -388,14 +1137,17 @@ def run_db_sync(
                 _txt(r.get("Colore")),
                 _txt(r.get("Materiale")),
                 _txt(r.get("Descrizione")),
-                _f(r.get("Venduto_Totale")),
-                _f(r.get("Venduto_Periodo")),
-                _f(r.get("Giacenza")),
-                _f(r.get("Venduto_Extra")),
-                _f(r.get("Prezzo_Acquisto")),
+                _clamp_num(r.get("Venduto_Totale"), low=0.0),
+                _clamp_num(r.get("Venduto_Periodo"), low=0.0),
+                _clamp_num(r.get("Giacenza"), low=0.0),
+                _clamp_num(r.get("Venduto_Extra"), low=0.0),
+                _txt(r.get("Fascia_Prezzo")),
+                _clamp_num(r.get("Prezzo_Listino"), low=0.0),
+                _clamp_num(r.get("Prezzo_Acquisto"), low=0.0),
+                _clamp_num(r.get("Prezzo_Vendita"), low=0.0),
             )
             for c in size_cols:
-                z, q = _size(c), _f(r.get(c))
+                z, q = _size(c), _clamp_num(r.get(c), low=0.0)
                 if z is None or q is None:
                     continue
                 k = (module, season, a, int(z))
@@ -428,6 +1180,9 @@ def run_db_sync(
             "create_schema": bool(create_schema),
             "orders_jobs": [{"module": j["module"], "mode": j["mode"], "season": j["season"], "file": str(j["path"])} for j in jobs],
             "order_source_jobs": [{"module": j["module"], "season": j["season"], "file": str(j["path"])} for j in source_jobs],
+            "order_source_history_jobs": [{"module": j["module"], "season": j["season"], "file": str(j["path"])} for j in history_source_jobs],
+            "catalog_source_history_jobs": catalog_history_jobs,
+            "order_detail_history_jobs": detail_history_jobs,
         }
         with conn.cursor() as cur:
             cur.execute(
@@ -552,13 +1307,14 @@ def run_db_sync(
                 """
                 INSERT INTO fact_order_source (
                   run_id, module, season_code, article_code, categoria, tipologia, marchio, colore, materiale,
-                  descrizione, venduto_totale, venduto_periodo, giacenza, venduto_extra, prezzo_acquisto
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                  descrizione, venduto_totale, venduto_periodo, giacenza, venduto_extra, fascia_prezzo, prezzo_listino, prezzo_acquisto, prezzo_vendita
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (run_id, module, season_code, article_code) DO UPDATE SET
                   categoria=EXCLUDED.categoria, tipologia=EXCLUDED.tipologia, marchio=EXCLUDED.marchio, colore=EXCLUDED.colore,
                   materiale=EXCLUDED.materiale, descrizione=EXCLUDED.descrizione, venduto_totale=EXCLUDED.venduto_totale,
                   venduto_periodo=EXCLUDED.venduto_periodo, giacenza=EXCLUDED.giacenza, venduto_extra=EXCLUDED.venduto_extra,
-                  prezzo_acquisto=EXCLUDED.prezzo_acquisto
+                  fascia_prezzo=EXCLUDED.fascia_prezzo, prezzo_listino=EXCLUDED.prezzo_listino,
+                  prezzo_acquisto=EXCLUDED.prezzo_acquisto, prezzo_vendita=EXCLUDED.prezzo_vendita
                 """,
                 ord_src_main_rows,
             ),

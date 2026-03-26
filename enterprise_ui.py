@@ -5,8 +5,10 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -15,11 +17,26 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from catalog_service import (
+    get_catalog_article_detail,
+    get_catalog_status,
+    import_catalog_to_db,
+    list_catalog_articles,
+)
+from catalog_showcase_service import (
+    export_catalog_showcase,
+    get_latest_catalog_showcase_result,
+    get_catalog_showcase_result,
+    get_catalog_showcase_html_asset_path,
+    get_catalog_showcase_html_path,
+    get_catalog_showcase_zip_path,
+    list_catalog_showcase_results,
+)
 from db_sync import get_db_dsn
 
 try:
@@ -32,6 +49,10 @@ ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "ui" / "static"
 SETTINGS_PATH = ROOT / "config" / "ui_settings.json"
 RUN_HISTORY_PATH = ROOT / "output" / "ui" / "runs_history.json"
+DEFAULT_UI_SETTINGS = {
+    "developer_mode": False,
+    "catalog_photo_root": "",
+}
 
 OUTPUT_FILES = [
     "clean_sales.csv",
@@ -50,16 +71,29 @@ OUTPUT_FILES = [
 
 DASHBOARD_TABLE_COLUMNS: Dict[str, List[str]] = {
     "transfer_proposals": ["article_code", "size", "from_shop_code", "to_shop_code", "reason", "qty"],
-    "order_proposals": ["module", "season_code", "mode", "article_code", "totale_qty", "predizione_vendite", "budget_acquisto"],
+    "order_proposals": [
+        "module",
+        "season_code",
+        "mode",
+        "article_code",
+        "fascia_prezzo",
+        "prezzo_listino",
+        "prezzo_vendita",
+        "totale_qty",
+        "predizione_vendite",
+        "budget_acquisto",
+    ],
     "critical_articles": ["article_code", "shop_code", "demand_hybrid", "stock_after", "deficit"],
     "next_current_candidates": [
         "from_cont_season",
         "article_code",
+        "fascia_prezzo",
         "categoria",
         "tipologia",
         "marchio",
         "colore",
         "materiale",
+        "prezzo_vendita",
         "venduto_periodo",
         "giacenza",
         "applied_factor",
@@ -116,6 +150,7 @@ def _friendly_run_type(run_type: Optional[str]) -> str:
         "app_pipeline": "Aggiornamento completo",
         "manual_sync": "Sincronizzazione database",
         "app_pipeline_ui": "Avvio manuale da console",
+        "catalog_import": "Import catalogo",
     }
     return mapping.get(rt, str(run_type or "Run"))
 
@@ -142,6 +177,7 @@ def _friendly_module_name(value: Optional[str]) -> str:
         "current": "Corrente",
         "continuativa": "Continuativa",
         "distribuzione": "Distribuzione",
+        "catalogo": "Catalogo",
     }
     return mapping.get(module, str(value or "Run"))
 
@@ -177,6 +213,266 @@ def _friendly_season_label(code: Optional[str], module_name: Optional[str] = Non
     return raw
 
 
+def _catalog_season_group(code: Optional[str]) -> Optional[str]:
+    raw = _clean_text(code)
+    if not raw:
+        return None
+    suffix_match = re.search(r"([A-Za-z])\s*$", raw)
+    suffix = suffix_match.group(1).upper() if suffix_match else ""
+    if suffix in {"I", "Y"}:
+        return "winter"
+    if suffix in {"E", "G"}:
+        return "summer"
+    return None
+
+
+def _summarize_catalog_seasons(codes: List[str]) -> str:
+    cleaned: List[str] = []
+    years: List[str] = []
+    for code in codes:
+        raw = _clean_text(code)
+        if not raw or raw in cleaned:
+            continue
+        cleaned.append(raw)
+        label = _friendly_season_label(raw) or ""
+        year_match = re.search(r"(\d{4})", label)
+        if year_match:
+            year_val = year_match.group(1)
+            if year_val not in years:
+                years.append(year_val)
+
+    if not cleaned:
+        return "Catalogo"
+
+    groups = {_catalog_season_group(code) for code in cleaned}
+    family_parts: List[str] = []
+    if "winter" in groups:
+        family_parts.append("Inverno (I/Y)")
+    if "summer" in groups:
+        family_parts.append("Estate (E/G)")
+
+    unknown_codes = [code for code in cleaned if _catalog_season_group(code) is None]
+    if unknown_codes:
+        family_parts.extend([_friendly_season_label(code) or code for code in unknown_codes[:2]])
+
+    if years:
+        year_piece = years[0] if len(years) == 1 else f"{years[0]}-{years[-1]}"
+        if family_parts:
+            return f"Catalogo {year_piece} · {' + '.join(family_parts)}"
+        return f"Catalogo {year_piece}"
+    if family_parts:
+        return f"Catalogo {' + '.join(family_parts)}"
+    return "Catalogo"
+
+
+def _season_year_number(code: Optional[str]) -> Optional[int]:
+    raw = _clean_text(code)
+    if not raw:
+        return None
+    match = re.search(r"(\d{2,4})", raw)
+    if not match:
+        return None
+    year_num = int(match.group(1))
+    if 0 <= year_num < 100:
+        year_num += 2000
+    return year_num
+
+
+def _season_family_key(code: Optional[str]) -> Optional[str]:
+    raw = _clean_text(code)
+    if not raw:
+        return None
+    suffix_match = re.search(r"([A-Za-z])\s*$", raw)
+    suffix = suffix_match.group(1).upper() if suffix_match else ""
+    if suffix in {"I", "Y"}:
+        return "winter"
+    if suffix in {"E", "G"}:
+        return "summer"
+    return None
+
+
+def _season_pair_code_sort_key(code: str) -> tuple[int, str]:
+    raw = str(code or "").strip().upper()
+    suffix = raw[-1:] if raw else ""
+    if suffix in {"I", "E"}:
+        return (0, raw)
+    if suffix in {"Y", "G"}:
+        return (1, raw)
+    return (9, raw)
+
+
+def _season_pair_display_label(family: Optional[str], year_num: Optional[int], codes: List[str]) -> str:
+    family_label = {"winter": "Inv.", "summer": "Est."}.get(str(family or "").strip().lower(), "Stg.")
+    codes_norm = sorted(
+        {str(code or "").strip().upper() for code in codes if str(code or "").strip()},
+        key=_season_pair_code_sort_key,
+    )
+    code_piece = f" ({'+'.join(codes_norm)})" if codes_norm else ""
+    if year_num:
+        return f"{family_label} {year_num}{code_piece}"
+    return f"{family_label}{code_piece}"
+
+
+def _season_pair_mode_rank(module_name: Optional[str], mode_name: Optional[str]) -> int:
+    module = _canonical_module_name(module_name)
+    mode = str(mode_name or "").strip().lower()
+    if module == "continuativa":
+        if mode == "hybrid":
+            return 1
+        if mode == "rf":
+            return 2
+        if mode == "math":
+            return 3
+        return 9
+    if mode == "math":
+        return 1
+    return 9
+
+
+def _price_band_sort_key(value: Any) -> tuple[int, int, str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return (1, 10**9, raw)
+    match = re.match(r"^\s*(\d+)\s*-\s*(\d+)\s*$", raw)
+    if not match:
+        return (1, 10**9, raw.lower())
+    return (0, int(match.group(1)), raw.lower())
+
+
+def _compute_season_pair_trend(cur, run: Dict[str, Any]) -> Dict[str, Any]:
+    run_id = str(run.get("run_id") or "").strip()
+    ctx = run.get("business_context") if isinstance(run.get("business_context"), dict) else {}
+    target_codes = []
+    for code in (ctx.get("current_seasons") or []) + (ctx.get("continuativa_seasons") or []):
+        code_txt = _clean_text(code)
+        if code_txt and code_txt not in target_codes:
+            target_codes.append(code_txt)
+
+    cur.execute(
+        """
+        SELECT
+          module,
+          season_code,
+          SUM(COALESCE(venduto_periodo, 0)) AS qty
+        FROM public.fact_order_source
+        WHERE run_id = %s::uuid
+          AND season_code IS NOT NULL
+        GROUP BY module, season_code
+        """
+        ,
+        (run_id,),
+    )
+    rows = cur.fetchall()
+
+    pairs: Dict[tuple[str, int], Dict[str, Any]] = {}
+    for row in rows:
+        module = _canonical_module_name(row[0])
+        season_code = _clean_text(row[1])
+        qty = _to_float(row[2])
+        family = _season_family_key(season_code)
+        year_num = _season_year_number(season_code)
+        if not season_code or family is None or year_num is None:
+            continue
+        pair_key = (str(family), int(year_num))
+        pair_bucket = pairs.setdefault(
+            pair_key,
+            {
+                "qty": 0.0,
+                "codes": [],
+                "modules": [],
+            },
+        )
+        pair_bucket["qty"] += qty
+        code_val = str(season_code or "").strip().upper()
+        if code_val and code_val not in pair_bucket["codes"]:
+            pair_bucket["codes"].append(code_val)
+        if module and module not in pair_bucket["modules"]:
+            pair_bucket["modules"].append(module)
+
+    if not pairs:
+        return {
+            "latest_code": None,
+            "latest_qty": None,
+            "prev_code": None,
+            "prev_qty": None,
+            "delta": None,
+            "delta_pct": None,
+        }
+
+    target_family = None
+    target_year = None
+    target_families = {_season_family_key(code) for code in target_codes if _season_family_key(code)}
+    target_years = {_season_year_number(code) for code in target_codes if _season_year_number(code) is not None}
+    if len(target_families) == 1 and len(target_years) == 1:
+        target_family = next(iter(target_families))
+        target_year = next(iter(target_years))
+
+    current_candidates = [
+        (family, year_num, pair_data)
+        for (family, year_num), pair_data in pairs.items()
+        if len(pair_data.get("codes", [])) >= 2
+    ]
+    if not current_candidates:
+        return {
+            "latest_code": None,
+            "latest_qty": None,
+            "prev_code": None,
+            "prev_qty": None,
+            "delta": None,
+            "delta_pct": None,
+        }
+
+    current_match = None
+    if target_family is not None and target_year is not None:
+        current_match = next(
+            (
+                (family, year_num, pair_data)
+                for family, year_num, pair_data in current_candidates
+                if family == target_family and int(year_num) == int(target_year)
+            ),
+            None,
+        )
+    current_family, current_year, current_pair = current_match or sorted(
+        current_candidates,
+        key=lambda item: (int(item[1]), len(item[2].get("codes", [])), _to_float(item[2].get("qty"))),
+        reverse=True,
+    )[0]
+    latest_qty = _to_float(current_pair.get("qty"))
+    latest_code = _season_pair_display_label(current_family, current_year, current_pair.get("codes", []))
+
+    prev_candidates: List[tuple[int, Dict[str, Any]]] = []
+    for (family, year_num), pair_data in pairs.items():
+        if family != current_family or int(year_num) >= int(current_year):
+            continue
+        if len(pair_data.get("codes", [])) < 2:
+            continue
+        prev_candidates.append((int(year_num), pair_data))
+
+    if not prev_candidates:
+        return {
+            "latest_code": latest_code,
+            "latest_qty": latest_qty,
+            "prev_code": None,
+            "prev_qty": None,
+            "delta": None,
+            "delta_pct": None,
+        }
+
+    prev_year, prev_pair = sorted(prev_candidates, key=lambda item: item[0], reverse=True)[0]
+    prev_qty = _to_float(prev_pair.get("qty"))
+    prev_code = _season_pair_display_label(current_family, prev_year, prev_pair.get("codes", []))
+    delta = latest_qty - prev_qty
+    delta_pct = None if prev_qty == 0 else ((latest_qty - prev_qty) / prev_qty) * 100.0
+    return {
+        "latest_code": latest_code,
+        "latest_qty": latest_qty,
+        "prev_code": prev_code,
+        "prev_qty": prev_qty,
+        "delta": delta,
+        "delta_pct": delta_pct,
+    }
+
+
 def _iso_sort_ts(value: Optional[str]) -> float:
     if not value:
         return 0.0
@@ -207,6 +503,25 @@ class RunOptions(BaseModel):
 
 class DeveloperModePayload(BaseModel):
     enabled: bool
+
+
+class CatalogSettingsPayload(BaseModel):
+    catalog_photo_root: Optional[str] = None
+
+
+class CatalogShowcasePayload(BaseModel):
+    run_id: Optional[str] = None
+    export_mode: str = "both"
+    primary_source: str = "local"
+    allow_fallback: bool = False
+    selected_seasons: List[str] = Field(default_factory=list)
+    selected_reparti: List[str] = Field(default_factory=list)
+    selected_suppliers: List[str] = Field(default_factory=list)
+    selected_categories: List[str] = Field(default_factory=list)
+    manual_codes_text: str = ""
+    photo_root: Optional[str] = None
+    photo_position: str = "xl"
+    allow_position_variants: bool = True
 
 
 @dataclass
@@ -249,20 +564,143 @@ class PipelineRun:
         return data
 
 
+@dataclass
+class CatalogImportJob:
+    job_id: str
+    created_at: str
+    sheet: str
+    create_schema: bool
+    classification: Dict[str, Any]
+    status: str = "queued"  # queued|running|success|failed
+    stage: str = "queued"
+    message: str = "Import catalogo in attesa"
+    progress: float = 0.0
+    started_at: Optional[str] = None
+    ended_at: Optional[str] = None
+    error: Optional[str] = None
+    run_id: Optional[str] = None
+    summary: Optional[Dict[str, Any]] = None
+    current: Optional[int] = None
+    total: Optional[int] = None
+    rows_done: Optional[int] = None
+    rows_total: Optional[int] = None
+    file_name: Optional[str] = None
+    detected_kind: Optional[str] = None
+    source: str = "ui"
+
+    def to_public(self) -> Dict[str, Any]:
+        return {
+            "job_id": self.job_id,
+            "created_at": self.created_at,
+            "started_at": self.started_at,
+            "ended_at": self.ended_at,
+            "sheet": self.sheet,
+            "create_schema": bool(self.create_schema),
+            "classification": dict(self.classification or {}),
+            "status": self.status,
+            "stage": self.stage,
+            "message": self.message,
+            "progress": round(float(self.progress or 0.0), 2),
+            "error": self.error,
+            "run_id": self.run_id,
+            "summary": self.summary,
+            "current": self.current,
+            "total": self.total,
+            "rows_done": self.rows_done,
+            "rows_total": self.rows_total,
+            "file_name": self.file_name,
+            "detected_kind": self.detected_kind,
+            "source": self.source,
+        }
+
+
+@dataclass
+class CatalogShowcaseJob:
+    job_id: str
+    created_at: str
+    export_mode: str
+    primary_source: str
+    allow_fallback: bool
+    photo_position: str
+    allow_position_variants: bool
+    filters: Dict[str, Any]
+    status: str = "queued"  # queued|running|success|failed
+    stage: str = "queued"
+    message: str = "Generazione catalogo vetrina in attesa"
+    progress: float = 0.0
+    started_at: Optional[str] = None
+    ended_at: Optional[str] = None
+    error: Optional[str] = None
+    summary: Optional[Dict[str, Any]] = None
+    requested: Optional[int] = None
+    current: Optional[int] = None
+    total: Optional[int] = None
+    current_article: Optional[str] = None
+    current_season: Optional[str] = None
+    exported_html_images: int = 0
+    exported_jpg: int = 0
+    used_local: int = 0
+    used_web: int = 0
+    missing_images: int = 0
+
+    def to_public(self) -> Dict[str, Any]:
+        summary_job_id = ""
+        if isinstance(self.summary, dict):
+            summary_job_id = str(self.summary.get("job_id") or "").strip()
+        asset_job_id = summary_job_id or self.job_id
+        html_preview_url = ""
+        if isinstance(self.summary, dict) and str(self.summary.get("html_path") or "").strip():
+            html_preview_url = f"/catalog-showcase/{asset_job_id}/html"
+        return {
+            "job_id": self.job_id,
+            "created_at": self.created_at,
+            "started_at": self.started_at,
+            "ended_at": self.ended_at,
+            "export_mode": self.export_mode,
+            "primary_source": self.primary_source,
+            "allow_fallback": bool(self.allow_fallback),
+            "photo_position": self.photo_position,
+            "allow_position_variants": bool(self.allow_position_variants),
+            "filters": dict(self.filters or {}),
+            "status": self.status,
+            "stage": self.stage,
+            "message": self.message,
+            "progress": round(float(self.progress or 0.0), 2),
+            "error": self.error,
+            "summary": self.summary,
+            "requested": self.requested,
+            "current": self.current,
+            "total": self.total,
+            "current_article": self.current_article,
+            "current_season": self.current_season,
+            "exported_html_images": int(self.exported_html_images or 0),
+            "exported_jpg": int(self.exported_jpg or 0),
+            "used_local": int(self.used_local or 0),
+            "used_web": int(self.used_web or 0),
+            "missing_images": int(self.missing_images or 0),
+            "download_url": f"/api/catalog/showcase/download/{asset_job_id}",
+            "html_preview_url": html_preview_url,
+        }
+
+
 class SettingsStore:
     def __init__(self, path: Path):
         self.path = path
         self.lock = threading.Lock()
-        self.data = {"developer_mode": False}
+        self.data = dict(DEFAULT_UI_SETTINGS)
         self._load()
 
     def _load(self):
         if not self.path.exists():
             return
         try:
-            self.data = json.loads(self.path.read_text(encoding="utf-8"))
+            loaded = json.loads(self.path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                self.data = {**DEFAULT_UI_SETTINGS, **loaded}
+            else:
+                self.data = dict(DEFAULT_UI_SETTINGS)
         except Exception:
-            self.data = {"developer_mode": False}
+            self.data = dict(DEFAULT_UI_SETTINGS)
 
     def _save(self):
         _ensure_parent(self.path)
@@ -275,6 +713,12 @@ class SettingsStore:
     def set_developer_mode(self, enabled: bool) -> Dict[str, Any]:
         with self.lock:
             self.data["developer_mode"] = bool(enabled)
+            self._save()
+            return dict(self.data)
+
+    def set_catalog_photo_root(self, path_value: Optional[str]) -> Dict[str, Any]:
+        with self.lock:
+            self.data["catalog_photo_root"] = str(path_value or "").strip()
             self._save()
             return dict(self.data)
 
@@ -469,8 +913,390 @@ class RunManager:
             return run.log_lines[-tail:]
 
 
+class CatalogImportManager:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.jobs: List[CatalogImportJob] = []
+        self.current_job_id: Optional[str] = None
+
+    def _cleanup(self):
+        self.jobs = self.jobs[:30]
+
+    def _find(self, job_id: str) -> Optional[CatalogImportJob]:
+        return next((job for job in self.jobs if job.job_id == job_id), None)
+
+    def _set_progress(self, job_id: str, payload: Dict[str, Any]):
+        with self.lock:
+            job = self._find(job_id)
+            if job is None:
+                return
+            job.status = "running"
+            if "stage" in payload:
+                job.stage = str(payload.get("stage") or job.stage)
+            if "message" in payload:
+                job.message = str(payload.get("message") or job.message)
+            if "progress" in payload:
+                try:
+                    job.progress = max(0.0, min(100.0, float(payload.get("progress") or 0.0)))
+                except Exception:
+                    pass
+            for key in ("current", "total", "rows_done", "rows_total"):
+                if key in payload:
+                    try:
+                        value = payload.get(key)
+                        setattr(job, key, None if value is None else int(value))
+                    except Exception:
+                        setattr(job, key, None)
+            for key in ("file_name", "detected_kind"):
+                if key in payload:
+                    value = payload.get(key)
+                    setattr(job, key, None if value is None else str(value))
+
+    def _runner_thread(
+        self,
+        *,
+        job_id: str,
+        work_dir: Path,
+        excel_files: List[Path],
+        price_files: List[Path],
+        sheet: int | str,
+        create_schema: bool,
+    ):
+        with self.lock:
+            job = self._find(job_id)
+            if job is None:
+                return
+            job.status = "running"
+            job.started_at = _now_iso()
+            job.stage = "starting"
+            job.message = "Avvio import catalogo"
+            self.current_job_id = job_id
+
+        try:
+            summary = import_catalog_to_db(
+                root=ROOT,
+                excel_files=excel_files,
+                price_files=price_files,
+                sheet=sheet,
+                create_schema=bool(create_schema),
+                verbose=False,
+                progress_cb=lambda payload: self._set_progress(job_id, payload),
+            )
+            with self.lock:
+                job = self._find(job_id)
+                if job is not None:
+                    job.status = "success"
+                    job.stage = "completed"
+                    job.progress = 100.0
+                    job.message = "Import catalogo completato"
+                    job.ended_at = _now_iso()
+                    job.summary = summary
+                    job.run_id = str(summary.get("run_id") or "")
+        except Exception as exc:
+            with self.lock:
+                job = self._find(job_id)
+                if job is not None:
+                    job.status = "failed"
+                    job.stage = "failed"
+                    job.message = "Errore durante import catalogo"
+                    job.ended_at = _now_iso()
+                    job.error = str(exc)
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+            with self.lock:
+                if self.current_job_id == job_id:
+                    self.current_job_id = None
+
+    def start_job(
+        self,
+        *,
+        work_dir: Path,
+        sheet: int | str,
+        create_schema: bool,
+        excel_files: List[Path],
+        price_files: List[Path],
+        classification: Dict[str, Any],
+    ) -> CatalogImportJob:
+        with self.lock:
+            active = next((job for job in self.jobs if job.status in {"queued", "running"}), None)
+            if active is not None:
+                raise RuntimeError(f"Esiste gia' un import catalogo in corso: {active.job_id}")
+
+            job = CatalogImportJob(
+                job_id=str(uuid.uuid4()),
+                created_at=_now_iso(),
+                sheet=str(sheet),
+                create_schema=bool(create_schema),
+                classification=classification,
+                message="Upload completato, import in coda",
+            )
+            self.jobs.insert(0, job)
+            self._cleanup()
+
+        th = threading.Thread(
+            target=self._runner_thread,
+            kwargs={
+                "job_id": job.job_id,
+                "work_dir": work_dir,
+                "excel_files": list(excel_files),
+                "price_files": list(price_files),
+                "sheet": sheet,
+                "create_schema": bool(create_schema),
+            },
+            daemon=True,
+        )
+        th.start()
+        return job
+
+    def get_job(self, job_id: str) -> Optional[CatalogImportJob]:
+        with self.lock:
+            return self._find(job_id)
+
+    def get_active_job(self) -> Optional[CatalogImportJob]:
+        with self.lock:
+            if not self.current_job_id:
+                return None
+            return self._find(self.current_job_id)
+
+
+class CatalogShowcaseManager:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.jobs: List[CatalogShowcaseJob] = []
+        self.current_job_id: Optional[str] = None
+        self._load_history_from_disk()
+
+    def _cleanup(self):
+        self.jobs = self.jobs[:30]
+
+    def _find(self, job_id: str) -> Optional[CatalogShowcaseJob]:
+        return next((job for job in self.jobs if job.job_id == job_id), None)
+
+    @staticmethod
+    def _job_from_summary(summary: Dict[str, Any]) -> Optional[CatalogShowcaseJob]:
+        if not isinstance(summary, dict):
+            return None
+        job_id = str(summary.get("job_id") or "").strip()
+        if not job_id:
+            return None
+        source_mode = str(summary.get("source_mode") or "local_only").strip().lower()
+        filters_raw = summary.get("filters") if isinstance(summary.get("filters"), dict) else {}
+        generated_at = str(summary.get("generated_at") or _now_iso())
+        return CatalogShowcaseJob(
+            job_id=job_id,
+            created_at=generated_at,
+            export_mode=str(summary.get("export_mode") or "both"),
+            primary_source="web" if source_mode.startswith("web") else "local",
+            allow_fallback=source_mode in {"local_then_web", "web_then_local"},
+            photo_position=str(summary.get("photo_position") or "xl"),
+            allow_position_variants=bool(summary.get("allow_position_variants", True)),
+            filters={
+                "selected_seasons": [str(x) for x in (filters_raw.get("selected_seasons") or [])],
+                "selected_reparti": [str(x) for x in (filters_raw.get("selected_reparti") or [])],
+                "selected_suppliers": [str(x) for x in (filters_raw.get("selected_suppliers") or [])],
+                "selected_categories": [str(x) for x in (filters_raw.get("selected_categories") or [])],
+                "manual_codes_text": "",
+            },
+            status="success",
+            stage="completed",
+            message="Catalogo vetrina completato",
+            progress=100.0,
+            started_at=generated_at,
+            ended_at=generated_at,
+            summary=summary,
+            requested=int(summary.get("requested", 0) or 0),
+            exported_html_images=int(summary.get("exported_html_images", 0) or 0),
+            exported_jpg=int(summary.get("exported_jpg", 0) or 0),
+            used_local=int(summary.get("used_local", 0) or 0),
+            used_web=int(summary.get("used_web", 0) or 0),
+            missing_images=int(summary.get("missing_images", 0) or 0),
+        )
+
+    def _load_history_from_disk(self):
+        try:
+            rows = list_catalog_showcase_results(root=ROOT, limit=30)
+        except Exception:
+            rows = []
+        hydrated: List[CatalogShowcaseJob] = []
+        for item in rows:
+            job = self._job_from_summary(item)
+            if job is not None:
+                hydrated.append(job)
+        self.jobs = hydrated
+
+    def _set_progress(self, job_id: str, payload: Dict[str, Any]):
+        with self.lock:
+            job = self._find(job_id)
+            if job is None:
+                return
+            job.status = "running"
+            if "stage" in payload:
+                job.stage = str(payload.get("stage") or job.stage)
+            if "message" in payload:
+                job.message = str(payload.get("message") or job.message)
+            if "progress" in payload:
+                try:
+                    job.progress = max(0.0, min(100.0, float(payload.get("progress") or 0.0)))
+                except Exception:
+                    pass
+            for key in ("requested", "current", "total"):
+                if key in payload:
+                    value = payload.get(key)
+                    try:
+                        setattr(job, key, None if value is None else int(value))
+                    except Exception:
+                        setattr(job, key, None)
+            for key in ("current_article", "current_season"):
+                if key in payload:
+                    value = payload.get(key)
+                    setattr(job, key, None if value is None else str(value))
+            for key in ("exported_html_images", "exported_jpg", "used_local", "used_web", "missing_images"):
+                if key in payload:
+                    try:
+                        setattr(job, key, int(payload.get(key) or 0))
+                    except Exception:
+                        setattr(job, key, 0)
+
+    def _runner_thread(self, *, job_id: str, options: Dict[str, Any]):
+        with self.lock:
+            job = self._find(job_id)
+            if job is None:
+                return
+            job.status = "running"
+            job.started_at = _now_iso()
+            job.stage = "starting"
+            job.message = "Avvio generazione catalogo vetrina"
+            self.current_job_id = job_id
+
+        try:
+            summary = export_catalog_showcase(
+                root=ROOT,
+                job_id=job_id,
+                export_mode=str(options.get("export_mode") or "both"),
+                primary_source=str(options.get("primary_source") or "local"),
+                allow_fallback=bool(options.get("allow_fallback")),
+                selected_seasons=list(options.get("selected_seasons") or []),
+                selected_reparti=list(options.get("selected_reparti") or []),
+                selected_suppliers=list(options.get("selected_suppliers") or []),
+                selected_categories=list(options.get("selected_categories") or []),
+                manual_codes_text=str(options.get("manual_codes_text") or ""),
+                photo_root=str(options.get("photo_root") or ""),
+                photo_position=str(options.get("photo_position") or "xl"),
+                allow_position_variants=bool(options.get("allow_position_variants", True)),
+                source_run_id=options.get("run_id"),
+                progress_cb=lambda payload: self._set_progress(job_id, payload),
+            )
+            with self.lock:
+                job = self._find(job_id)
+                if job is not None:
+                    job.status = "success"
+                    job.stage = "completed"
+                    job.progress = 100.0
+                    job.message = "Catalogo vetrina completato"
+                    job.ended_at = _now_iso()
+                    job.summary = summary
+                    job.requested = int(summary.get("requested", 0) or 0)
+                    job.exported_html_images = int(summary.get("exported_html_images", 0) or 0)
+                    job.exported_jpg = int(summary.get("exported_jpg", 0) or 0)
+                    job.used_local = int(summary.get("used_local", 0) or 0)
+                    job.used_web = int(summary.get("used_web", 0) or 0)
+                    job.missing_images = int(summary.get("missing_images", 0) or 0)
+        except Exception as exc:
+            with self.lock:
+                job = self._find(job_id)
+                if job is not None:
+                    job.status = "failed"
+                    job.stage = "failed"
+                    job.message = "Errore durante generazione catalogo vetrina"
+                    job.ended_at = _now_iso()
+                    job.error = str(exc)
+        finally:
+            with self.lock:
+                if self.current_job_id == job_id:
+                    self.current_job_id = None
+
+    def start_job(self, *, options: Dict[str, Any]) -> CatalogShowcaseJob:
+        with self.lock:
+            active = next((job for job in self.jobs if job.status in {"queued", "running"}), None)
+            if active is not None:
+                raise RuntimeError(f"Esiste gia' un catalogo vetrina in corso: {active.job_id}")
+
+            filters = {
+                "selected_seasons": [str(x) for x in (options.get("selected_seasons") or [])],
+                "selected_reparti": [str(x) for x in (options.get("selected_reparti") or [])],
+                "selected_suppliers": [str(x) for x in (options.get("selected_suppliers") or [])],
+                "selected_categories": [str(x) for x in (options.get("selected_categories") or [])],
+                "manual_codes_text": str(options.get("manual_codes_text") or ""),
+            }
+            job = CatalogShowcaseJob(
+                job_id=datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8],
+                created_at=_now_iso(),
+                export_mode=str(options.get("export_mode") or "both"),
+                primary_source=str(options.get("primary_source") or "local"),
+                allow_fallback=bool(options.get("allow_fallback")),
+                photo_position=str(options.get("photo_position") or "xl"),
+                allow_position_variants=bool(options.get("allow_position_variants", True)),
+                filters=filters,
+                message="Richiesta accodata, avvio generazione catalogo vetrina",
+            )
+            self.jobs.insert(0, job)
+            self._cleanup()
+
+        th = threading.Thread(target=self._runner_thread, kwargs={"job_id": job.job_id, "options": dict(options)}, daemon=True)
+        th.start()
+        return job
+
+    def get_job(self, job_id: str) -> Optional[CatalogShowcaseJob]:
+        with self.lock:
+            job = self._find(job_id)
+        if job is not None:
+            return job
+        try:
+            summary = get_catalog_showcase_result(root=ROOT, job_id=job_id)
+        except Exception:
+            return None
+        hydrated = self._job_from_summary(summary)
+        if hydrated is None:
+            return None
+        with self.lock:
+            existing = self._find(hydrated.job_id)
+            if existing is not None:
+                return existing
+            self.jobs.insert(0, hydrated)
+            self._cleanup()
+            return hydrated
+
+    def get_active_job(self) -> Optional[CatalogShowcaseJob]:
+        with self.lock:
+            if not self.current_job_id:
+                return None
+            return self._find(self.current_job_id)
+
+    def get_latest_job(self) -> Optional[CatalogShowcaseJob]:
+        with self.lock:
+            latest = next((job for job in self.jobs if str(job.status or "").lower() in {"success", "failed"}), None)
+        if latest is not None:
+            return latest
+        try:
+            summary = get_latest_catalog_showcase_result(root=ROOT)
+        except Exception:
+            return None
+        hydrated = self._job_from_summary(summary)
+        if hydrated is None:
+            return None
+        with self.lock:
+            existing = self._find(hydrated.job_id)
+            if existing is not None:
+                return existing
+            self.jobs.insert(0, hydrated)
+            self._cleanup()
+            return hydrated
+
+
 settings_store = SettingsStore(SETTINGS_PATH)
 run_manager = RunManager(RUN_HISTORY_PATH)
+catalog_import_manager = CatalogImportManager()
+catalog_showcase_manager = CatalogShowcaseManager()
 
 app = FastAPI(title="BARCA Control Center", version="1.0.0")
 if STATIC_DIR.exists():
@@ -548,17 +1374,107 @@ def _db_status() -> Dict[str, Any]:
                     cur.execute("SELECT * FROM public.vw_latest_run_counts")
                     c_row = cur.fetchone()
                     cols = [d.name for d in cur.description] if cur.description else []
-                    latest_counts = (
-                        {col: _json_value(value) for col, value in zip(cols, c_row)}
-                        if c_row
-                        else {}
-                    )
+                    latest_counts = {col: _json_value(value) for col, value in zip(cols, c_row)} if c_row else {}
                 except Exception:
                     latest_counts = {}
 
-            return {"connected": True, "latest_run": latest, "latest_counts": latest_counts}
+        return {"connected": True, "latest_run": latest, "latest_counts": latest_counts}
     except Exception as exc:
         return {"connected": False, "reason": str(exc)}
+
+
+def _catalog_status_payload(run_id: Optional[str] = None) -> Dict[str, Any]:
+    try:
+        return get_catalog_status(run_id)
+    except Exception as exc:
+        return {"available": False, "reason": str(exc), "counts": {}, "facets": {}}
+
+
+def _catalog_articles_payload(
+    *,
+    run_id: Optional[str] = None,
+    search: str = "",
+    season_code: str = "",
+    reparto: str = "",
+    categoria: str = "",
+    limit: int = 100,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    try:
+        payload = list_catalog_articles(
+            search=search,
+            season_code=season_code,
+            reparto=reparto,
+            categoria=categoria,
+            limit=limit,
+            offset=offset,
+            source_run_id=run_id,
+        )
+        payload["available"] = True
+        return payload
+    except Exception as exc:
+        return {
+            "available": False,
+            "reason": str(exc),
+            "run_id": run_id,
+            "rows": [],
+            "total": 0,
+            "offset": int(offset),
+            "limit": int(limit),
+        }
+
+
+def _catalog_article_detail_payload(
+    *,
+    article_code: str,
+    season_code: str,
+    run_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    try:
+        payload = get_catalog_article_detail(
+            article_code=article_code,
+            season_code=season_code,
+            source_run_id=run_id,
+        )
+        payload["available"] = True
+        return payload
+    except Exception as exc:
+        return {"available": False, "reason": str(exc), "summary": None, "stores": []}
+
+
+async def _save_uploaded_batch(target_root: Path, uploads: Optional[List[UploadFile]], fallback_prefix: str) -> List[Path]:
+    saved: List[Path] = []
+    for idx, uploaded in enumerate(uploads or [], start=1):
+        raw_name = Path(uploaded.filename or f"{fallback_prefix}_{idx}").name
+        file_name = raw_name or f"{fallback_prefix}_{idx}"
+        slot_dir = target_root / f"{idx:03d}"
+        slot_dir.mkdir(parents=True, exist_ok=True)
+        target = slot_dir / file_name
+        target.write_bytes(await uploaded.read())
+        saved.append(target)
+    return saved
+
+
+def _classify_catalog_files(paths: List[Path]) -> Dict[str, Any]:
+    excel_files: List[Path] = []
+    price_files: List[Path] = []
+    ignored_files: List[Dict[str, str]] = []
+
+    for path in paths:
+        suffix = path.suffix.lower()
+        if suffix in {".xls", ".xlsx"}:
+            excel_files.append(path)
+            continue
+        if suffix == ".csv":
+            price_files.append(path)
+            continue
+        ignored_files.append({"file_name": path.name, "reason": f"estensione non supportata: {suffix or 'senza estensione'}"})
+
+    return {
+        "excel_files": excel_files,
+        "price_files": price_files,
+        "ignored_files": ignored_files,
+    }
 
 
 def _db_recent_runs(limit: int = 50) -> List[Dict[str, Any]]:
@@ -578,6 +1494,63 @@ def _db_recent_runs(limit: int = 50) -> List[Dict[str, Any]]:
                     SELECT run_id, run_type, status, started_at, finished_at, metadata
                     FROM public.etl_run
                     ORDER BY COALESCE(finished_at, started_at) DESC
+                    LIMIT %s
+                    """,
+                    (limit,),
+                )
+                rows = cur.fetchall()
+    except Exception:
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        metadata = row[5] if isinstance(row[5], dict) else {}
+        started_at = row[3].isoformat() if row[3] else None
+        ended_at = row[4].isoformat() if row[4] else None
+        status_raw = row[2]
+        business_context = _run_business_context(metadata, row[1])
+        out.append(
+            {
+                "run_id": str(row[0]),
+                "created_at": started_at,
+                "started_at": started_at,
+                "ended_at": ended_at,
+                "status": _status_to_ui(status_raw),
+                "status_raw": status_raw,
+                "return_code": None,
+                "options": {},
+                "error": None,
+                "log_tail": [],
+                "source": "db",
+                "run_type": row[1],
+                "run_type_label": business_context["friendly_run_type"],
+                "status_label": _friendly_status(status_raw),
+                "metadata": metadata,
+                "business_context": business_context,
+                "can_stop": False,
+            }
+        )
+    return out
+
+
+def _db_recent_dashboard_runs(limit: int = 50) -> List[Dict[str, Any]]:
+    if psycopg is None:
+        return []
+
+    try:
+        dsn = get_db_dsn()
+    except Exception:
+        return []
+
+    try:
+        with psycopg.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT r.run_id, r.run_type, r.status, r.started_at, r.finished_at, r.metadata
+                    FROM public.etl_run r
+                    WHERE {_dashboard_run_where_sql('r')}
+                    ORDER BY COALESCE(r.finished_at, r.started_at) DESC
                     LIMIT %s
                     """,
                     (limit,),
@@ -668,6 +1641,68 @@ def _db_run_detail(run_id: str) -> Optional[Dict[str, Any]]:
         "metadata": metadata,
         "business_context": business_context,
         "can_stop": False,
+    }
+
+
+def _db_active_catalog_import_job() -> Optional[Dict[str, Any]]:
+    if psycopg is None:
+        return None
+
+    try:
+        dsn = get_db_dsn()
+    except Exception:
+        return None
+
+    try:
+        with psycopg.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT run_id, status, started_at, metadata
+                    FROM public.etl_run
+                    WHERE run_type = 'catalog_import'
+                      AND status = 'running'
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                    """
+                )
+                row = cur.fetchone()
+    except Exception:
+        return None
+
+    if not row:
+        return None
+
+    metadata = row[3] if isinstance(row[3], dict) else {}
+    excel_files = metadata.get("excel_files") if isinstance(metadata, dict) else []
+    price_files = metadata.get("price_files") if isinstance(metadata, dict) else []
+    return {
+        "job_id": None,
+        "created_at": row[2].isoformat() if row[2] else None,
+        "started_at": row[2].isoformat() if row[2] else None,
+        "ended_at": None,
+        "sheet": str(metadata.get("sheet") or "0"),
+        "create_schema": None,
+        "classification": {
+            "excel_count": len(excel_files) if isinstance(excel_files, list) else 0,
+            "price_count": len(price_files) if isinstance(price_files, list) else 0,
+            "ignored_count": 0,
+            "ignored_files": [],
+        },
+        "status": "running",
+        "stage": "external_running",
+        "message": "Import catalogo in corso nel backend. Il dettaglio avanzamento completo sara' disponibile per i nuovi import avviati da questa versione UI.",
+        "progress": 0.0,
+        "error": None,
+        "run_id": str(row[0]),
+        "summary": None,
+        "current": None,
+        "total": None,
+        "rows_done": None,
+        "rows_total": None,
+        "file_name": None,
+        "detected_kind": None,
+        "source": "db",
     }
 
 
@@ -817,6 +1852,7 @@ def _run_business_context(metadata: Optional[Dict[str, Any]], run_type: Optional
     md = metadata if isinstance(metadata, dict) else {}
     orders_jobs = md.get("orders_jobs") if isinstance(md.get("orders_jobs"), list) else []
     source_jobs = md.get("order_source_jobs") if isinstance(md.get("order_source_jobs"), list) else []
+    catalog_seasons = [str(x).strip() for x in (md.get("catalog_seasons") or []) if str(x).strip()]
 
     def _collect_seasons(jobs: List[Dict[str, Any]], module_name: str) -> List[str]:
         vals: List[str] = []
@@ -851,6 +1887,8 @@ def _run_business_context(metadata: Optional[Dict[str, Any]], run_type: Optional
         modules.append("corrente")
     if cont_seasons:
         modules.append("continuativa")
+    if catalog_seasons:
+        modules.append("catalogo")
     if not modules and str(run_type or "").strip().lower() == "app_pipeline":
         modules.append("distribuzione")
 
@@ -866,7 +1904,10 @@ def _run_business_context(metadata: Optional[Dict[str, Any]], run_type: Optional
         season_parts.append(", ".join(current_season_labels))
     if cont_season_labels:
         season_parts.append(", ".join(cont_season_labels))
-    summary_short = " + ".join(season_parts) if season_parts else _friendly_run_type(run_type)
+    if catalog_seasons and not season_parts:
+        summary_short = _summarize_catalog_seasons(catalog_seasons)
+    else:
+        summary_short = " + ".join(season_parts) if season_parts else _friendly_run_type(run_type)
 
     method_parts: List[str] = []
     if current_mode_labels:
@@ -890,6 +1931,7 @@ def _run_business_context(metadata: Optional[Dict[str, Any]], run_type: Optional
         "continuativa_modes": cont_modes,
         "current_mode_labels": current_mode_labels,
         "continuativa_mode_labels": cont_mode_labels,
+        "catalog_seasons": catalog_seasons,
         "summary_short": summary_short,
         "summary": summary,
         "title": title,
@@ -989,9 +2031,28 @@ def _build_kpi_deltas(current_kpis: Dict[str, Any], baseline_kpis: Optional[Dict
         "next_current_delta_positive_total",
     ]
     out: Dict[str, Any] = {}
+    if not baseline_kpis:
+        for key in tracked_keys:
+            out[key] = {
+                "current": _to_float(current_kpis.get(key)),
+                "previous": None,
+                "abs": None,
+                "pct": None,
+            }
+        return out
+
     for key in tracked_keys:
         cur_v = _to_float(current_kpis.get(key))
-        base_v = _to_float((baseline_kpis or {}).get(key)) if baseline_kpis else 0.0
+        base_raw = baseline_kpis.get(key)
+        if base_raw is None:
+            out[key] = {
+                "current": cur_v,
+                "previous": None,
+                "abs": None,
+                "pct": None,
+            }
+            continue
+        base_v = _to_float(base_raw)
         abs_delta = cur_v - base_v
         pct_delta = None if base_v == 0 else (abs_delta / base_v) * 100.0
         out[key] = {
@@ -1001,6 +2062,20 @@ def _build_kpi_deltas(current_kpis: Dict[str, Any], baseline_kpis: Optional[Dict
             "pct": pct_delta,
         }
     return out
+
+
+def _dashboard_run_where_sql(alias: str = "etl_run") -> str:
+    return f"""
+        lower(COALESCE({alias}.status, '')) IN ('completed', 'success', 'done', 'ok')
+        AND lower(COALESCE({alias}.run_type, '')) IN ('app_pipeline', 'app_pipeline_ui', 'manual_sync')
+        AND (
+          EXISTS (SELECT 1 FROM public.fact_sales_snapshot s WHERE s.run_id = {alias}.run_id LIMIT 1)
+          OR EXISTS (SELECT 1 FROM public.fact_stock_snapshot s WHERE s.run_id = {alias}.run_id LIMIT 1)
+          OR EXISTS (SELECT 1 FROM public.fact_transfer_suggestion t WHERE t.run_id = {alias}.run_id LIMIT 1)
+          OR EXISTS (SELECT 1 FROM public.fact_feature_state f WHERE f.run_id = {alias}.run_id LIMIT 1)
+          OR EXISTS (SELECT 1 FROM public.fact_order_forecast o WHERE o.run_id = {alias}.run_id LIMIT 1)
+        )
+    """
 
 
 def _dashboard_export_rows(payload: Dict[str, Any], table_key: str) -> List[Dict[str, Any]]:
@@ -1037,9 +2112,10 @@ def _resolve_dashboard_run(cur, run_id: Optional[str]) -> Optional[Dict[str, Any
         )
     else:
         cur.execute(
-            """
+            f"""
             SELECT run_id, run_type, status, started_at, finished_at, metadata
             FROM public.etl_run
+            WHERE {_dashboard_run_where_sql('etl_run')}
             ORDER BY COALESCE(finished_at, started_at) DESC
             LIMIT 1
             """
@@ -1109,10 +2185,11 @@ def _dashboard_payload(run_id: Optional[str], table_limit: int = 30) -> Dict[str
 
                 if anchor_ts is not None:
                     cur.execute(
-                        """
+                        f"""
                         SELECT run_id, run_type, status, started_at, finished_at, metadata
                         FROM public.etl_run
-                        WHERE run_id <> %s::uuid
+                        WHERE {_dashboard_run_where_sql('etl_run')}
+                          AND run_id <> %s::uuid
                           AND COALESCE(finished_at, started_at) < %s
                         ORDER BY COALESCE(finished_at, started_at) DESC
                         LIMIT 1
@@ -1123,10 +2200,11 @@ def _dashboard_payload(run_id: Optional[str], table_limit: int = 30) -> Dict[str
 
                 if prev_row is None:
                     cur.execute(
-                        """
+                        f"""
                         SELECT run_id, run_type, status, started_at, finished_at, metadata
                         FROM public.etl_run
-                        WHERE run_id <> %s::uuid
+                        WHERE {_dashboard_run_where_sql('etl_run')}
+                          AND run_id <> %s::uuid
                         ORDER BY COALESCE(finished_at, started_at) DESC
                         LIMIT 1
                         """,
@@ -1149,6 +2227,9 @@ def _dashboard_payload(run_id: Optional[str], table_limit: int = 30) -> Dict[str
                         "business_context": prev_business_context,
                     }
                     baseline_kpis = _fetch_kpi_core(cur, baseline_run["run_id"])
+                    if all(abs(_to_float(v)) < 1e-9 for v in (baseline_kpis or {}).values()):
+                        baseline_run = None
+                        baseline_kpis = None
 
                 cur.execute(
                     """
@@ -1237,6 +2318,25 @@ def _dashboard_payload(run_id: Optional[str], table_limit: int = 30) -> Dict[str
                 cur.execute(
                     """
                     SELECT
+                      COALESCE(NULLIF(os.fascia_prezzo, ''), 'n/a') AS label,
+                      SUM(COALESCE(fo.totale_qty, 0)) AS value
+                    FROM public.fact_order_forecast fo
+                    LEFT JOIN public.fact_order_source os
+                      ON os.run_id = fo.run_id
+                     AND os.module = fo.module
+                     AND os.article_code = fo.article_code
+                     AND os.season_code IS NOT DISTINCT FROM fo.season_code
+                    WHERE fo.run_id = %s::uuid
+                    GROUP BY COALESCE(NULLIF(os.fascia_prezzo, ''), 'n/a')
+                    """
+                    ,
+                    (rid,),
+                )
+                orders_by_price_band = sorted(_fetch_chart_rows(cur), key=lambda row: _price_band_sort_key(row.get("label")))
+
+                cur.execute(
+                    """
+                    SELECT
                       shop_code AS label,
                       SUM(demand_hybrid - stock_after) AS value
                     FROM public.fact_feature_state
@@ -1266,9 +2366,24 @@ def _dashboard_payload(run_id: Optional[str], table_limit: int = 30) -> Dict[str
 
                 cur.execute(
                     """
-                    SELECT module, season_code, mode, article_code, totale_qty, predizione_vendite, budget_acquisto
-                    FROM public.fact_order_forecast
-                    WHERE run_id = %s::uuid
+                    SELECT
+                      fo.module,
+                      fo.season_code,
+                      fo.mode,
+                      fo.article_code,
+                      os.fascia_prezzo,
+                      os.prezzo_listino,
+                      os.prezzo_vendita,
+                      fo.totale_qty,
+                      fo.predizione_vendite,
+                      fo.budget_acquisto
+                    FROM public.fact_order_forecast fo
+                    LEFT JOIN public.fact_order_source os
+                      ON os.run_id = fo.run_id
+                     AND os.module = fo.module
+                     AND os.article_code = fo.article_code
+                     AND os.season_code IS NOT DISTINCT FROM fo.season_code
+                    WHERE fo.run_id = %s::uuid
                     ORDER BY totale_qty DESC NULLS LAST, article_code ASC
                     LIMIT %s
                     """,
@@ -1354,11 +2469,13 @@ def _dashboard_payload(run_id: Optional[str], table_limit: int = 30) -> Dict[str
                     SELECT
                       c.season_code AS from_cont_season,
                       c.article_code,
+                      c.fascia_prezzo,
                       c.categoria,
                       c.tipologia,
                       c.marchio,
                       c.colore,
                       c.materiale,
+                      COALESCE(c.prezzo_vendita, c.prezzo_listino, 0) AS prezzo_vendita,
                       COALESCE(c.venduto_periodo, 0) AS venduto_periodo,
                       COALESCE(c.giacenza, 0) AS giacenza,
                       COALESCE(c.prezzo_acquisto, 0) AS prezzo_acquisto,
@@ -1391,6 +2508,7 @@ def _dashboard_payload(run_id: Optional[str], table_limit: int = 30) -> Dict[str
                 next_current_rows = next_current_all[:table_limit]
 
                 next_current_by_category_map: Dict[str, float] = {}
+                next_current_by_price_band_map: Dict[str, float] = {}
                 next_current_delta_positive_map: Dict[str, float] = {}
                 next_current_qty_total = 0.0
                 next_current_budget_total = 0.0
@@ -1398,10 +2516,12 @@ def _dashboard_payload(run_id: Optional[str], table_limit: int = 30) -> Dict[str
                 next_current_delta_positive_total = 0.0
                 for row in next_current_all:
                     cat = str(row.get("categoria") or "n/a")
+                    price_band = str(row.get("fascia_prezzo") or "n/a")
                     qty = float(row.get("predicted_current_qty") or 0.0)
                     budget = float(row.get("predicted_budget") or 0.0)
                     delta = float(row.get("delta_vs_stock") or 0.0)
                     next_current_by_category_map[cat] = next_current_by_category_map.get(cat, 0.0) + qty
+                    next_current_by_price_band_map[price_band] = next_current_by_price_band_map.get(price_band, 0.0) + qty
                     next_current_qty_total += qty
                     next_current_budget_total += budget
                     if delta > 0:
@@ -1412,6 +2532,10 @@ def _dashboard_payload(run_id: Optional[str], table_limit: int = 30) -> Dict[str
                 next_current_by_category = [
                     {"label": k, "value": v}
                     for k, v in sorted(next_current_by_category_map.items(), key=lambda kv: kv[1], reverse=True)[:12]
+                ]
+                next_current_by_price_band = [
+                    {"label": k, "value": v}
+                    for k, v in sorted(next_current_by_price_band_map.items(), key=lambda kv: _price_band_sort_key(kv[0]))
                 ]
                 next_current_delta_positive_by_category = [
                     {"label": k, "value": v}
@@ -1425,42 +2549,13 @@ def _dashboard_payload(run_id: Optional[str], table_limit: int = 30) -> Dict[str
                 kpis["next_current_delta_positive_total"] = float(next_current_delta_positive_total)
                 kpi_deltas = _build_kpi_deltas(kpis, baseline_kpis)
 
-                cur.execute(
-                    """
-                    SELECT season_code, SUM(COALESCE(totale_qty, 0)) AS qty
-                    FROM public.fact_order_forecast
-                    WHERE run_id = %s::uuid
-                      AND season_code IS NOT NULL
-                    GROUP BY season_code
-                    ORDER BY season_code DESC
-                    LIMIT 2
-                    """,
-                    (rid,),
-                )
-                season_rows = cur.fetchall()
-                if season_rows:
-                    latest_code, latest_qty = season_rows[0][0], _to_float(season_rows[0][1])
-                    kpis["season_latest_code"] = str(latest_code) if latest_code is not None else None
-                    kpis["season_latest_qty"] = latest_qty
-                    if len(season_rows) > 1:
-                        prev_code, prev_qty_raw = season_rows[1][0], season_rows[1][1]
-                        prev_qty = _to_float(prev_qty_raw)
-                        kpis["season_prev_code"] = str(prev_code) if prev_code is not None else None
-                        kpis["season_prev_qty"] = prev_qty
-                        kpis["season_qty_delta"] = latest_qty - prev_qty
-                        kpis["season_qty_delta_pct"] = None if prev_qty == 0 else ((latest_qty - prev_qty) / prev_qty) * 100.0
-                    else:
-                        kpis["season_prev_code"] = None
-                        kpis["season_prev_qty"] = None
-                        kpis["season_qty_delta"] = None
-                        kpis["season_qty_delta_pct"] = None
-                else:
-                    kpis["season_latest_code"] = None
-                    kpis["season_latest_qty"] = None
-                    kpis["season_prev_code"] = None
-                    kpis["season_prev_qty"] = None
-                    kpis["season_qty_delta"] = None
-                    kpis["season_qty_delta_pct"] = None
+                season_pair_trend = _compute_season_pair_trend(cur, run)
+                kpis["season_latest_code"] = season_pair_trend.get("latest_code")
+                kpis["season_latest_qty"] = season_pair_trend.get("latest_qty")
+                kpis["season_prev_code"] = season_pair_trend.get("prev_code")
+                kpis["season_prev_qty"] = season_pair_trend.get("prev_qty")
+                kpis["season_qty_delta"] = season_pair_trend.get("delta")
+                kpis["season_qty_delta_pct"] = season_pair_trend.get("delta_pct")
 
                 return {
                     "connected": True,
@@ -1475,8 +2570,10 @@ def _dashboard_payload(run_id: Optional[str], table_limit: int = 30) -> Dict[str
                         "orders_by_season_mode": orders_by_season_mode,
                         "orders_by_module": orders_by_module,
                         "orders_by_mode": orders_by_mode,
+                        "orders_by_price_band": orders_by_price_band,
                         "critical_by_shop": critical_by_shop,
                         "next_current_by_category": next_current_by_category,
+                        "next_current_by_price_band": next_current_by_price_band,
                         "next_current_delta_positive_by_category": next_current_delta_positive_by_category,
                     },
                     "tables": {
@@ -1511,6 +2608,11 @@ def api_settings():
 @app.post("/api/settings/developer-mode")
 def api_set_developer_mode(payload: DeveloperModePayload):
     return settings_store.set_developer_mode(payload.enabled)
+
+
+@app.post("/api/settings/catalog")
+def api_set_catalog_settings(payload: CatalogSettingsPayload):
+    return settings_store.set_catalog_photo_root(payload.catalog_photo_root)
 
 
 @app.post("/api/run")
@@ -1622,6 +2724,250 @@ def api_outputs():
     return {"generated_at": _now_iso(), "files": _output_summary()}
 
 
+@app.post("/api/catalog/import")
+async def api_catalog_import(
+    files: Optional[List[UploadFile]] = File(default=None),
+    excel_files: Optional[List[UploadFile]] = File(default=None),
+    price_files: Optional[List[UploadFile]] = File(default=None),
+    sheet: str = Form(default="0"),
+    create_schema: bool = Form(default=True),
+):
+    if not files and not excel_files and not price_files:
+        raise HTTPException(status_code=422, detail="Carica almeno un file catalogo (.xls/.xlsx/.csv).")
+
+    active_db_job = _db_active_catalog_import_job()
+    if active_db_job is not None:
+        raise HTTPException(status_code=409, detail="Esiste gia' un import catalogo in corso. Attendi che finisca prima di avviarne un altro.")
+
+    tmp_root = ROOT / "output" / "tmp"
+    tmp_root.mkdir(parents=True, exist_ok=True)
+    work_dir = Path(tempfile.mkdtemp(prefix="catalog_import_", dir=str(tmp_root)))
+    uploads_dir = work_dir / "uploads"
+    mixed_dir = uploads_dir / "mixed"
+    excel_dir = uploads_dir / "excel_explicit"
+    price_dir = uploads_dir / "price_explicit"
+    mixed_dir.mkdir(parents=True, exist_ok=True)
+    excel_dir.mkdir(parents=True, exist_ok=True)
+    price_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        saved_mixed = await _save_uploaded_batch(mixed_dir, files, "catalog_file")
+        mixed_classification = _classify_catalog_files(saved_mixed)
+
+        saved_excel = list(mixed_classification["excel_files"])
+        saved_excel.extend(await _save_uploaded_batch(excel_dir, excel_files, "catalog_excel"))
+
+        saved_price = list(mixed_classification["price_files"])
+        saved_price.extend(await _save_uploaded_batch(price_dir, price_files, "catalog_price"))
+
+        ignored_files = list(mixed_classification["ignored_files"])
+
+        if not saved_excel and not saved_price:
+            detail = "Nessun file utile trovato: servono .xls/.xlsx per il catalogo o .csv per i prezzi."
+            if ignored_files:
+                ignored_names = ", ".join(item["file_name"] for item in ignored_files[:5])
+                detail = f"{detail} File ignorati: {ignored_names}"
+            raise HTTPException(status_code=422, detail=detail)
+
+        sheet_value: int | str
+        if str(sheet).strip().isdigit():
+            sheet_value = int(str(sheet).strip())
+        else:
+            sheet_value = str(sheet).strip() or 0
+
+        classification = {
+            "excel_count": len(saved_excel),
+            "price_count": len(saved_price),
+            "ignored_count": len(ignored_files),
+            "ignored_files": ignored_files,
+        }
+        job = catalog_import_manager.start_job(
+            work_dir=work_dir,
+            sheet=sheet_value,
+            create_schema=bool(create_schema),
+            excel_files=saved_excel,
+            price_files=saved_price,
+            classification=classification,
+        )
+        return {
+            "ok": True,
+            "job": job.to_public(),
+        }
+    except Exception as exc:
+        if isinstance(exc, HTTPException):
+            raise exc
+        if isinstance(exc, RuntimeError):
+            raise HTTPException(status_code=409, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/catalog/import-jobs/active")
+def api_catalog_import_active():
+    job = catalog_import_manager.get_active_job()
+    if job is not None:
+        return {"job": job.to_public()}
+    return {"job": _db_active_catalog_import_job()}
+
+
+@app.get("/api/catalog/import-jobs/{job_id}")
+def api_catalog_import_job(job_id: str):
+    job = catalog_import_manager.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job import catalogo non trovato")
+    return job.to_public()
+
+
+@app.post("/api/catalog/showcase/jobs")
+def api_catalog_showcase_start_job(payload: CatalogShowcasePayload):
+    settings = settings_store.get()
+    photo_root = str(payload.photo_root or "").strip() or str(settings.get("catalog_photo_root", "") or "").strip()
+    try:
+        job = catalog_showcase_manager.start_job(
+            options={
+                "run_id": payload.run_id,
+                "export_mode": payload.export_mode,
+                "primary_source": payload.primary_source,
+                "allow_fallback": bool(payload.allow_fallback),
+                "selected_seasons": payload.selected_seasons,
+                "selected_reparti": payload.selected_reparti,
+                "selected_suppliers": payload.selected_suppliers,
+                "selected_categories": payload.selected_categories,
+                "manual_codes_text": payload.manual_codes_text,
+                "photo_root": photo_root,
+                "photo_position": payload.photo_position,
+                "allow_position_variants": bool(payload.allow_position_variants),
+            }
+        )
+        return {"ok": True, "job": job.to_public()}
+    except Exception as exc:
+        if isinstance(exc, RuntimeError):
+            raise HTTPException(status_code=409, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/catalog/showcase/jobs/active")
+def api_catalog_showcase_active_job():
+    job = catalog_showcase_manager.get_active_job()
+    return {"job": job.to_public() if job is not None else None}
+
+
+@app.get("/api/catalog/showcase/jobs/latest")
+def api_catalog_showcase_latest_job():
+    job = catalog_showcase_manager.get_latest_job()
+    return {"job": job.to_public() if job is not None else None}
+
+
+@app.get("/api/catalog/showcase/jobs/{job_id}")
+def api_catalog_showcase_job(job_id: str):
+    job = catalog_showcase_manager.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job catalogo vetrina non trovato")
+    return job.to_public()
+
+
+@app.get("/api/catalog/status")
+def api_catalog_status(run_id: Optional[str] = Query(default=None)):
+    return _catalog_status_payload(run_id=run_id)
+
+
+@app.get("/api/catalog/articles")
+def api_catalog_articles(
+    run_id: Optional[str] = Query(default=None),
+    search: str = Query(default=""),
+    season_code: str = Query(default=""),
+    reparto: str = Query(default=""),
+    categoria: str = Query(default=""),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    return _catalog_articles_payload(
+        run_id=run_id,
+        search=search,
+        season_code=season_code,
+        reparto=reparto,
+        categoria=categoria,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@app.get("/api/catalog/article-detail")
+def api_catalog_article_detail(
+    article_code: str = Query(...),
+    season_code: str = Query(...),
+    run_id: Optional[str] = Query(default=None),
+):
+    return _catalog_article_detail_payload(
+        article_code=article_code,
+        season_code=season_code,
+        run_id=run_id,
+    )
+
+
+@app.post("/api/catalog/showcase/export")
+def api_catalog_showcase_export(payload: CatalogShowcasePayload):
+    settings = settings_store.get()
+    photo_root = str(payload.photo_root or "").strip() or str(settings.get("catalog_photo_root", "") or "").strip()
+    try:
+        summary = export_catalog_showcase(
+            root=ROOT,
+            export_mode=payload.export_mode,
+            primary_source=payload.primary_source,
+            allow_fallback=bool(payload.allow_fallback),
+            selected_seasons=payload.selected_seasons,
+            selected_reparti=payload.selected_reparti,
+            selected_suppliers=payload.selected_suppliers,
+            selected_categories=payload.selected_categories,
+            manual_codes_text=payload.manual_codes_text,
+            photo_root=photo_root,
+            photo_position=payload.photo_position,
+            allow_position_variants=bool(payload.allow_position_variants),
+            source_run_id=payload.run_id,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    job_id = str(summary.get("job_id") or "")
+    html_url = f"/catalog-showcase/{job_id}/html" if str(summary.get("html_path") or "").strip() else ""
+    return {
+        "ok": True,
+        "summary": summary,
+        "download_url": f"/api/catalog/showcase/download/{job_id}",
+        "html_preview_url": html_url,
+    }
+
+
+@app.get("/api/catalog/showcase/download/{job_id}")
+def api_catalog_showcase_download(job_id: str):
+    try:
+        zip_path = get_catalog_showcase_zip_path(root=ROOT, job_id=job_id)
+        summary = get_catalog_showcase_result(root=ROOT, job_id=job_id)
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    download_name = str(summary.get("download_filename") or "").strip() or zip_path.name
+    return FileResponse(path=zip_path, filename=download_name, media_type="application/zip")
+
+
+@app.get("/catalog-showcase/{job_id}/html")
+def page_catalog_showcase_html(job_id: str):
+    try:
+        html_path = get_catalog_showcase_html_path(root=ROOT, job_id=job_id)
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return FileResponse(path=html_path, filename=html_path.name, media_type="text/html")
+
+
+@app.get("/catalog-showcase/{job_id}/html/{asset_path:path}")
+def page_catalog_showcase_html_asset(job_id: str, asset_path: str):
+    try:
+        path = get_catalog_showcase_html_asset_path(root=ROOT, job_id=job_id, asset_path=asset_path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return FileResponse(path=path, filename=path.name)
+
+
 @app.get("/api/db/status")
 def api_db_status():
     return _db_status()
@@ -1629,7 +2975,7 @@ def api_db_status():
 
 @app.get("/api/dashboard/runs")
 def api_dashboard_runs(limit: int = Query(default=100, ge=1, le=500)):
-    rows = _db_recent_runs(limit=limit)
+    rows = _db_recent_dashboard_runs(limit=limit)
     runs = []
     for row in rows:
         runs.append(

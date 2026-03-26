@@ -1,0 +1,2 @@
+Sigla,enabled,cap_scaff_paia,cap_eff_paia,ratio_eff_vs_scaff,vendite_24_paia,giro_stock,stock_medio_ideale_paia,linee_eff,linee_ideali,note
+CO,TRUE,7590,9570,1.26087,11376,2.5,4550,1110,595,"Override manuale Conegliano: blocca il valore stimato e non dipende dai campi sporchi della sorgente capacita'."
