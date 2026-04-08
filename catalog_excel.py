@@ -10,8 +10,9 @@ from openpyxl import load_workbook
 
 
 EXCEL_PARSER_VERSION = "catalog_excel_v1"
-_ARTICLE_RE = re.compile(r"^\s*\d+\s*/\s*[A-Za-z0-9]+[A-Za-z0-9]*\s*$")
+_ARTICLE_RE = re.compile(r"^\s*[A-Za-z0-9]{1,4}\s*/\s*[A-Za-z0-9]{2,}\s*$")
 _SIZE_RE = re.compile(r"^\s*(\d{2})\s*$")
+_INLINE_LABEL_CACHE: Dict[str, re.Pattern[str]] = {}
 
 
 def ensure_xlsx(path: str | Path) -> Path:
@@ -65,6 +66,17 @@ def _find_value_after_label(row: List[Any], label: str) -> Optional[str]:
             if value in {"", ":"}:
                 continue
             return value
+    pattern = _INLINE_LABEL_CACHE.get(target)
+    if pattern is None:
+        pattern = re.compile(rf"^\s*{re.escape(target)}\s*:?\s*(.+?)\s*$", re.IGNORECASE)
+        _INLINE_LABEL_CACHE[target] = pattern
+    for cell in cells:
+        match = pattern.match(cell)
+        if not match:
+            continue
+        value = _norm_str(match.group(1))
+        if value and value != ":":
+            return value
     return None
 
 
@@ -75,16 +87,21 @@ def _row_contains(row: List[Any], target: str) -> bool:
 
 def _update_context_from_row(row: List[Any]) -> Dict[str, str]:
     out: Dict[str, str] = {}
-    for key, label in (("fornitore", "FORNITORE"), ("reparto", "REPARTO"), ("categoria", "CATEGORIA")):
+    for key, label in (
+        ("fornitore", "FORNITORE"),
+        ("reparto", "REPARTO"),
+        ("categoria", "CATEGORIA"),
+        ("marchio", "MARCHIO"),
+    ):
         value = _find_value_after_label(row, label)
         if value:
             out[key] = value
     if _row_contains(row, "TIPOLOGIA"):
         value = _find_value_after_label(row, "TIPOLOGIA")
-        if value:
+        if value and value != ":":
             out["tipologia"] = value
         else:
-            values = [_norm_str(cell) for cell in row if _norm_str(cell)]
+            values = [_norm_str(cell) for cell in row if _norm_str(cell) and _norm_str(cell) != ":"]
             if values:
                 out["tipologia"] = values[-1]
     return out
@@ -161,6 +178,7 @@ def parse_situazione_articoli_excel(
     fornitore = ""
     reparto = ""
     categoria = ""
+    marchio = ""
     tipologia = ""
 
     table = None
@@ -194,6 +212,7 @@ def parse_situazione_articoli_excel(
                 "fornitore": fornitore,
                 "reparto": reparto,
                 "categoria": categoria,
+                "marchio": marchio,
                 "tipologia": tipologia,
                 "source_file": source_file,
                 "source_sheet": source_sheet,
@@ -234,6 +253,8 @@ def parse_situazione_articoli_excel(
             reparto = context["reparto"]
         if "categoria" in context:
             categoria = context["categoria"]
+        if "marchio" in context:
+            marchio = context["marchio"]
         if "tipologia" in context:
             tipologia = context["tipologia"]
 
@@ -274,6 +295,7 @@ def parse_situazione_articoli_excel(
         "fornitore",
         "reparto",
         "categoria",
+        "marchio",
         "tipologia",
         "source_file",
         "source_sheet",

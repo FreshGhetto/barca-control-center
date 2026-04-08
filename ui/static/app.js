@@ -12,7 +12,11 @@ const state = {
   dashboardRuns: [],
   dashboardRunId: null,
   dashboardData: null,
+  dashboardRefreshing: false,
+  selectedTransferArticle: "",
+  transferArticleDetail: null,
   catalogStatus: null,
+  catalogRuns: [],
   catalogRows: [],
   catalogTotal: 0,
   catalogSelected: null,
@@ -27,15 +31,20 @@ const state = {
     seasons: [],
     reparti: [],
     categories: [],
+    brands: [],
     seasonSearch: "",
     repartoSearch: "",
     categoriaSearch: "",
+    brandSearch: "",
   },
   catalogFilters: {
+    run_id: "",
     search: "",
     season: "",
     reparto: "",
     categoria: "",
+    limit: 250,
+    offset: 0,
   },
   dashboardTableState: {
     transfer_proposals: { sortKey: "qty", sortDir: "desc", search: "", rowLimit: 20, showAll: false },
@@ -101,6 +110,7 @@ const el = {
   chartNextCurrentDeltaCategory: document.getElementById("chartNextCurrentDeltaCategory"),
   chartNextCurrentPriceBand: document.getElementById("chartNextCurrentPriceBand"),
   transferPanel: document.getElementById("transferPanel"),
+  transferArticlePanel: document.getElementById("transferArticlePanel"),
   ordersPanel: document.getElementById("ordersPanel"),
   criticalPanel: document.getElementById("criticalPanel"),
   nextCurrentPanel: document.getElementById("nextCurrentPanel"),
@@ -137,6 +147,14 @@ const el = {
   criticalTableShowAllBtn: document.getElementById("criticalTableShowAllBtn"),
   nextCurrentTableShowAllBtn: document.getElementById("nextCurrentTableShowAllBtn"),
   transferTableFocusBtn: document.getElementById("transferTableFocusBtn"),
+  transferArticleSubtitle: document.getElementById("transferArticleSubtitle"),
+  transferArticleInput: document.getElementById("transferArticleInput"),
+  transferArticleLoadBtn: document.getElementById("transferArticleLoadBtn"),
+  transferArticleExportXlsxBtn: document.getElementById("transferArticleExportXlsxBtn"),
+  transferArticleSummary: document.getElementById("transferArticleSummary"),
+  transferArticleReasons: document.getElementById("transferArticleReasons"),
+  transferArticleMovesBody: document.getElementById("transferArticleMovesBody"),
+  transferArticleMatrix: document.getElementById("transferArticleMatrix"),
   ordersTableFocusBtn: document.getElementById("ordersTableFocusBtn"),
   criticalTableFocusBtn: document.getElementById("criticalTableFocusBtn"),
   nextCurrentTableFocusBtn: document.getElementById("nextCurrentTableFocusBtn"),
@@ -160,15 +178,21 @@ const el = {
   catalogSaveSettingsBtn: document.getElementById("catalogSaveSettingsBtn"),
   catalogSettingsMsg: document.getElementById("catalogSettingsMsg"),
   catalogSummary: document.getElementById("catalogSummary"),
+  catalogRunFilter: document.getElementById("catalogRunFilter"),
   catalogSearch: document.getElementById("catalogSearch"),
   catalogSeasonFilter: document.getElementById("catalogSeasonFilter"),
   catalogRepartoFilter: document.getElementById("catalogRepartoFilter"),
   catalogCategoriaFilter: document.getElementById("catalogCategoriaFilter"),
+  catalogRowLimit: document.getElementById("catalogRowLimit"),
   catalogTableBody: document.getElementById("catalogTableBody"),
+  catalogPrevPageBtn: document.getElementById("catalogPrevPageBtn"),
+  catalogNextPageBtn: document.getElementById("catalogNextPageBtn"),
+  catalogPageInfo: document.getElementById("catalogPageInfo"),
   catalogDetailBox: document.getElementById("catalogDetailBox"),
   catalogShowcaseForm: document.getElementById("catalogShowcaseForm"),
   catalogShowcaseSubmitBtn: document.getElementById("catalogShowcaseSubmitBtn"),
   catalogShowcaseExportMode: document.getElementById("catalogShowcaseExportMode"),
+  catalogShowcaseJpgLayout: document.getElementById("catalogShowcaseJpgLayout"),
   catalogShowcasePrimarySource: document.getElementById("catalogShowcasePrimarySource"),
   catalogShowcasePhotoPosition: document.getElementById("catalogShowcasePhotoPosition"),
   catalogShowcaseAllowVariants: document.getElementById("catalogShowcaseAllowVariants"),
@@ -176,18 +200,23 @@ const el = {
   catalogShowcaseSeasonStatus: document.getElementById("catalogShowcaseSeasonStatus"),
   catalogShowcaseRepartoStatus: document.getElementById("catalogShowcaseRepartoStatus"),
   catalogShowcaseCategoriaStatus: document.getElementById("catalogShowcaseCategoriaStatus"),
+  catalogShowcaseBrandStatus: document.getElementById("catalogShowcaseBrandStatus"),
   catalogShowcaseSeasonSearch: document.getElementById("catalogShowcaseSeasonSearch"),
   catalogShowcaseRepartoSearch: document.getElementById("catalogShowcaseRepartoSearch"),
   catalogShowcaseCategoriaSearch: document.getElementById("catalogShowcaseCategoriaSearch"),
+  catalogShowcaseBrandSearch: document.getElementById("catalogShowcaseBrandSearch"),
   catalogShowcaseSeasonAll: document.getElementById("catalogShowcaseSeasonAll"),
   catalogShowcaseRepartoAll: document.getElementById("catalogShowcaseRepartoAll"),
   catalogShowcaseCategoriaAll: document.getElementById("catalogShowcaseCategoriaAll"),
+  catalogShowcaseBrandAll: document.getElementById("catalogShowcaseBrandAll"),
   catalogShowcaseSeasonClear: document.getElementById("catalogShowcaseSeasonClear"),
   catalogShowcaseRepartoClear: document.getElementById("catalogShowcaseRepartoClear"),
   catalogShowcaseCategoriaClear: document.getElementById("catalogShowcaseCategoriaClear"),
+  catalogShowcaseBrandClear: document.getElementById("catalogShowcaseBrandClear"),
   catalogShowcaseSeasonOptions: document.getElementById("catalogShowcaseSeasonOptions"),
   catalogShowcaseRepartoOptions: document.getElementById("catalogShowcaseRepartoOptions"),
   catalogShowcaseCategoriaOptions: document.getElementById("catalogShowcaseCategoriaOptions"),
+  catalogShowcaseBrandOptions: document.getElementById("catalogShowcaseBrandOptions"),
   catalogShowcaseManualCodes: document.getElementById("catalogShowcaseManualCodes"),
   catalogShowcaseMsg: document.getElementById("catalogShowcaseMsg"),
   catalogShowcaseProgressBox: document.getElementById("catalogShowcaseProgressBox"),
@@ -210,8 +239,27 @@ const DASHBOARD_TABLE_CONFIG = {
     infoEl: el.transferTableInfo,
     exportCsvEl: el.transferExportCsvBtn,
     exportXlsxEl: el.transferExportXlsxBtn,
-    columns: ["article_code", "size", "from_shop_code", "to_shop_code", "reason", "qty"],
-    numericColumns: ["qty", "size"],
+    columns: [
+      "article_code",
+      "size",
+      "from_shop_code",
+      "from_observed_sales_signal",
+      "from_zero_sales_source_candidate",
+      "to_shop_code",
+      "to_observed_sales_signal",
+      "to_missing_core_sizes",
+      "to_destination_priority_score",
+      "reason",
+      "qty",
+    ],
+    numericColumns: [
+      "qty",
+      "size",
+      "from_observed_sales_signal",
+      "to_observed_sales_signal",
+      "to_missing_core_sizes",
+      "to_destination_priority_score",
+    ],
   },
   order_proposals: {
     key: "order_proposals",
@@ -568,9 +616,11 @@ function renderCatalogShowcaseJob(job) {
   const selectedReparti = Array.isArray(filters.selected_reparti) ? filters.selected_reparti : [];
   const selectedCategories = Array.isArray(filters.selected_categories) ? filters.selected_categories : [];
   const selectedSuppliers = Array.isArray(filters.selected_suppliers) ? filters.selected_suppliers : [];
+  const selectedBrands = Array.isArray(filters.selected_brands) ? filters.selected_brands : [];
 
   details.push(job.primary_source === "local" ? "Sorgente foto: archivio locale" : "Sorgente foto: sito BARCA");
   details.push(`Formato: ${String(job.export_mode || "both").toUpperCase()}`);
+  details.push(`Layout JPG: ${String(job.jpg_layout || "minimal") === "detailed" ? "detailed" : "minimal"}`);
   if (job.requested != null) details.push(`Articoli selezionati: ${fmtNum(job.requested || 0, 0)}`);
   if (job.current && job.total) details.push(`Articoli elaborati: ${fmtNum(job.current, 0)}/${fmtNum(job.total, 0)}`);
   if (job.current_article) {
@@ -586,6 +636,7 @@ function renderCatalogShowcaseJob(job) {
   if (selectedReparti.length) details.push(`${selectedReparti.length} reparti`);
   if (selectedCategories.length) details.push(`${selectedCategories.length} categorie`);
   if (selectedSuppliers.length) details.push(`${selectedSuppliers.length} fornitori`);
+  if (selectedBrands.length) details.push(`${selectedBrands.length} marchi`);
   if (job.started_at) details.push(`Avvio: ${fmtDateCompact(job.started_at)}`);
   if (job.ended_at) details.push(`Fine: ${fmtDateCompact(job.ended_at)}`);
   if (job.error) details.push(`Errore: ${job.error}`);
@@ -1569,6 +1620,10 @@ function formatDashboardCellValue(tableKey, key, raw, row) {
   if (tableKey === "transfer_proposals") {
     if (key === "qty") return fmtPairs(raw, 2);
     if (key === "size") return fmtNum(raw, 0);
+    if (key === "from_observed_sales_signal" || key === "to_observed_sales_signal") return fmtPairs(raw, 0);
+    if (key === "to_missing_core_sizes") return fmtNum(raw, 0);
+    if (key === "to_destination_priority_score") return fmtNum(raw, 0);
+    if (key === "from_zero_sales_source_candidate") return raw ? "Si" : "No";
     return fmt(raw);
   }
 
@@ -1616,7 +1671,11 @@ function renderDashboardTable(tbody, rows, keys, numericKeys = [], tableKey = ""
           return `<td class="${escHtml(cls)}">${escHtml(val)}</td>`;
         })
         .join("");
-      return `<tr>${cells}</tr>`;
+      const articleCode = tableKey === "transfer_proposals" ? String(row.article_code || "").trim() : "";
+      const isSelected = tableKey === "transfer_proposals" && articleCode && articleCode === state.selectedTransferArticle;
+      const rowAttrs = articleCode ? ` data-article-code="${escHtml(articleCode)}"` : "";
+      const rowClass = isSelected ? "selected-transfer-article" : "";
+      return `<tr class="${escHtml(rowClass)}"${rowAttrs}>${cells}</tr>`;
     })
     .join("");
 }
@@ -1691,6 +1750,16 @@ function renderDashboardTableByKey(tableKey) {
   if (!cfg) return;
   const data = getDashboardTableRows(tableKey);
   renderDashboardTable(cfg.tbodyEl, data.rows, cfg.columns, cfg.numericColumns, tableKey);
+  if (tableKey === "transfer_proposals" && cfg.tbodyEl) {
+    cfg.tbodyEl.querySelectorAll("tr[data-article-code]").forEach((rowEl) => {
+      rowEl.addEventListener("click", () => {
+        const articleCode = String(rowEl.dataset.articleCode || "").trim();
+        if (!articleCode) return;
+        state.selectedTransferArticle = articleCode;
+        loadTransferArticleDetail(articleCode);
+      });
+    });
+  }
   setDashboardTableSortIndicators(tableKey);
   if (cfg.infoEl) {
     cfg.infoEl.textContent = `${data.shown}/${data.filtered} (tot ${data.total})`;
@@ -1770,6 +1839,227 @@ async function exportDashboardTableXlsx(tableKey) {
   const m = /filename="([^"]+)"/i.exec(cd);
   if (m && m[1]) filename = m[1];
   downloadBlob(blob, filename);
+}
+
+function renderTransferArticleEmpty(message) {
+  state.transferArticleDetail = null;
+  if (el.transferArticleSubtitle) {
+    el.transferArticleSubtitle.textContent = message || "Clicca una riga trasferimento o inserisci un articolo per aprire la matrice.";
+  }
+  if (el.transferArticleSummary) {
+    el.transferArticleSummary.innerHTML = `<div class="empty-state">${escHtml(message || "Nessun articolo selezionato.")}</div>`;
+  }
+  if (el.transferArticleReasons) {
+    el.transferArticleReasons.innerHTML = "";
+  }
+  if (el.transferArticleMovesBody) {
+    el.transferArticleMovesBody.innerHTML = "<tr class='empty-row'><td colspan='5'>Nessun movimento disponibile.</td></tr>";
+  }
+  if (el.transferArticleMatrix) {
+    el.transferArticleMatrix.innerHTML = "<div class='empty-state'>Matrice non disponibile.</div>";
+  }
+}
+
+function getTransferProposalArticles() {
+  const rows = Array.isArray(state.dashboardData?.tables?.transfer_proposals) ? state.dashboardData.tables.transfer_proposals : [];
+  const seen = new Set();
+  const out = [];
+  rows.forEach((row) => {
+    const code = String(row?.article_code || "").trim();
+    if (!code || seen.has(code)) return;
+    seen.add(code);
+    out.push(code);
+  });
+  return out;
+}
+
+function renderTransferArticleDetail(detail) {
+  const article = detail?.article || {};
+  const articleCode = String(article.article_code || "").trim();
+  const description = String(article.description || "").trim();
+  if (el.transferArticleInput && articleCode) {
+    el.transferArticleInput.value = articleCode;
+  }
+  if (el.transferArticleSubtitle) {
+    const subtitle = [articleCode, description].filter(Boolean).join(" · ");
+    el.transferArticleSubtitle.textContent = subtitle || "Dettaglio articolo";
+  }
+  if (el.transferArticleSummary) {
+    const cards = [
+      ["Stock iniziale", fmtPairs(article.total_before, 0)],
+      ["Stock finale", fmtPairs(article.total_after, 0)],
+      ["Paia mosse", fmtPairs(article.moved_qty_total, 0)],
+      ["Negozi donor", fmtNum(article.donor_shops, 0)],
+      ["Negozi receiver", fmtNum(article.receiver_shops, 0)],
+      ["Paia verso outlet", fmtPairs(article.outlet_qty, 0)],
+    ];
+    el.transferArticleSummary.innerHTML = cards
+      .map(
+        ([label, value]) => `
+          <article class="article-summary-card">
+            <div class="article-summary-label">${escHtml(label)}</div>
+            <div class="article-summary-value">${escHtml(value)}</div>
+          </article>
+        `,
+      )
+      .join("");
+  }
+  if (el.transferArticleReasons) {
+    const reasons = Array.isArray(article.reasons) ? article.reasons : [];
+    el.transferArticleReasons.innerHTML = reasons.length
+      ? reasons
+          .map(
+            (row) => `<span class="article-reason-pill">${escHtml(row.reason || "n/a")} · ${escHtml(fmtPairs(row.qty, 0))}</span>`,
+          )
+          .join("")
+      : "";
+  }
+
+  const moves = Array.isArray(detail?.movements) ? detail.movements : [];
+  if (el.transferArticleMovesBody) {
+    el.transferArticleMovesBody.innerHTML = moves.length
+      ? moves
+          .map(
+            (row) => `
+              <tr>
+                <td>${escHtml(fmtNum(row.size, 0))}</td>
+                <td>${escHtml(fmt(row.from_shop_code))}</td>
+                <td>${escHtml(fmt(row.to_shop_code))}</td>
+                <td>${escHtml(fmt(row.reason))}</td>
+                <td>${escHtml(fmtPairs(row.qty, 0))}</td>
+              </tr>
+            `,
+          )
+          .join("")
+      : "<tr class='empty-row'><td colspan='5'>Nessun movimento registrato per questo articolo.</td></tr>";
+  }
+
+  const shopRows = Array.isArray(detail?.shop_rows) ? detail.shop_rows : [];
+  if (el.transferArticleMatrix) {
+    if (!shopRows.length) {
+      el.transferArticleMatrix.innerHTML = "<div class='empty-state'>Nessuna matrice disponibile per questo articolo.</div>";
+    } else {
+      const sizeHeaders = (detail?.sizes || []).map((size) => `<th>${escHtml(String(size))}</th>`).join("");
+      const bodyRows = shopRows
+        .map((row) => {
+          const sizeCells = (row.size_cells || [])
+            .map((cell) => {
+              const classes = ["article-matrix-cell"];
+              if (Number(cell.inbound_qty || 0) > Number(cell.outbound_qty || 0)) classes.push("inbound");
+              if (Number(cell.outbound_qty || 0) > Number(cell.inbound_qty || 0)) classes.push("outbound");
+              if (cell.missing_after) classes.push("gap");
+              if (Number(cell.duplicate_before || 0) > 0) classes.push("duplicate");
+              const notes = [];
+              if (cell.missing_after) notes.push("buco core");
+              if (Number(cell.duplicate_before || 0) > 0) notes.push(`doppio ${fmtNum(cell.duplicate_before, 0)}`);
+              return `
+                <td class="${escHtml(classes.join(" "))}">
+                  <div class="article-matrix-top">
+                    <span>pre ${escHtml(fmtNum(cell.before_qty, 0))}</span>
+                    <span>aft ${escHtml(fmtNum(cell.after_qty, 0))}</span>
+                  </div>
+                  <div class="article-matrix-flow">
+                    <span class="in">+${escHtml(fmtNum(cell.inbound_qty, 0))}</span>
+                    <span class="out">-${escHtml(fmtNum(cell.outbound_qty, 0))}</span>
+                  </div>
+                  <div class="article-matrix-after">Δ ${escHtml(fmtNum(cell.delta_qty, 0))}</div>
+                  <div class="article-matrix-note">${escHtml(notes.join(" · ") || "ok")}</div>
+                </td>
+              `;
+            })
+            .join("");
+          const metaText = [`F${fmt(row.fascia)}`, row.role, `vend ${fmtPairs(row.observed_sales_signal, 0)}`].join(" · ");
+          const totalsText = `pre ${fmtPairs(row.before_total, 0)} · +${fmtPairs(row.inbound_total, 0)} · -${fmtPairs(row.outbound_total, 0)} · aft ${fmtPairs(row.after_total, 0)}`;
+          return `
+            <tr>
+              <td class="article-matrix-shop">
+                <strong>${escHtml(fmt(row.shop_code))}</strong>
+                <div class="article-matrix-note">${escHtml(metaText)}</div>
+              </td>
+              <td class="article-matrix-meta">
+                <div>${escHtml(totalsText)}</div>
+                <div class="article-matrix-note">buchi core ${escHtml(fmtNum(row.missing_core_sizes, 0))} · deficit ${escHtml(fmtPairs(row.deficit_after, 0))}</div>
+              </td>
+              ${sizeCells}
+            </tr>
+          `;
+        })
+        .join("");
+      el.transferArticleMatrix.innerHTML = `
+        <table class="article-matrix-table">
+          <thead>
+            <tr>
+              <th class="article-matrix-shop">Negozio</th>
+              <th class="article-matrix-meta">Riepilogo</th>
+              ${sizeHeaders}
+            </tr>
+          </thead>
+          <tbody>${bodyRows}</tbody>
+        </table>
+      `;
+    }
+  }
+}
+
+async function loadTransferArticleDetail(articleCode = null) {
+  const code = String(articleCode || state.selectedTransferArticle || el.transferArticleInput?.value || "").trim();
+  if (!state.dashboardRunId) {
+    renderTransferArticleEmpty("Seleziona prima un aggiornamento dashboard.");
+    return;
+  }
+  if (!code) {
+    renderTransferArticleEmpty("Seleziona un articolo dalla tabella trasferimenti.");
+    return;
+  }
+  state.selectedTransferArticle = code;
+  try {
+    const qs = new URLSearchParams({
+      run_id: state.dashboardRunId,
+      article_code: code,
+    });
+    const detail = await api(`/api/dashboard/article-detail?${qs.toString()}`);
+    state.transferArticleDetail = detail;
+    renderTransferArticleDetail(detail);
+    renderDashboardTableByKey("transfer_proposals");
+  } catch (err) {
+    renderTransferArticleEmpty(`Errore dettaglio articolo: ${err.message}`);
+  }
+}
+
+async function exportTransferArticleDetailXlsx() {
+  const code = String(state.selectedTransferArticle || el.transferArticleInput?.value || "").trim();
+  if (!state.dashboardRunId || !code) {
+    alert("Seleziona prima un articolo dal pannello trasferimenti.");
+    return;
+  }
+  const qs = new URLSearchParams({
+    run_id: state.dashboardRunId,
+    article_code: code,
+  });
+  const res = await fetch(`/api/dashboard/article-detail/export?${qs.toString()}`);
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(txt || `HTTP ${res.status}`);
+  }
+  const blob = await res.blob();
+  let filename = `barca_article_${code}.xlsx`;
+  const cd = res.headers.get("content-disposition") || "";
+  const m = /filename="([^"]+)"/i.exec(cd);
+  if (m && m[1]) filename = m[1];
+  downloadBlob(blob, filename);
+}
+
+async function ensureTransferArticleSelection() {
+  const available = getTransferProposalArticles();
+  if (!available.length) {
+    state.selectedTransferArticle = "";
+    renderTransferArticleEmpty("Nessun articolo presente nei trasferimenti della run selezionata.");
+    return;
+  }
+  if (!available.includes(state.selectedTransferArticle)) {
+    state.selectedTransferArticle = available[0];
+  }
+  await loadTransferArticleDetail(state.selectedTransferArticle);
 }
 
 function toggleTableFullscreen(tableKey, forceState = null) {
@@ -1956,15 +2246,16 @@ function setActiveDashSection(sectionName) {
 function collectRunPayload() {
   const val = (id) => document.getElementById(id).value.trim();
   const chk = (id) => document.getElementById(id).checked;
+  const skipOrders = chk("skipOrders");
   return {
-    source_db: chk("sourceDb"),
+    source_db: true,
     source_db_run_id: val("sourceDbRunId") || null,
-    skip_ingest: chk("skipIngest"),
-    incoming_root: val("incomingRoot") || null,
+    skip_ingest: true,
+    incoming_root: null,
     keep_incoming: false,
-    skip_orders: chk("skipOrders"),
-    orders_root: val("ordersRoot") || null,
-    orders_source_db: chk("ordersSourceDb"),
+    skip_orders: skipOrders,
+    orders_root: null,
+    orders_source_db: !skipOrders,
     orders_source_db_run_id: val("ordersSourceDbRunId") || null,
     orders_math_only: chk("ordersMathOnly"),
     orders_coverage: Number(document.getElementById("ordersCoverage").value || "1.20"),
@@ -2122,6 +2413,13 @@ function catalogShowcaseFilterMeta(group) {
         allLabel: "Tutte le categorie incluse",
         emptySearchLabel: "Nessuna categoria trovata con questo filtro.",
       },
+      brands: {
+        searchKey: "brandSearch",
+        optionsEl: el.catalogShowcaseBrandOptions,
+        statusEl: el.catalogShowcaseBrandStatus,
+        allLabel: "Tutti i marchi inclusi",
+        emptySearchLabel: "Nessun marchio trovato con questo filtro.",
+      },
     }[group] || null
   );
 }
@@ -2136,11 +2434,12 @@ function getCatalogShowcaseAvailableItems(group, facets = state.catalogStatus?.f
   if (group === "seasons") return normalizeCatalogShowcaseItems(facets?.seasons);
   if (group === "reparti") return normalizeCatalogShowcaseItems(facets?.reparti);
   if (group === "categories") return normalizeCatalogShowcaseItems(facets?.categorie);
+  if (group === "brands") return normalizeCatalogShowcaseItems(facets?.marchi);
   return [];
 }
 
 function pruneCatalogShowcaseSelections(facets) {
-  ["seasons", "reparti", "categories"].forEach((group) => {
+  ["seasons", "reparti", "categories", "brands"].forEach((group) => {
     const available = new Set(getCatalogShowcaseAvailableItems(group, facets));
     state.catalogShowcaseFilters[group] = (state.catalogShowcaseFilters[group] || []).filter((item) => available.has(item));
   });
@@ -2208,6 +2507,7 @@ function renderCatalogShowcaseFilters(facets) {
   renderCatalogShowcaseFilterGroup("seasons", getCatalogShowcaseAvailableItems("seasons", facets));
   renderCatalogShowcaseFilterGroup("reparti", getCatalogShowcaseAvailableItems("reparti", facets));
   renderCatalogShowcaseFilterGroup("categories", getCatalogShowcaseAvailableItems("categories", facets));
+  renderCatalogShowcaseFilterGroup("brands", getCatalogShowcaseAvailableItems("brands", facets));
 }
 
 function toggleCatalogShowcaseFilterValue(group, value) {
@@ -2240,6 +2540,7 @@ function resetCatalogShowcaseFilter(group) {
   if (group === "seasons" && el.catalogShowcaseSeasonSearch) el.catalogShowcaseSeasonSearch.value = "";
   if (group === "reparti" && el.catalogShowcaseRepartoSearch) el.catalogShowcaseRepartoSearch.value = "";
   if (group === "categories" && el.catalogShowcaseCategoriaSearch) el.catalogShowcaseCategoriaSearch.value = "";
+  if (group === "brands" && el.catalogShowcaseBrandSearch) el.catalogShowcaseBrandSearch.value = "";
   renderCatalogShowcaseFilters(state.catalogStatus?.facets || {});
 }
 
@@ -2337,10 +2638,58 @@ function renderCatalogFilters(facets) {
   renderCatalogShowcaseFilters(facets);
 }
 
+function catalogRunLabel(run) {
+  const ts = fmtDateCompact(run?.started_at || run?.created_at);
+  const context =
+    run?.business_context?.summary_short ||
+    runContextSummary(run, { includeMethods: false, fallbackDefault: false }) ||
+    runTypeLabel(run);
+  const parts = [];
+  if (ts && ts !== "--") parts.push(ts);
+  if (context) parts.push(context);
+  if (run?.run_id) parts.push(`#${shortRunCode(run.run_id)}`);
+  return parts.join(" · ") || "Run catalogo";
+}
+
+function renderCatalogRunFilter() {
+  if (!el.catalogRunFilter) return;
+  const runs = Array.isArray(state.catalogRuns) ? state.catalogRuns : [];
+  const selectedRunId = state.catalogFilters.run_id || "";
+  el.catalogRunFilter.innerHTML =
+    `<option value="">Catalogo corrente (vista aggregata)</option>` +
+    runs
+      .map((run) => `<option value="${escHtml(run.run_id || "")}">${escHtml(catalogRunLabel(run))}</option>`)
+      .join("");
+  const selectedExists = selectedRunId && runs.some((run) => run.run_id === selectedRunId);
+  el.catalogRunFilter.value = selectedExists ? selectedRunId : "";
+  state.catalogFilters.run_id = el.catalogRunFilter.value || "";
+}
+
+function renderCatalogPager() {
+  const limit = Math.max(1, Number(state.catalogFilters.limit) || 250);
+  const offset = Math.max(0, Number(state.catalogFilters.offset) || 0);
+  const total = Math.max(0, Number(state.catalogTotal) || 0);
+  const rowsCount = Array.isArray(state.catalogRows) ? state.catalogRows.length : 0;
+  const lastVisible = Math.min(total, offset + rowsCount);
+  const currentPage = rowsCount > 0 ? Math.floor(offset / limit) + 1 : 1;
+  const totalPages = Math.max(1, Math.ceil(total / limit) || 1);
+
+  if (el.catalogPageInfo) {
+    if (total <= 0 || rowsCount <= 0) {
+      el.catalogPageInfo.textContent = "Pagina 1/1 · 0 articoli";
+    } else {
+      el.catalogPageInfo.textContent = `Pagina ${currentPage}/${totalPages} · ${fmtNum(offset + 1, 0)}-${fmtNum(lastVisible, 0)} di ${fmtNum(total, 0)} articoli`;
+    }
+  }
+  if (el.catalogPrevPageBtn) el.catalogPrevPageBtn.disabled = offset <= 0;
+  if (el.catalogNextPageBtn) el.catalogNextPageBtn.disabled = total <= 0 || lastVisible >= total;
+}
+
 function renderCatalogTable() {
   if (!el.catalogTableBody) return;
   if (!state.catalogRows || state.catalogRows.length === 0) {
     el.catalogTableBody.innerHTML = `<tr class='empty-row'><td colspan='12'>Nessun articolo catalogo disponibile per i filtri selezionati.</td></tr>`;
+    renderCatalogPager();
     return;
   }
   el.catalogTableBody.innerHTML = state.catalogRows
@@ -2379,6 +2728,7 @@ function renderCatalogTable() {
       refreshCatalogDetail();
     });
   });
+  renderCatalogPager();
 }
 
 function renderCatalogDetail(detail) {
@@ -2411,9 +2761,11 @@ function renderCatalogDetail(detail) {
         <span class="tag">${escHtml(summary.season_code || "--")}</span>
         <span class="tag">${escHtml(summary.reparto || "--")}</span>
         <span class="tag">${escHtml(summary.categoria || "--")}</span>
+        <span class="tag">${escHtml(summary.marchio || "--")}</span>
       </div>
     </div>
     <div class="catalog-detail-meta">
+      <div><span>Marchio</span><strong>${escHtml(summary.marchio || "--")}</strong></div>
       <div><span>Fornitore</span><strong>${escHtml(summary.supplier || "--")}</strong></div>
       <div><span>Tipologia</span><strong>${escHtml(summary.tipologia || "--")}</strong></div>
       <div><span>GIAC</span><strong>${escHtml(fmtNum(summary.giac, 0))}</strong></div>
@@ -2461,22 +2813,47 @@ function renderCatalogDetail(detail) {
 }
 
 async function refreshCatalogStatus() {
-  const out = await api("/api/catalog/status");
+  const qs = new URLSearchParams();
+  if (state.catalogFilters.run_id) qs.set("run_id", state.catalogFilters.run_id);
+  const out = await api(`/api/catalog/status${qs.toString() ? `?${qs.toString()}` : ""}`);
   state.catalogStatus = out;
   renderCatalogSummary(out);
   renderCatalogFilters(out?.facets || {});
   return out;
 }
 
+async function refreshCatalogRuns() {
+  try {
+    const qs = new URLSearchParams({
+      source: "db",
+      run_type: "catalog",
+      limit: "100",
+      offset: "0",
+      sort_by: "started_at",
+      sort_dir: "desc",
+    });
+    const out = await api(`/api/runs?${qs.toString()}`);
+    const runs = Array.isArray(out?.runs) ? out.runs : [];
+    state.catalogRuns = runs.filter((run) => {
+      const runType = normalizeText(run?.run_type || "");
+      return runType.includes("catalog_import") || (runType.includes("catalog") && !runType.includes("showcase"));
+    });
+  } catch {
+    state.catalogRuns = [];
+  }
+  renderCatalogRunFilter();
+}
+
 async function refreshCatalogArticles() {
   const qs = new URLSearchParams({
-    limit: "250",
-    offset: "0",
+    limit: String(Math.max(1, Number(state.catalogFilters.limit) || 250)),
+    offset: String(Math.max(0, Number(state.catalogFilters.offset) || 0)),
     search: state.catalogFilters.search || "",
     season_code: state.catalogFilters.season || "",
     reparto: state.catalogFilters.reparto || "",
     categoria: state.catalogFilters.categoria || "",
   });
+  if (state.catalogFilters.run_id) qs.set("run_id", state.catalogFilters.run_id);
   const out = await api(`/api/catalog/articles?${qs.toString()}`);
   state.catalogRows = out.rows || [];
   state.catalogTotal = Number(out.total || state.catalogRows.length || 0);
@@ -2503,14 +2880,17 @@ async function refreshCatalogDetail() {
     article_code: state.catalogSelected.article_code,
     season_code: state.catalogSelected.season_code,
   });
+  if (state.catalogFilters.run_id) qs.set("run_id", state.catalogFilters.run_id);
   const out = await api(`/api/catalog/article-detail?${qs.toString()}`);
   renderCatalogDetail(out);
 }
 
 async function refreshCatalog() {
   try {
+    await refreshCatalogRuns();
     const status = await refreshCatalogStatus();
     if (!status?.available) {
+      state.catalogTotal = 0;
       state.catalogRows = [];
       renderCatalogTable();
       renderCatalogDetail(null);
@@ -2519,6 +2899,7 @@ async function refreshCatalog() {
     await refreshCatalogArticles();
   } catch (err) {
     renderCatalogSummary({ available: false, reason: err.message });
+    state.catalogTotal = 0;
     state.catalogRows = [];
     renderCatalogTable();
     renderCatalogDetail({ available: false, reason: err.message });
@@ -2675,11 +3056,13 @@ async function startCatalogShowcaseExport(evt) {
   const payload = {
     run_id: null,
     export_mode: el.catalogShowcaseExportMode?.value || "both",
+    jpg_layout: el.catalogShowcaseJpgLayout?.value || "minimal",
     primary_source: el.catalogShowcasePrimarySource?.value || "local",
     allow_fallback: !!el.catalogShowcaseFallback?.checked,
     selected_seasons: state.catalogShowcaseFilters.seasons || [],
     selected_reparti: state.catalogShowcaseFilters.reparti || [],
     selected_categories: state.catalogShowcaseFilters.categories || [],
+    selected_brands: state.catalogShowcaseFilters.brands || [],
     manual_codes_text: el.catalogShowcaseManualCodes?.value || "",
     photo_root: el.catalogPhotoRoot?.value?.trim() || "",
     photo_position: el.catalogShowcasePhotoPosition?.value?.trim() || "xl",
@@ -2690,6 +3073,7 @@ async function startCatalogShowcaseExport(evt) {
     payload.selected_seasons.length ? `${payload.selected_seasons.length} stagioni` : "tutte le stagioni",
     payload.selected_reparti.length ? `${payload.selected_reparti.length} reparti` : "tutti i reparti",
     payload.selected_categories.length ? `${payload.selected_categories.length} categorie` : "tutte le categorie",
+    payload.selected_brands.length ? `${payload.selected_brands.length} marchi` : "tutti i marchi",
   ].join(" • ");
 
   setCatalogShowcaseMessage("Generazione catalogo vetrina avviata...");
@@ -2701,6 +3085,7 @@ async function startCatalogShowcaseExport(evt) {
       filtersSummary,
       payload.primary_source === "local" ? "Sorgente foto: archivio locale" : "Sorgente foto: sito BARCA",
       `Formato: ${String(payload.export_mode || "both").toUpperCase()}`,
+      `Layout JPG: ${String(payload.jpg_layout || "minimal") === "detailed" ? "detailed" : "minimal"}`,
     ],
     indeterminate: false,
     progress: 0,
@@ -2764,12 +3149,19 @@ async function loadDashboardRuns() {
 }
 
 async function refreshDashboard() {
+  if (state.dashboardRefreshing) {
+    return;
+  }
+  state.dashboardRefreshing = true;
   try {
     if (state.dashboardRuns.length === 0) {
       await loadDashboardRuns();
     }
     const runId = state.dashboardRunId || "";
     const qs = runId ? `?run_id=${encodeURIComponent(runId)}&table_limit=200` : "?table_limit=200";
+    if (!state.dashboardData) {
+      setDashboardWarn("Caricamento dashboard in corso...");
+    }
     const out = await api(`/api/dashboard${qs}`);
 
     if (!out.connected) {
@@ -2792,6 +3184,7 @@ async function refreshDashboard() {
       renderBarChart(el.chartNextCurrentDeltaCategory, [], { unit: "pairs" });
       renderBarChart(el.chartNextCurrentPriceBand, [], { unit: "pairs" });
       renderAllDashboardTables();
+      renderTransferArticleEmpty("Dashboard non disponibile per il dettaglio articolo.");
       if (el.dashboardSubtitle) {
         el.dashboardSubtitle.textContent = "Connessione DB non disponibile.";
       }
@@ -2818,6 +3211,7 @@ async function refreshDashboard() {
       renderBarChart(el.chartNextCurrentDeltaCategory, [], { unit: "pairs" });
       renderBarChart(el.chartNextCurrentPriceBand, [], { unit: "pairs" });
       renderAllDashboardTables();
+      renderTransferArticleEmpty("Nessun aggiornamento caricabile per il dettaglio articolo.");
       if (el.dashboardSubtitle) {
         el.dashboardSubtitle.textContent = "Nessun aggiornamento caricabile per dashboard.";
       }
@@ -2858,8 +3252,12 @@ async function refreshDashboard() {
     renderBarChart(el.chartNextCurrentDeltaCategory, out.charts?.next_current_delta_positive_by_category || [], { unit: "pairs", digits: 2 });
     renderBarChart(el.chartNextCurrentPriceBand, out.charts?.next_current_by_price_band || [], { unit: "pairs", digits: 2 });
     renderAllDashboardTables();
+    await ensureTransferArticleSelection();
   } catch (err) {
     setDashboardWarn(`Errore dashboard: ${err.message}`);
+    renderTransferArticleEmpty(`Errore dettaglio articolo: ${err.message}`);
+  } finally {
+    state.dashboardRefreshing = false;
   }
 }
 
@@ -2983,7 +3381,7 @@ async function refreshAll(includeDashboard = false) {
   await refreshSelectedRunDetails();
   if (includeDashboard) {
     await loadDashboardRuns();
-    await refreshDashboard();
+    refreshDashboard();
   }
 }
 
@@ -3071,6 +3469,9 @@ function initEvents() {
   el.catalogShowcaseCategoriaSearch?.addEventListener("input", () =>
     setCatalogShowcaseFilterSearch("categories", el.catalogShowcaseCategoriaSearch.value || ""),
   );
+  el.catalogShowcaseBrandSearch?.addEventListener("input", () =>
+    setCatalogShowcaseFilterSearch("brands", el.catalogShowcaseBrandSearch.value || ""),
+  );
   el.catalogShowcaseSeasonAll?.addEventListener("click", () =>
     setCatalogShowcaseFilterSelection("seasons", getCatalogShowcaseAvailableItems("seasons")),
   );
@@ -3080,10 +3481,19 @@ function initEvents() {
   el.catalogShowcaseCategoriaAll?.addEventListener("click", () =>
     setCatalogShowcaseFilterSelection("categories", getCatalogShowcaseAvailableItems("categories")),
   );
+  el.catalogShowcaseBrandAll?.addEventListener("click", () =>
+    setCatalogShowcaseFilterSelection("brands", getCatalogShowcaseAvailableItems("brands")),
+  );
   el.catalogShowcaseSeasonClear?.addEventListener("click", () => resetCatalogShowcaseFilter("seasons"));
   el.catalogShowcaseRepartoClear?.addEventListener("click", () => resetCatalogShowcaseFilter("reparti"));
   el.catalogShowcaseCategoriaClear?.addEventListener("click", () => resetCatalogShowcaseFilter("categories"));
-  [el.catalogShowcaseSeasonOptions, el.catalogShowcaseRepartoOptions, el.catalogShowcaseCategoriaOptions].forEach(
+  el.catalogShowcaseBrandClear?.addEventListener("click", () => resetCatalogShowcaseFilter("brands"));
+  [
+    el.catalogShowcaseSeasonOptions,
+    el.catalogShowcaseRepartoOptions,
+    el.catalogShowcaseCategoriaOptions,
+    el.catalogShowcaseBrandOptions,
+  ].forEach(
     (container) => {
       container?.addEventListener("click", (evt) => {
         const option = evt.target?.closest?.("[data-showcase-filter-group][data-showcase-filter-value]");
@@ -3138,25 +3548,67 @@ function initEvents() {
     state.dashboardRunId = el.dashboardRunSelect?.value || null;
     refreshDashboard();
   });
+  el.transferArticleLoadBtn?.addEventListener("click", () => {
+    loadTransferArticleDetail();
+  });
+  el.transferArticleInput?.addEventListener("keydown", (evt) => {
+    if (evt.key !== "Enter") return;
+    evt.preventDefault();
+    loadTransferArticleDetail();
+  });
+  el.transferArticleExportXlsxBtn?.addEventListener("click", async () => {
+    try {
+      await exportTransferArticleDetailXlsx();
+    } catch (err) {
+      alert(`Export Excel articolo fallito: ${err.message}`);
+    }
+  });
   el.dashboardRefreshBtn?.addEventListener("click", async () => {
     await loadDashboardRuns();
     await refreshDashboard();
   });
   el.catalogRefreshBtn?.addEventListener("click", refreshCatalog);
+  el.catalogRunFilter?.addEventListener("change", () => {
+    state.catalogFilters.run_id = el.catalogRunFilter.value || "";
+    state.catalogFilters.offset = 0;
+    refreshCatalog();
+  });
   el.catalogSearch?.addEventListener("input", () => {
     state.catalogFilters.search = el.catalogSearch.value || "";
+    state.catalogFilters.offset = 0;
     refreshCatalogArticles();
   });
   el.catalogSeasonFilter?.addEventListener("change", () => {
     state.catalogFilters.season = el.catalogSeasonFilter.value || "";
+    state.catalogFilters.offset = 0;
     refreshCatalogArticles();
   });
   el.catalogRepartoFilter?.addEventListener("change", () => {
     state.catalogFilters.reparto = el.catalogRepartoFilter.value || "";
+    state.catalogFilters.offset = 0;
     refreshCatalogArticles();
   });
   el.catalogCategoriaFilter?.addEventListener("change", () => {
     state.catalogFilters.categoria = el.catalogCategoriaFilter.value || "";
+    state.catalogFilters.offset = 0;
+    refreshCatalogArticles();
+  });
+  el.catalogRowLimit?.addEventListener("change", () => {
+    state.catalogFilters.limit = Math.max(1, Number(el.catalogRowLimit.value) || 250);
+    state.catalogFilters.offset = 0;
+    refreshCatalogArticles();
+  });
+  el.catalogPrevPageBtn?.addEventListener("click", () => {
+    const limit = Math.max(1, Number(state.catalogFilters.limit) || 250);
+    if (state.catalogFilters.offset <= 0) return;
+    state.catalogFilters.offset = Math.max(0, Number(state.catalogFilters.offset || 0) - limit);
+    refreshCatalogArticles();
+  });
+  el.catalogNextPageBtn?.addEventListener("click", () => {
+    const limit = Math.max(1, Number(state.catalogFilters.limit) || 250);
+    const nextOffset = Number(state.catalogFilters.offset || 0) + limit;
+    if (nextOffset >= state.catalogTotal) return;
+    state.catalogFilters.offset = nextOffset;
     refreshCatalogArticles();
   });
   window.addEventListener("keydown", (evt) => {

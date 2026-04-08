@@ -22,6 +22,7 @@ class CatalogArticle:
     season_label: str = ""
     description: str = ""
     color: str = ""
+    marchio: str = ""
     supplier: str = ""
     reparto: str = ""
     categoria: str = ""

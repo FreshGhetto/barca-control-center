@@ -6,10 +6,10 @@ set "PYTHON_MODE="
 set "PYTHON_EXE="
 set "PYTHON_LABEL="
 
-echo === BARCA Unified Engine ===
-echo Modalita' operativa DB-only.
-echo Il motore legge solo snapshot e ordini gia' presenti nel database PostgreSQL.
-echo I CSV in output restano solo come export/diagnostica.
+echo === BARCA DB Bootstrap ===
+echo Modalita' raw -> DB.
+echo I file CSV/Excel vengono usati solo per popolare PostgreSQL.
+echo Il motore operativo continuera' poi a lavorare solo dal DB.
 echo.
 
 call :resolve_python
@@ -20,20 +20,19 @@ if errorlevel 1 (
   exit /b 1
 )
 
-REM Install dipendenze (se gia' presenti non fa danni)
 echo Interprete Python: %PYTHON_LABEL%
 call :run_python -m pip install -r requirements.txt
 IF %ERRORLEVEL% NEQ 0 (
   echo.
-  echo ERRORE: Python/pip non disponibile. 
+  echo ERRORE: Python/pip non disponibile.
   echo Suggerimento: usa il python del tuo venv, es:
   echo   C:\PythonEnvs\_Envs\ml_env\Scripts\python -m pip install -r requirements.txt
-  echo   C:\PythonEnvs\_Envs\ml_env\Scripts\python app.py --sync-db
+  echo   C:\PythonEnvs\_Envs\ml_env\Scripts\python populate_db_from_raw.py --db-create-schema
   pause
   exit /b 1
 )
 
-call :run_python app.py --sync-db
+call :run_python populate_db_from_raw.py --db-create-schema
 pause
 exit /b %ERRORLEVEL%
 

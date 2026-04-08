@@ -14,6 +14,21 @@ from catalog_models import Article
 _INVALID_FS_CHARS_RE = re.compile(r'[<>:"/\\|?*]')
 
 
+def _article_alias_codes(article: Article) -> List[str]:
+    aliases: List[str] = []
+    seen = set()
+    for item in (article.source_files or set()):
+        text = str(item or "").strip()
+        if not text.lower().startswith("manual_code_alias:"):
+            continue
+        code = normalize_code(text.split(":", 1)[1] if ":" in text else "")
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        aliases.append(code)
+    return aliases
+
+
 def _load_font(size: int) -> ImageFont.ImageFont:
     candidates = [
         "DejaVuSans.ttf",
@@ -90,21 +105,35 @@ def _resolve_article_prices(
     lookup = price_lookup or {}
     season_code = str(article.season or article.season_code or "").strip().upper()
     article_code = str(article.code or "").strip().upper()
+    candidate_codes: List[str] = []
+    seen_codes = set()
+    for raw_code in [article_code, *_article_alias_codes(article)]:
+        code = normalize_code(raw_code)
+        if not code or code in seen_codes:
+            continue
+        seen_codes.add(code)
+        candidate_codes.append(code)
 
-    direct_info = lookup.get(_catalog_price_key(season_code, article_code), {})
-    listino_price = _as_optional_float(direct_info.get("prezzo_listino"))
-    saldo_price = _as_optional_float(direct_info.get("prezzo_saldo"))
-    if listino_price is not None and saldo_price is not None:
-        return listino_price, saldo_price
+    candidate_seasons: List[str] = []
+    seen_seasons = set()
+    for raw_season in [season_code, *_season_price_aliases(season_code), ""]:
+        season = str(raw_season or "").strip().upper()
+        if season in seen_seasons:
+            continue
+        seen_seasons.add(season)
+        candidate_seasons.append(season)
 
-    for alias_code in _season_price_aliases(season_code):
-        alias_info = lookup.get(_catalog_price_key(alias_code, article_code), {})
-        if listino_price is None:
-            listino_price = _as_optional_float(alias_info.get("prezzo_listino"))
-        if saldo_price is None:
-            saldo_price = _as_optional_float(alias_info.get("prezzo_saldo"))
-        if listino_price is not None and saldo_price is not None:
-            break
+    listino_price: Optional[float] = None
+    saldo_price: Optional[float] = None
+    for candidate_code in candidate_codes:
+        for candidate_season in candidate_seasons:
+            price_info = lookup.get(_catalog_price_key(candidate_season, candidate_code), {})
+            if listino_price is None:
+                listino_price = _as_optional_float(price_info.get("prezzo_listino"))
+            if saldo_price is None:
+                saldo_price = _as_optional_float(price_info.get("prezzo_saldo"))
+            if listino_price is not None and saldo_price is not None:
+                return listino_price, saldo_price
 
     return listino_price, saldo_price
 
@@ -138,6 +167,243 @@ def _format_sizes_inline(sizes: Mapping[int, float]) -> str:
             continue
         parts.append(f"{int(raw_size)}:{qty:.0f}")
     return " | ".join(parts) if parts else "-"
+
+
+def _text_size(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> Tuple[int, int]:
+    bbox = draw.textbbox((0, 0), str(text or ""), font=font)
+    return max(0, bbox[2] - bbox[0]), max(0, bbox[3] - bbox[1])
+
+
+def _truncate_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int) -> str:
+    cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not cleaned:
+        return ""
+    if _text_size(draw, cleaned, font)[0] <= max_width:
+        return cleaned
+    ellipsis = "..."
+    candidate = cleaned
+    while candidate:
+        candidate = candidate[:-1].rstrip()
+        probe = f"{candidate}{ellipsis}"
+        if _text_size(draw, probe, font)[0] <= max_width:
+            return probe
+    return ellipsis
+
+
+def _wrap_text(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.ImageFont,
+    max_width: int,
+    *,
+    max_lines: Optional[int] = None,
+) -> List[str]:
+    cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not cleaned:
+        return []
+
+    words = cleaned.split(" ")
+    lines: List[str] = []
+    current = ""
+
+    for word in words:
+        candidate = word if not current else f"{current} {word}"
+        if _text_size(draw, candidate, font)[0] <= max_width:
+            current = candidate
+            continue
+        if current:
+            lines.append(current)
+        if max_lines is not None and len(lines) >= max_lines:
+            lines[-1] = _truncate_text(draw, lines[-1], font, max_width)
+            return lines
+        if _text_size(draw, word, font)[0] <= max_width:
+            current = word
+            continue
+        broken = _truncate_text(draw, word, font, max_width)
+        lines.append(broken)
+        current = ""
+        if max_lines is not None and len(lines) >= max_lines:
+            return lines
+
+    if current:
+        lines.append(current)
+
+    if max_lines is not None and len(lines) > max_lines:
+        trimmed = lines[: max_lines - 1]
+        remaining = " ".join(lines[max_lines - 1 :])
+        trimmed.append(_truncate_text(draw, remaining, font, max_width))
+        return trimmed
+    return lines
+
+
+def _draw_wrapped_text(
+    draw: ImageDraw.ImageDraw,
+    *,
+    x: int,
+    y: int,
+    text: str,
+    font: ImageFont.ImageFont,
+    fill: Tuple[int, int, int],
+    max_width: int,
+    max_lines: Optional[int] = None,
+    line_gap: int = 6,
+) -> int:
+    lines = _wrap_text(draw, text, font, max_width, max_lines=max_lines)
+    if not lines:
+        return y
+    for idx, line in enumerate(lines):
+        draw.text((x, y), line, font=font, fill=fill)
+        _, line_h = _text_size(draw, line, font)
+        y += line_h + (line_gap if idx < len(lines) - 1 else 0)
+    return y
+
+
+def _fit_table_fonts(
+    draw: ImageDraw.ImageDraw,
+    *,
+    headers: Sequence[str],
+    rows: Sequence[Sequence[str]],
+    col_widths: Sequence[int],
+    header_h: int,
+    row_h: int,
+    preferred_body_size: int,
+    preferred_head_size: int,
+    min_body_size: int = 8,
+    min_head_size: int = 8,
+) -> Tuple[ImageFont.ImageFont, ImageFont.ImageFont]:
+    body_size = max(min_body_size, int(preferred_body_size))
+    head_size = max(min_head_size, int(preferred_head_size))
+
+    def _fits(head_font: ImageFont.ImageFont, body_font: ImageFont.ImageFont) -> bool:
+        for idx, header in enumerate(headers):
+            max_w = max(10, int(col_widths[idx]) - 14)
+            tw, th = _text_size(draw, str(header or ""), head_font)
+            if tw > max_w or th > max(10, header_h - 8):
+                return False
+        for row in rows:
+            for idx, cell in enumerate(row):
+                max_w = max(10, int(col_widths[idx]) - 14)
+                tw, th = _text_size(draw, str(cell or ""), body_font)
+                if tw > max_w or th > max(10, row_h - 8):
+                    return False
+        return True
+
+    while body_size >= min_body_size or head_size >= min_head_size:
+        body_font = _load_font(body_size)
+        head_font = _load_font(head_size)
+        if _fits(head_font, body_font):
+            return head_font, body_font
+        if body_size > min_body_size:
+            body_size -= 1
+        if head_size > min_head_size:
+            head_size -= 1
+
+    return _load_font(min_head_size), _load_font(min_body_size)
+
+
+def _draw_image_box(
+    canvas: Image.Image,
+    draw: ImageDraw.ImageDraw,
+    *,
+    box: Tuple[int, int, int, int],
+    img_bytes: Optional[bytes],
+    placeholder_font: ImageFont.ImageFont,
+    placeholder_fill: Tuple[int, int, int] = (90, 96, 110),
+) -> None:
+    draw.rounded_rectangle(box, radius=22, fill=(255, 255, 255), outline=(205, 214, 225), width=3)
+    x0, y0, x1, y1 = box
+    inner = (x0 + 14, y0 + 14, x1 - 14, y1 - 14)
+    if img_bytes:
+        try:
+            with Image.open(io.BytesIO(img_bytes)) as prod:
+                p = prod.convert("RGB")
+                bw = inner[2] - inner[0]
+                bh = inner[3] - inner[1]
+                scale = min(bw / p.width, bh / p.height, 1.0)
+                nw = max(1, int(p.width * scale))
+                nh = max(1, int(p.height * scale))
+                p2 = p.resize((nw, nh), Image.Resampling.LANCZOS)
+                px = inner[0] + (bw - nw) // 2
+                py = inner[1] + (bh - nh) // 2
+                canvas.paste(p2, (px, py))
+                return
+        except Exception:
+            pass
+
+    placeholder = "IMMAGINE NON DISPONIBILE"
+    pw, ph = _text_size(draw, placeholder, placeholder_font)
+    draw.text(
+        (x0 + max(24, ((x1 - x0) - pw) // 2), y0 + max(24, ((y1 - y0) - ph) // 2)),
+        placeholder,
+        font=placeholder_font,
+        fill=placeholder_fill,
+    )
+
+
+def _draw_badge(
+    draw: ImageDraw.ImageDraw,
+    *,
+    x: int,
+    y: int,
+    text: str,
+    font: ImageFont.ImageFont,
+    fill: Tuple[int, int, int] = (18, 51, 87),
+    bg: Tuple[int, int, int] = (236, 244, 251),
+    border: Tuple[int, int, int] = (214, 229, 247),
+) -> int:
+    label = str(text or "").strip()
+    if not label:
+        return x
+    tw, th = _text_size(draw, label, font)
+    pad_x = 16
+    pad_y = 10
+    box = (x, y, x + tw + (pad_x * 2), y + th + (pad_y * 2))
+    draw.rounded_rectangle(box, radius=18, fill=bg, outline=border, width=2)
+    draw.text((x + pad_x, y + pad_y - 1), label, font=font, fill=fill)
+    return box[2]
+
+
+def _draw_metric_box(
+    draw: ImageDraw.ImageDraw,
+    *,
+    box: Tuple[int, int, int, int],
+    label: str,
+    value: str,
+    label_font: ImageFont.ImageFont,
+    value_font: ImageFont.ImageFont,
+) -> None:
+    x0, y0, x1, y1 = box
+    draw.rounded_rectangle(box, radius=18, fill=(248, 250, 252), outline=(221, 227, 235), width=2)
+    draw.text((x0 + 16, y0 + 14), label, font=label_font, fill=(91, 101, 115))
+    _, label_h = _text_size(draw, label, label_font)
+    draw.text((x0 + 16, y0 + 18 + label_h), value, font=value_font, fill=(17, 24, 39))
+
+
+def _draw_meta_box(
+    draw: ImageDraw.ImageDraw,
+    *,
+    box: Tuple[int, int, int, int],
+    label: str,
+    value: str,
+    label_font: ImageFont.ImageFont,
+    value_font: ImageFont.ImageFont,
+) -> None:
+    x0, y0, x1, y1 = box
+    max_w = max(40, (x1 - x0) - 24)
+    draw.rounded_rectangle(box, radius=16, fill=(255, 255, 255), outline=(221, 227, 235), width=2)
+    draw.text((x0 + 12, y0 + 10), label, font=label_font, fill=(91, 101, 115))
+    label_h = _text_size(draw, label, label_font)[1]
+    _draw_wrapped_text(
+        draw,
+        x=x0 + 12,
+        y=y0 + 14 + label_h,
+        text=value,
+        font=value_font,
+        fill=(17, 24, 39),
+        max_width=max_w,
+        max_lines=2,
+        line_gap=4,
+    )
 
 
 def _build_article_detail_html(
@@ -191,6 +457,7 @@ def _build_article_detail_html(
     detail_rows.append(f"<span class='detail-badge'>Stagione { _esc(article.season or '-') }</span>")
     detail_rows.append(f"<span class='detail-badge'>Reparto { _esc(article.reparto or '-') }</span>")
     detail_rows.append(f"<span class='detail-badge'>Categoria { _esc(article.categoria or '-') }</span>")
+    detail_rows.append(f"<span class='detail-badge'>Marchio { _esc(article.marchio or '-') }</span>")
     detail_rows.append("</div>")
     detail_rows.append("</div>")
 
@@ -213,6 +480,7 @@ def _build_article_detail_html(
     detail_rows.append("<div class='detail-section-title'>Scheda articolo</div>")
     detail_rows.append("<div class='detail-meta-grid'>")
     for label, value in [
+        ("Marchio", article.marchio or "-"),
         ("Fornitore", article.supplier or "-"),
         ("Tipologia", article.tipologia or "-"),
         ("Prezzo listino", _format_price(listino_price)),
@@ -280,6 +548,7 @@ def _build_article_detail_html(
 def _resolve_image_bytes(
     *,
     code: str,
+    alias_codes: Optional[Sequence[str]],
     source_mode: str,
     code_to_local_image: Mapping[str, str | Path],
     fetch_remote_bytes: Optional[Callable[[str], Tuple[Optional[bytes], Optional[str]]]],
@@ -289,29 +558,51 @@ def _resolve_image_bytes(
       source_kind: "local" | "web" | ""
       detail can be populated even on success (e.g. local fallback reason).
     """
-    c = normalize_code(code)
+    candidate_codes: List[str] = []
+    seen = set()
+    for raw in [code, *(alias_codes or [])]:
+        c = normalize_code(raw)
+        if not c or c in seen:
+            continue
+        seen.add(c)
+        candidate_codes.append(c)
+    if not candidate_codes:
+        return None, "not_found", ""
 
     def _try_local() -> Tuple[Optional[bytes], Optional[str], str]:
-        p = lookup_local_image_path(c, code_to_local_image)
-        if not p:
-            return None, "local_not_found", ""
-        if not p.exists() or not p.is_file():
-            return None, "local_file_missing", ""
-        try:
-            return p.read_bytes(), None, "local"
-        except Exception as e:
-            return None, f"local_read_error:{type(e).__name__}", ""
+        last_err = "local_not_found"
+        for idx, candidate_code in enumerate(candidate_codes):
+            p = lookup_local_image_path(candidate_code, code_to_local_image)
+            if not p:
+                continue
+            if not p.exists() or not p.is_file():
+                last_err = "local_file_missing"
+                continue
+            try:
+                detail = None
+                if idx > 0:
+                    detail = f"local_alias:{candidate_code}"
+                return p.read_bytes(), detail, "local"
+            except Exception as e:
+                last_err = f"local_read_error:{type(e).__name__}"
+        return None, last_err, ""
 
     def _try_web() -> Tuple[Optional[bytes], Optional[str], str]:
         if fetch_remote_bytes is None:
             return None, "web_fetch_unavailable", ""
-        try:
-            b, err = fetch_remote_bytes(c)
-            if b:
-                return b, None, "web"
-            return None, err or "web_not_found", ""
-        except Exception as e:
-            return None, f"web_fetch_error:{type(e).__name__}", ""
+        last_err = "web_not_found"
+        for idx, candidate_code in enumerate(candidate_codes):
+            try:
+                b, err = fetch_remote_bytes(candidate_code)
+                if b:
+                    detail = None
+                    if idx > 0:
+                        detail = f"web_alias:{candidate_code}"
+                    return b, detail, "web"
+                last_err = err or "web_not_found"
+            except Exception as e:
+                last_err = f"web_fetch_error:{type(e).__name__}"
+        return None, last_err, ""
 
     if source_mode in ("local_only", "local_then_web"):
         b, err, kind = _try_local()
@@ -336,7 +627,7 @@ def _resolve_image_bytes(
     return None, "not_found", ""
 
 
-def render_showcase_jpg(
+def _render_showcase_jpg_minimal(
     article: Article,
     img_bytes: Optional[bytes],
     *,
@@ -364,23 +655,7 @@ def render_showcase_jpg(
     f_price = _load_font(38)
     f_desc = _load_font(31)
 
-    if img_bytes:
-        try:
-            with Image.open(io.BytesIO(img_bytes)) as prod:
-                p = prod.convert("RGB")
-                bw = photo_box[2] - photo_box[0]
-                bh = photo_box[3] - photo_box[1]
-                scale = min(bw / p.width, bh / p.height, 1.0)
-                nw = max(1, int(p.width * scale))
-                nh = max(1, int(p.height * scale))
-                p2 = p.resize((nw, nh), Image.Resampling.LANCZOS)
-                px = photo_box[0] + (bw - nw) // 2
-                py = photo_box[1] + (bh - nh) // 2
-                img.paste(p2, (px, py))
-        except Exception:
-            draw.text((photo_box[0] + 24, photo_box[1] + 24), "IMMAGINE NON DISPONIBILE", font=f_desc, fill=(70, 70, 70))
-    else:
-        draw.text((photo_box[0] + 24, photo_box[1] + 24), "IMMAGINE NON DISPONIBILE", font=f_desc, fill=(70, 70, 70))
+    _draw_image_box(img, draw, box=photo_box, img_bytes=img_bytes, placeholder_font=f_desc, placeholder_fill=(70, 70, 70))
 
     code = article.code or ""
     ven = float(article.ven or 0.0)
@@ -418,6 +693,367 @@ def render_showcase_jpg(
     return img
 
 
+def _render_showcase_jpg_detailed(
+    article: Article,
+    img_bytes: Optional[bytes],
+    *,
+    listino_price: Optional[float] = None,
+    saldo_price: Optional[float] = None,
+    canvas_w: int = 1300,
+    canvas_h: int = 1500,
+) -> Image.Image:
+    img = Image.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+
+    scale = min(canvas_w / 1748.0, canvas_h / 2480.0)
+    margin = max(28, int(44 * scale))
+    inner_gap = max(18, int(28 * scale))
+    panel_pad = max(18, int(24 * scale))
+    content = (margin, margin, canvas_w - margin, canvas_h - margin)
+
+    stores = [
+        sr
+        for key, sr in (article.stores or {}).items()
+        if str(key or "").strip() and str(key or "").strip().upper() != "XX"
+    ]
+    stores.sort(key=lambda sr: (str(sr.store or "").strip().upper(), str(sr.store or "").strip()))
+
+    size_keys: set[int] = set()
+    for sr in stores:
+        for size, qty in (sr.sizes or {}).items():
+            try:
+                qty_f = float(qty or 0.0)
+                size_i = int(size)
+            except Exception:
+                continue
+            if abs(qty_f) > 1e-9:
+                size_keys.add(size_i)
+    if not size_keys:
+        for size, qty in (article.size_totals or {}).items():
+            try:
+                qty_f = float(qty or 0.0)
+                size_i = int(size)
+            except Exception:
+                continue
+            if abs(qty_f) > 1e-9:
+                size_keys.add(size_i)
+    visible_sizes = sorted(size_keys)
+
+    draw.rectangle(content, outline=(25, 25, 25), width=max(2, int(3 * scale)))
+
+    content_w = content[2] - content[0]
+    content_h = content[3] - content[1]
+    if len(stores) >= 22:
+        top_ratio = 0.20
+    elif len(stores) >= 16:
+        top_ratio = 0.23
+    else:
+        top_ratio = 0.27
+
+    top_h = max(int(520 * scale), int(content_h * top_ratio))
+    top_h = min(top_h, int(content_h * 0.30))
+    photo_w = max(int(content_w * 0.32), int(420 * scale))
+    photo_box = (content[0], content[1], content[0] + photo_w, content[1] + top_h)
+    info_box = (photo_box[2] + inner_gap, content[1], content[2], content[1] + top_h)
+    table_box = (content[0], info_box[3] + inner_gap, content[2], content[3])
+
+    draw.rectangle(photo_box, outline=(60, 60, 60), width=max(1, int(2 * scale)))
+    draw.rectangle(info_box, outline=(60, 60, 60), width=max(1, int(2 * scale)))
+    draw.rectangle(table_box, outline=(60, 60, 60), width=max(1, int(2 * scale)))
+
+    f_code = _load_font(max(34, int(70 * scale)))
+    f_desc = _load_font(max(18, int(31 * scale)))
+    f_context = _load_font(max(16, int(22 * scale)))
+    f_metric_label = _load_font(max(14, int(18 * scale)))
+    f_metric_value = _load_font(max(22, int(34 * scale)))
+    f_meta_label = _load_font(max(13, int(16 * scale)))
+    f_meta_value = _load_font(max(16, int(23 * scale)))
+    f_section = _load_font(max(18, int(26 * scale)))
+    f_placeholder = _load_font(max(15, int(22 * scale)))
+
+    _draw_image_box(
+        img,
+        draw,
+        box=(photo_box[0] + 8, photo_box[1] + 8, photo_box[2] - 8, photo_box[3] - 8),
+        img_bytes=img_bytes,
+        placeholder_font=f_placeholder,
+        placeholder_fill=(90, 90, 90),
+    )
+
+    def _draw_plain_box(box: Tuple[int, int, int, int], label: str, value: str, *, value_max_lines: int = 2) -> None:
+        x0, y0, x1, y1 = box
+        draw.rectangle(box, outline=(145, 145, 145), width=1, fill=(255, 255, 255))
+        draw.text((x0 + 10, y0 + 8), label, font=f_meta_label, fill=(90, 90, 90))
+        label_h = _text_size(draw, label, f_meta_label)[1]
+        _draw_wrapped_text(
+            draw,
+            x=x0 + 10,
+            y=y0 + 12 + label_h,
+            text=value,
+            font=f_meta_value,
+            fill=(18, 18, 18),
+            max_width=max(40, (x1 - x0) - 20),
+            max_lines=value_max_lines,
+            line_gap=2,
+        )
+
+    def _draw_cell_text(
+        box: Tuple[int, int, int, int],
+        text: str,
+        font: ImageFont.ImageFont,
+        *,
+        align: str = "center",
+        fill: Tuple[int, int, int] = (20, 20, 20),
+        pad: int = 8,
+    ) -> None:
+        value = str(text or "")
+        x0, y0, x1, y1 = box
+        tw, th = _text_size(draw, value, font)
+        if align == "left":
+            tx = x0 + pad
+        elif align == "right":
+            tx = x1 - tw - pad
+        else:
+            tx = x0 + max(0, ((x1 - x0) - tw) // 2)
+        ty = y0 + max(3, ((y1 - y0) - th) // 2 - 1)
+        draw.text((tx, ty), value, font=font, fill=fill)
+
+    info_x = info_box[0] + panel_pad
+    info_y = info_box[1] + panel_pad
+    info_w = info_box[2] - info_box[0] - (panel_pad * 2)
+
+    code_text = article.code or "-"
+    description = " • ".join([x for x in [article.description, article.color] if x]) or "-"
+    context_text = " | ".join(
+        [
+            f"Stagione {article.season or '-'}",
+            f"Reparto {article.reparto or '-'}",
+            f"Categoria {article.categoria or '-'}",
+        ]
+    )
+
+    draw.text((info_x, info_y), code_text, font=f_code, fill=(10, 10, 10))
+    info_y += _text_size(draw, code_text, f_code)[1] + max(8, int(10 * scale))
+    info_y = _draw_wrapped_text(
+        draw,
+        x=info_x,
+        y=info_y,
+        text=description,
+        font=f_desc,
+        fill=(55, 55, 55),
+        max_width=info_w,
+        max_lines=2,
+        line_gap=4,
+    )
+    info_y += max(8, int(10 * scale))
+    info_y = _draw_wrapped_text(
+        draw,
+        x=info_x,
+        y=info_y,
+        text=context_text,
+        font=f_context,
+        fill=(70, 70, 70),
+        max_width=info_w,
+        max_lines=2,
+        line_gap=3,
+    )
+    info_y += max(14, int(18 * scale))
+
+    meta_gap = max(10, int(12 * scale))
+    meta_box_h = max(74, int(86 * scale))
+    meta_col_w = int((info_w - meta_gap) / 2)
+    price_text = f"Listino {_format_price(listino_price)} | Saldo {_format_price(saldo_price)}"
+    meta_items = [
+        ("Marchio", article.marchio or "-"),
+        ("Fornitore", article.supplier or "-"),
+        ("Tipologia", article.tipologia or "-"),
+        ("Prezzi", price_text),
+    ]
+    for idx, (label, value) in enumerate(meta_items):
+        row = idx // 2
+        col = idx % 2
+        x0 = info_x + col * (meta_col_w + meta_gap)
+        y0 = info_y + row * (meta_box_h + meta_gap)
+        _draw_plain_box((x0, y0, x0 + meta_col_w, y0 + meta_box_h), label, value)
+
+    sizes_y = info_y + (2 * (meta_box_h + meta_gap))
+    _draw_plain_box(
+        (info_x, sizes_y, info_x + info_w, sizes_y + meta_box_h),
+        "Taglie totali",
+        _format_sizes_inline(article.size_totals or {}),
+        value_max_lines=2,
+    )
+
+    metrics = [
+        ("GIAC", _format_qty(article.giac)),
+        ("CON", _format_qty(article.con)),
+        ("VEN", _format_qty(article.ven)),
+        ("% VEN", _format_pct(article.perc_ven)),
+        ("NEGOZI", str(len(stores))),
+    ]
+    metric_gap = meta_gap
+    metric_w = max(90, int((info_w - (metric_gap * (len(metrics) - 1))) / len(metrics)))
+    metrics_y = min(
+        info_box[3] - panel_pad - max(78, int(90 * scale)),
+        sizes_y + meta_box_h + max(14, int(18 * scale)),
+    )
+    metric_h = max(78, int(90 * scale))
+    for idx, (label, value) in enumerate(metrics):
+        x0 = info_x + idx * (metric_w + metric_gap)
+        x1 = info_box[2] - panel_pad if idx == len(metrics) - 1 else x0 + metric_w
+        draw.rectangle((x0, metrics_y, x1, metrics_y + metric_h), outline=(145, 145, 145), width=1, fill=(252, 252, 252))
+        draw.text((x0 + 10, metrics_y + 10), label, font=f_metric_label, fill=(90, 90, 90))
+        label_h = _text_size(draw, label, f_metric_label)[1]
+        draw.text((x0 + 10, metrics_y + 15 + label_h), value, font=f_metric_value, fill=(10, 10, 10))
+
+    table_pad = max(16, int(22 * scale))
+    table_x0 = table_box[0] + table_pad
+    table_x1 = table_box[2] - table_pad
+    table_y0 = table_box[1] + table_pad
+    draw.text((table_x0, table_y0), "Situazione completa per negozio", font=f_section, fill=(10, 10, 10))
+    table_y0 += _text_size(draw, "Situazione completa per negozio", f_section)[1] + max(10, int(14 * scale))
+
+    if not stores:
+        draw.text(
+            (table_x0, table_y0 + 8),
+            "Nessun dettaglio negozio disponibile per questo articolo.",
+            font=f_desc,
+            fill=(90, 90, 90),
+        )
+        return img
+
+    headers = ["NEG", "GIAC", "CON", "VEN", "%VEN"] + [str(size) for size in visible_sizes]
+    size_weight = 0.74 if len(visible_sizes) <= 8 else 0.64
+    col_weights = [1.75, 0.95, 0.95, 0.95, 1.05] + ([size_weight] * len(visible_sizes))
+    total_weight = sum(col_weights)
+    table_w = table_x1 - table_x0
+    col_widths: List[int] = []
+    consumed = 0
+    for idx, weight in enumerate(col_weights):
+        if idx == len(col_weights) - 1:
+            width = table_w - consumed
+        else:
+            width = max(44, int((table_w * weight) / total_weight))
+            consumed += width
+        col_widths.append(width)
+
+    row_count = len(stores) + 1
+    body_available = max(240, table_box[3] - table_pad - table_y0 - 4)
+    row_h = max(24, int(body_available / max(2, row_count + 1)))
+    row_h = min(row_h, max(88, int(96 * scale)))
+    header_h = max(34, min(max(40, int(46 * scale)), row_h))
+    body_available = max(240, table_box[3] - table_pad - table_y0 - header_h - 4)
+    row_h = max(24, int(body_available / max(1, row_count)))
+    body_font_size = max(12, min(24, int(row_h * 0.46)))
+    head_font_size = max(11, body_font_size - 1)
+    if len(headers) >= 12:
+        body_font_size = max(11, body_font_size - 1)
+        head_font_size = max(10, head_font_size - 1)
+    if len(headers) >= 15:
+        body_font_size = max(10, body_font_size - 1)
+        head_font_size = max(9, head_font_size - 1)
+
+    rows_to_draw: List[List[str]] = []
+    for sr in stores:
+        sr_pct = float(sr.perc_ven or 0.0)
+        if abs(sr_pct) < 1e-9 and float(sr.con or 0.0) > 0:
+            sr_pct = (float(sr.ven or 0.0) / float(sr.con or 0.0)) * 100.0
+        row = [
+            str(sr.store or ""),
+            _format_qty(sr.giac),
+            _format_qty(sr.con),
+            _format_qty(sr.ven),
+            _format_pct(sr_pct),
+        ]
+        row.extend(_format_qty((sr.sizes or {}).get(size, 0.0), blank_zero=True) for size in visible_sizes)
+        rows_to_draw.append(row)
+
+    total_row = [
+        "TOT",
+        _format_qty(article.giac),
+        _format_qty(article.con),
+        _format_qty(article.ven),
+        _format_pct(article.perc_ven),
+    ]
+    total_row.extend(_format_qty((article.size_totals or {}).get(size, 0.0), blank_zero=True) for size in visible_sizes)
+    rows_to_draw.append(total_row)
+
+    f_table_head, f_table_body = _fit_table_fonts(
+        draw,
+        headers=headers,
+        rows=rows_to_draw,
+        col_widths=col_widths,
+        header_h=header_h,
+        row_h=row_h,
+        preferred_body_size=body_font_size,
+        preferred_head_size=head_font_size,
+        min_body_size=8,
+        min_head_size=8,
+    )
+
+    header_bg = (235, 235, 235)
+    alt_bg = (247, 247, 247)
+    total_bg = (226, 226, 226)
+    border = (185, 185, 185)
+    table_y = table_y0
+    x_cursor = table_x0
+    for idx, header in enumerate(headers):
+        x_next = x_cursor + col_widths[idx]
+        draw.rectangle((x_cursor, table_y, x_next, table_y + header_h), fill=header_bg, outline=border, width=1)
+        _draw_cell_text((x_cursor, table_y, x_next, table_y + header_h), header, f_table_head, align="left" if idx == 0 else "center")
+        x_cursor = x_next
+    table_y += header_h
+
+    for row_idx, row in enumerate(rows_to_draw):
+        bg = total_bg if row_idx == len(rows_to_draw) - 1 else (alt_bg if row_idx % 2 else (255, 255, 255))
+        x_cursor = table_x0
+        for col_idx, cell in enumerate(row):
+            x_next = x_cursor + col_widths[col_idx]
+            draw.rectangle((x_cursor, table_y, x_next, table_y + row_h), fill=bg, outline=border, width=1)
+            text = str(cell or "")
+            if col_idx == 0:
+                text = _truncate_text(draw, text, f_table_body, max(30, col_widths[col_idx] - 14))
+                _draw_cell_text((x_cursor, table_y, x_next, table_y + row_h), text, f_table_body, align="left")
+            else:
+                _draw_cell_text((x_cursor, table_y, x_next, table_y + row_h), text, f_table_body, align="center")
+            x_cursor = x_next
+        table_y += row_h
+
+    return img
+
+
+def render_showcase_jpg(
+    article: Article,
+    img_bytes: Optional[bytes],
+    *,
+    listino_price: Optional[float] = None,
+    saldo_price: Optional[float] = None,
+    canvas_w: int = 1300,
+    canvas_h: int = 1500,
+    layout: str = "minimal",
+) -> Image.Image:
+    layout_key = str(layout or "minimal").strip().lower()
+    if layout_key == "detailed":
+        if canvas_w == 1300 and canvas_h == 1500:
+            canvas_w, canvas_h = 1748, 2480
+        return _render_showcase_jpg_detailed(
+            article,
+            img_bytes,
+            listino_price=listino_price,
+            saldo_price=saldo_price,
+            canvas_w=canvas_w,
+            canvas_h=canvas_h,
+        )
+    return _render_showcase_jpg_minimal(
+        article,
+        img_bytes,
+        listino_price=listino_price,
+        saldo_price=saldo_price,
+        canvas_w=canvas_w,
+        canvas_h=canvas_h,
+    )
+
+
 def _build_catalog_html(
     *,
     title: str,
@@ -436,6 +1072,7 @@ def _build_catalog_html(
     categories = sorted({(it.get("categoria", "") or "CATEGORIA_SCONOSCIUTA") for it in rows})
     reparti = sorted({(it.get("reparto", "") or "REPARTO_SCONOSCIUTO") for it in rows})
     suppliers = sorted({(it.get("supplier", "") or "FORNITORE_SCONOSCIUTO") for it in rows})
+    brands = sorted({(it.get("marchio", "") or "MARCHIO_SCONOSCIUTO") for it in rows})
     sources = sorted({(it.get("source", "") or "none") for it in rows})
 
     def _esc(v: str) -> str:
@@ -455,7 +1092,7 @@ def _build_catalog_html(
         "body{font-family:Segoe UI,Arial,sans-serif;margin:0;background:var(--bg);color:var(--text);}"
         ".wrap{max-width:1700px;margin:0 auto;padding:18px 18px 28px 18px;}"
         "h1{margin:0 0 10px 0;font-size:30px;line-height:1.2;}"
-        ".toolbar{display:grid;grid-template-columns:2fr repeat(5,minmax(130px,1fr)) minmax(220px,1.3fr);gap:10px;padding:12px;border:1px solid var(--line);border-radius:12px;background:#fff;position:sticky;top:0;z-index:20;}"
+        ".toolbar{display:grid;grid-template-columns:2fr repeat(6,minmax(130px,1fr)) minmax(220px,1.3fr);gap:10px;padding:12px;border:1px solid var(--line);border-radius:12px;background:#fff;position:sticky;top:0;z-index:20;}"
         ".ctrl label{display:block;font-size:12px;font-weight:700;color:var(--muted);margin-bottom:4px;}"
         ".ctrl input,.ctrl select{width:100%;padding:8px 10px;border:1px solid #cfd6df;border-radius:8px;background:#fff;color:#0f172a;}"
         ".toolbar-bottom{display:flex;align-items:center;gap:10px;justify-content:space-between;margin-top:10px;font-size:13px;color:var(--muted);}"
@@ -554,6 +1191,9 @@ def _build_catalog_html(
     out.append("<div class='ctrl'><label for='f-supplier'>Fornitore</label><select id='f-supplier'><option value=''>Tutti</option>")
     out.extend([f"<option value='{_esc(x)}'>{_esc(x)}</option>" for x in suppliers])
     out.append("</select></div>")
+    out.append("<div class='ctrl'><label for='f-brand'>Marchio</label><select id='f-brand'><option value=''>Tutti</option>")
+    out.extend([f"<option value='{_esc(x)}'>{_esc(x)}</option>" for x in brands])
+    out.append("</select></div>")
     out.append("<div class='ctrl'><label for='f-src'>Fonte immagine</label><select id='f-src'><option value=''>Tutte</option>")
     out.extend([f"<option value='{_esc(x)}'>{_esc(x)}</option>" for x in sources])
     out.append("</select></div>")
@@ -601,6 +1241,7 @@ def _build_catalog_html(
         categoria = it.get("categoria", "") or "CATEGORIA_SCONOSCIUTA"
         reparto = it.get("reparto", "") or "REPARTO_SCONOSCIUTO"
         supplier = it.get("supplier", "") or "FORNITORE_SCONOSCIUTO"
+        marchio = it.get("marchio", "") or "MARCHIO_SCONOSCIUTO"
         source = it.get("source", "") or "none"
         source_detail = it.get("source_detail", "")
         img_rel = it.get("img_rel", "")
@@ -610,7 +1251,7 @@ def _build_catalog_html(
         ord_n = float(it.get("ord", "0") or 0.0)
         giac_n = float(it.get("giac", "0") or 0.0)
         searchable = " ".join(
-            [str(code), str(desc), str(season), str(categoria), str(reparto), str(supplier), str(source), str(prezzo_listino), str(prezzo_saldo)]
+            [str(code), str(desc), str(season), str(categoria), str(reparto), str(supplier), str(marchio), str(source), str(prezzo_listino), str(prezzo_saldo)]
         ).lower()
 
         if img_rel:
@@ -627,6 +1268,7 @@ def _build_catalog_html(
             f"data-category='{_esc(categoria)}' "
             f"data-reparto='{_esc(reparto)}' "
             f"data-supplier='{_esc(supplier)}' "
+            f"data-brand='{_esc(marchio)}' "
             f"data-source='{_esc(source)}' "
             f"data-source-detail='{_esc(source_detail)}' "
             f"data-ven='{ven_n:.6f}' "
@@ -663,10 +1305,11 @@ def _build_catalog_html(
             f"<span class='tag'>{_esc(season)}</span>"
             f"<span class='tag'>{_esc(reparto)}</span>"
             f"<span class='tag'>{_esc(categoria)}</span>"
+            f"<span class='tag'>{_esc(marchio)}</span>"
             f"<span class='tag'>SRC: {_esc(source)}</span>"
             "</div>"
         )
-        out.append(f"<div class='desc'>Fornitore: {_esc(supplier)}</div>")
+        out.append(f"<div class='desc'>Marchio: {_esc(marchio)} | Fornitore: {_esc(supplier)}</div>")
         out.append(f"<div class='desc'>{_esc(desc)}</div>")
         if detail_html:
             out.append("<div class='meta-actions'><button class='detail-btn' type='button'>PIU INFO</button></div>")
@@ -778,14 +1421,15 @@ def _build_catalog_html(
     if(ccode&&!cardsByCode[ccode]){cardsByCode[ccode]=cards[cidx];}
   }
 
-  var controls={
-    search:q("f-search"),
-    season:q("f-season"),
-    cat:q("f-cat"),
-    rep:q("f-rep"),
-    supplier:q("f-supplier"),
-    src:q("f-src"),
-    sort:q("f-sort"),
+    var controls={
+      search:q("f-search"),
+      season:q("f-season"),
+      cat:q("f-cat"),
+      rep:q("f-rep"),
+      supplier:q("f-supplier"),
+      brand:q("f-brand"),
+      src:q("f-src"),
+      sort:q("f-sort"),
     withImg:q("f-with-img"),
     reset:q("f-reset"),
     count:q("result-count"),
@@ -800,7 +1444,7 @@ def _build_catalog_html(
     mainPage:q("catalog-page"),
     flagPage:q("flag-page")
   };
-  if(!controls.search||!controls.season||!controls.cat||!controls.rep||!controls.supplier||!controls.src||!controls.sort||!controls.withImg||!controls.reset||!controls.count){
+  if(!controls.search||!controls.season||!controls.cat||!controls.rep||!controls.supplier||!controls.brand||!controls.src||!controls.sort||!controls.withImg||!controls.reset||!controls.count){
     return;
   }
 
@@ -932,6 +1576,7 @@ def _build_catalog_html(
         season:card.getAttribute("data-season")||"",
         reparto:card.getAttribute("data-reparto")||"",
         supplier:card.getAttribute("data-supplier")||"",
+        marchio:card.getAttribute("data-brand")||"",
         categoria:card.getAttribute("data-category")||"",
         source:card.getAttribute("data-source")||"",
         description:card.getAttribute("data-description")||"",
@@ -950,12 +1595,14 @@ def _build_catalog_html(
     var reparto=slugPart(controls.rep&&controls.rep.value,24);
     var categoria=slugPart(controls.cat&&controls.cat.value,24);
     var supplier=slugPart(controls.supplier&&controls.supplier.value,24);
+    var brand=slugPart(controls.brand&&controls.brand.value,24);
     var source=slugPart(controls.src&&controls.src.value,20);
     var search=slugPart(controls.search&&controls.search.value,20);
     if(season){filters.push(season);}
     if(reparto){filters.push(reparto);}
     if(categoria){filters.push(categoria);}
     if(supplier){filters.push(supplier);}
+    if(brand){filters.push("marchio-"+brand);}
     if(source){filters.push("src-"+source);}
     if(search){filters.push("ricerca-"+search);}
     if(controls.withImg&&controls.withImg.checked){filters.push("con-immagine");}
@@ -972,10 +1619,10 @@ def _build_catalog_html(
 
     var headers=[
       "Codice","VEN","ORD","GIAC","Listino","Saldo","Stagione","Reparto","Fornitore","Categoria",
-      "Fonte","Descrizione","Dettaglio sorgente","Motivo immagine mancante","Percorso immagine"
+      "Marchio","Fonte","Descrizione","Dettaglio sorgente","Motivo immagine mancante","Percorso immagine"
     ];
     var keys=[
-      "code","ven","ord","giac","listino","saldo","season","reparto","supplier","categoria",
+      "code","ven","ord","giac","listino","saldo","season","reparto","supplier","categoria","marchio",
       "source","description","sourceDetail","missingReason","imagePath"
     ];
 
@@ -1044,6 +1691,7 @@ def _build_catalog_html(
     var fCat=norm(controls.cat.value);
     var fRep=norm(controls.rep.value);
     var fSupplier=norm(controls.supplier.value);
+    var fBrand=norm(controls.brand.value);
     var fSrc=norm(controls.src.value);
     var onlyImg=!!controls.withImg.checked;
     var visible=[];
@@ -1055,9 +1703,10 @@ def _build_catalog_html(
       var okCat=!fCat||norm(c.getAttribute("data-category"))===fCat;
       var okRep=!fRep||norm(c.getAttribute("data-reparto"))===fRep;
       var okSupplier=!fSupplier||norm(c.getAttribute("data-supplier"))===fSupplier;
+      var okBrand=!fBrand||norm(c.getAttribute("data-brand"))===fBrand;
       var okSrc=!fSrc||norm(c.getAttribute("data-source"))===fSrc;
       var okImg=!onlyImg||c.getAttribute("data-has-image")==="1";
-      var show=okSearch&&okSeason&&okCat&&okRep&&okSupplier&&okSrc&&okImg;
+      var show=okSearch&&okSeason&&okCat&&okRep&&okSupplier&&okBrand&&okSrc&&okImg;
       c.style.display=show?"":"none";
       if(show){visible.push(c);}
     }
@@ -1077,6 +1726,7 @@ def _build_catalog_html(
   bindInput(controls.cat);
   bindInput(controls.rep);
   bindInput(controls.supplier);
+  bindInput(controls.brand);
   bindInput(controls.src);
   bindInput(controls.sort);
   bindInput(controls.withImg);
@@ -1087,6 +1737,7 @@ def _build_catalog_html(
     controls.cat.value="";
     controls.rep.value="";
     controls.supplier.value="";
+    controls.brand.value="";
     controls.src.value="";
     controls.sort.value="season_cat_code";
     controls.withImg.checked=true;
@@ -1225,6 +1876,7 @@ def export_showcase_catalog(
     fetch_remote_bytes: Optional[Callable[[str], Tuple[Optional[bytes], Optional[str]]]],
     title: str,
     price_lookup: Optional[Mapping[str, Mapping[str, Optional[float]]]] = None,
+    jpg_layout: str = "minimal",
     progress_cb: Optional[Callable[[Dict[str, object]], None]] = None,
     status_cb: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, object]:
@@ -1293,6 +1945,7 @@ def export_showcase_catalog(
 
         img_bytes, err, src_kind = _resolve_image_bytes(
             code=art.code,
+            alias_codes=_article_alias_codes(art),
             source_mode=source_mode,
             code_to_local_image=code_to_local_image,
             fetch_remote_bytes=fetch_remote_bytes,
@@ -1319,6 +1972,7 @@ def export_showcase_catalog(
                     img_bytes,
                     listino_price=listino_price,
                     saldo_price=saldo_price,
+                    layout=jpg_layout,
                 )
                 card.save(out_path, "JPEG", quality=95, subsampling=0, optimize=True)
                 exported_jpg += 1
@@ -1342,6 +1996,7 @@ def export_showcase_catalog(
                     "season_norm": str(art.season or "").strip(),
                     "reparto": str(art.reparto or "").strip(),
                     "supplier": str(art.supplier or "").strip(),
+                    "marchio": str(art.marchio or "").strip(),
                     "categoria": str(art.categoria or "").strip(),
                     "ven": f"{float(art.ven or 0.0):.0f}",
                     "ord": f"{float(art.con or 0.0):.0f}",  # ORD mapped to CON

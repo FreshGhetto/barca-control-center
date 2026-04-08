@@ -5,9 +5,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 import pandas as pd
 import numpy as np
+from analysis import build_article_shop_transfer_signals, validate_stock_snapshot_integrity
 from hybrid_demand import compute_hybrid_demand
+from reparto_sizes import SUPPORTED_SIZES, normalize_reparto, required_core_sizes
 
-SIZES = [35, 36, 37, 38, 39, 40, 41, 42]
+SIZES = list(SUPPORTED_SIZES)
 EXCLUDE_SHOPS = {"MR", "MP", "SP", "SPW"}
 WAREHOUSE = "M4"
 ONLINE = "WEB"
@@ -177,17 +179,22 @@ def is_outlet(fascia: Any) -> bool:
     return (not pd.isna(fascia)) and int(float(fascia)) in (6, 7)
 
 
-def required_run_sizes(fascia: Any) -> List[int]:
-    if pd.isna(fascia):
-        return [37, 38, 39]
-    f = int(float(fascia))
-    return [36, 37, 38, 39, 40] if f in (1, 2) else [37, 38, 39]
+def required_run_sizes(
+    fascia: Any,
+    *,
+    reparto: Any = None,
+    available_sizes: Optional[List[int]] = None,
+) -> List[int]:
+    return required_core_sizes(fascia, reparto=reparto, available_sizes=available_sizes)
 
 def build_lookup(articles: pd.DataFrame, sales: pd.DataFrame, shops: pd.DataFrame):
     # Normalize
     articles = articles.copy()
     sales = sales.copy()
     articles["Shop"] = _normalize_shop(articles["Shop"])
+    if "Reparto" not in articles.columns:
+        articles["Reparto"] = ""
+    articles["Reparto"] = articles["Reparto"].map(lambda value: normalize_reparto(value) or "")
     sales["Shop"] = _normalize_shop(sales["Shop"])
     shops = shops.copy()
     shops["Shop"] = _normalize_shop(shops["Shop"])
@@ -210,24 +217,60 @@ def build_lookup(articles: pd.DataFrame, sales: pd.DataFrame, shops: pd.DataFram
     sales["DemandRaw"] = 0.75 * sales["Periodo_Qty"] + 0.25 * sales["Venduto_Qty"]
     demand = {(r.Article, r.Shop): float(r.DemandRaw) for r in sales.itertuples(index=False)}
     periodo = {(r.Article, r.Shop): float(getattr(r, "Periodo_Qty", 0.0)) for r in sales.itertuples(index=False)}
+    sales_signal = {
+        (r.Article, r.Shop): float(
+            max(
+                float(getattr(r, "Periodo_Qty", 0.0) or 0.0),
+                float(getattr(r, "Venduto_Qty", 0.0) or 0.0),
+            )
+        )
+        for r in sales.itertuples(index=False)
+    }
 
     # stock per (article, shop) sizes
     stock = {}
     total = {}
+    article_reparto = {}
+    article_available_sizes: Dict[str, set[int]] = {}
     for r in articles.itertuples(index=False):
         if r.Shop in EXCLUDE_SHOPS:
             continue
+        article = str(r.Article).strip()
+        reparto = normalize_reparto(getattr(r, "Reparto", ""))
+        if reparto and article not in article_reparto:
+            article_reparto[article] = reparto
         key = (r.Article, r.Shop)
         sizes = {}
         for s in SIZES:
             qty = pd.to_numeric(getattr(r, f"Size_{s}", 0.0), errors="coerce")
             qty = 0.0 if pd.isna(qty) else float(qty)
             sizes[s] = max(0.0, qty)
+            if sizes[s] > 0.0:
+                article_available_sizes.setdefault(article, set()).add(int(s))
         stock[key] = sizes
         # Keep total aligned to transferable size buckets to avoid negative drift.
         total[key] = float(sum(sizes.values()))
 
-    return meta, demand, periodo, stock, total
+    # Preserve article/shop pairs seen in sales even when stock export has no explicit row.
+    for (article, shop), _ in demand.items():
+        if shop in EXCLUDE_SHOPS:
+            continue
+        key = (article, shop)
+        if key in stock:
+            continue
+        stock[key] = {s: 0.0 for s in SIZES}
+        total[key] = 0.0
+
+    return (
+        meta,
+        demand,
+        periodo,
+        sales_signal,
+        stock,
+        total,
+        article_reparto,
+        {article: sorted(list(sizes)) for article, sizes in article_available_sizes.items()},
+    )
 
 
 def compute_targets(meta, demand, article_shops):
@@ -248,22 +291,49 @@ def compute_targets(meta, demand, article_shops):
     return targets, presence
 
 
-def pick_outlet(meta, shops_for_article, demand, article):
-    outlets = [s for s in shops_for_article if is_outlet(meta.get(s, {}).get("Fascia", np.nan))]
-    if not outlets:
-        # fallback: any outlet in meta
-        outlets = [s for s, m in meta.items() if is_outlet(m.get("Fascia", np.nan))]
+def fascia_rank_value(fascia: Any) -> int:
+    if pd.isna(fascia):
+        return 99
+    try:
+        return int(float(fascia))
+    except Exception:
+        return 99
+
+
+def pick_outlet(meta, shops_for_article, demand, sales_signal, article):
+    outlet_set = {
+        s
+        for s in shops_for_article
+        if is_outlet(meta.get(s, {}).get("Fascia", np.nan))
+    }
+    outlet_set.update(
+        {
+            s
+            for s, m in meta.items()
+            if is_outlet(m.get("Fascia", np.nan))
+        }
+    )
+    outlets = sorted(outlet_set)
     if not outlets:
         return None
     outlets.sort(
-        key=lambda s: (demand.get((article, s), 0.0), fascia_weight(meta.get(s, {}).get("Fascia", np.nan))),
-        reverse=True,
+        key=lambda s: (
+            -fascia_rank_value(meta.get(s, {}).get("Fascia", np.nan)),
+            -int(float(sales_signal.get((article, s), 0.0)) > 0.0),
+            -float(sales_signal.get((article, s), 0.0)),
+            -float(demand.get((article, s), 0.0)),
+            s,
+        ),
     )
     return outlets[0]
 
 
-def can_make_run(meta, stock, article, shop):
-    req = required_run_sizes(meta.get(shop, {}).get("Fascia", np.nan))
+def can_make_run(meta, stock, article, shop, *, reparto=None, available_sizes=None):
+    req = required_run_sizes(
+        meta.get(shop, {}).get("Fascia", np.nan),
+        reparto=reparto,
+        available_sizes=available_sizes,
+    )
     sizes = stock.get((article, shop), {})
     return all(sizes.get(sz, 0.0) >= 1.0 for sz in req)
 
@@ -307,6 +377,127 @@ def donor_keep_min(meta, demand, article: str, shop: str) -> float:
     d = max(0.0, demand.get((article, shop), 0.0))
     safety = min(DONOR_SAFETY_MAX, float(np.ceil(d * DONOR_SAFETY_FACTOR)))
     return max(1.0, safety)
+
+
+def duplicate_pairs_for_size(stock, article: str, shop: str, size: int) -> float:
+    qty = float(stock.get((article, shop), {}).get(size, 0.0) or 0.0)
+    return max(0.0, qty - 1.0)
+
+
+def duplicate_pairs_total(stock, article: str, shop: str) -> float:
+    sizes = stock.get((article, shop), {})
+    return float(sum(max(0.0, float(qty or 0.0) - 1.0) for qty in sizes.values()))
+
+
+def prioritized_donors_for_size(
+    meta,
+    stock,
+    total,
+    demand,
+    sales_signal,
+    signal_lookup,
+    article: str,
+    recv: str,
+    size: int,
+    shops_for_article: List[str],
+):
+    if recv == ONLINE:
+        if stock.get((article, WAREHOUSE), {}).get(size, 0.0) >= 1.0:
+            return [{"shop": WAREHOUSE, "stage": "warehouse"}]
+        return []
+
+    warehouse = []
+    duplicates = []
+    singles = []
+    for donor in shops_for_article:
+        if donor in EXCLUDE_SHOPS or donor == ONLINE or donor == recv:
+            continue
+        if is_outlet(meta.get(donor, {}).get("Fascia", np.nan)):
+            continue
+        size_qty = float(stock.get((article, donor), {}).get(size, 0.0) or 0.0)
+        if size_qty < 1.0:
+            continue
+        if donor == WAREHOUSE:
+            warehouse.append({"shop": donor, "stage": "warehouse"})
+            continue
+
+        fascia_rank = fascia_rank_value(meta.get(donor, {}).get("Fascia", np.nan))
+        sig = signal_lookup.get((article, donor), {})
+        local_sales_signal = float(sig.get("NotebookVendutoSignal", sig.get("ObservedSalesSignal", sales_signal.get((article, donor), 0.0))))
+        source_priority_score = float(sig.get("SourcePriorityScore", 0.0))
+        duplicate_units = duplicate_pairs_for_size(stock, article, donor, size)
+        duplicate_total = duplicate_pairs_total(stock, article, donor)
+
+        if duplicate_units >= 1.0:
+            duplicates.append(
+                {
+                    "shop": donor,
+                    "stage": "duplicate",
+                    "duplicate_units": duplicate_units,
+                    "duplicate_total": duplicate_total,
+                    "fascia_rank": fascia_rank,
+                    "sales_signal": local_sales_signal,
+                    "source_priority_score": source_priority_score,
+                }
+            )
+            continue
+
+        singles.append(
+            {
+                "shop": donor,
+                "stage": "single",
+                "fascia_rank": fascia_rank,
+                "sales_signal": local_sales_signal,
+                "source_priority_score": source_priority_score,
+                "stock_total": float(total.get((article, donor), 0.0) or 0.0),
+            }
+        )
+
+    duplicates.sort(
+        key=lambda item: (
+            -item["fascia_rank"],
+            -item["duplicate_units"],
+            -item["duplicate_total"],
+            item["sales_signal"],
+            -item["source_priority_score"],
+            item["shop"],
+        )
+    )
+    singles.sort(
+        key=lambda item: (
+            -item["fascia_rank"],
+            item["sales_signal"],
+            -item["source_priority_score"],
+            -item["stock_total"],
+            item["shop"],
+        )
+    )
+    return warehouse + duplicates + singles
+
+
+def apply_transfer_move(
+    stock,
+    total,
+    shop_total_stock,
+    ops_out_used,
+    ops_in_used,
+    transfers,
+    article: str,
+    size: int,
+    donor: str,
+    recv: str,
+    reason: str,
+):
+    stock[(article, donor)][size] -= 1.0
+    stock.setdefault((article, recv), {}).setdefault(size, 0.0)
+    stock[(article, recv)][size] = stock[(article, recv)].get(size, 0.0) + 1.0
+    total[(article, donor)] = total.get((article, donor), 0.0) - 1.0
+    total[(article, recv)] = total.get((article, recv), 0.0) + 1.0
+    shop_total_stock[donor] = shop_total_stock.get(donor, 0.0) - 1.0
+    shop_total_stock[recv] = shop_total_stock.get(recv, 0.0) + 1.0
+    ops_out_used[donor] = ops_out_used.get(donor, 0.0) + 1.0
+    ops_in_used[recv] = ops_in_used.get(recv, 0.0) + 1.0
+    transfers.append({"Article": article, "Size": size, "Qty": 1, "From": donor, "To": recv, "Reason": reason})
 
 
 def build_ops_budgets(meta, shop_total_stock, shop_capacity_target):
@@ -473,9 +664,16 @@ def build_shipment_plan(transfers_df: pd.DataFrame, base_date: pd.Timestamp) -> 
 
     return pd.DataFrame(rows)
 
-def run_allocation(clean_sales_csv: Path, clean_articles_csv: Path, shops_xlsx: Path, output_dir: Path):
-    sales = pd.read_csv(clean_sales_csv)
-    articles = pd.read_csv(clean_articles_csv)
+def run_allocation_frames(
+    sales: pd.DataFrame,
+    articles: pd.DataFrame,
+    shops_xlsx: Path,
+    output_dir: Path,
+    *,
+    write_outputs: bool = True,
+):
+    sales = sales.copy()
+    articles = articles.copy()
     shops = load_shops_xlsx(shops_xlsx)
     run_date = pd.Timestamp.today().normalize()
     if "snapshot_at" in sales.columns:
@@ -483,7 +681,38 @@ def run_allocation(clean_sales_csv: Path, clean_articles_csv: Path, shops_xlsx: 
         if ts.notna().any():
             run_date = ts.dropna().max().normalize()
 
-    meta, demand_raw, periodo, stock, total = build_lookup(articles, sales, shops)
+    (
+        meta,
+        demand_raw,
+        periodo,
+        sales_signal,
+        stock,
+        total,
+        article_reparto,
+        article_available_sizes,
+    ) = build_lookup(articles, sales, shops)
+    signal_frame = build_article_shop_transfer_signals(articles, sales, shop_meta=meta)
+    signal_lookup = {
+        (str(r.Article), str(r.Shop)): {
+            "ObservedSalesSignal": float(getattr(r, "ObservedSalesSignal", 0.0) or 0.0),
+            "NotebookVendutoSignal": float(getattr(r, "NotebookVendutoSignal", 0.0) or 0.0),
+            "ReceiverEligibleBySales": bool(getattr(r, "ReceiverEligibleBySales", False)),
+            "StockDepth": float(getattr(r, "StockDepth", 0.0) or 0.0),
+            "ShopPriorityRank": int(getattr(r, "ShopPriorityRank", 99) or 99),
+            "MissingCoreSizes": int(getattr(r, "MissingCoreSizes", 0) or 0),
+            "CoreSizeCoverageRatio": float(getattr(r, "CoreSizeCoverageRatio", 0.0) or 0.0),
+            "LowStockActiveCandidate": bool(getattr(r, "LowStockActiveCandidate", False)),
+            "ZeroSalesSourceCandidate": bool(getattr(r, "ZeroSalesSourceCandidate", False)),
+            "NotebookDestinationCandidate": bool(getattr(r, "NotebookDestinationCandidate", False)),
+            "NotebookSourceCandidate": bool(getattr(r, "NotebookSourceCandidate", False)),
+            "DoublePairsAvailable": float(getattr(r, "DoublePairsAvailable", 0.0) or 0.0),
+            "HasDoublePairs": bool(getattr(r, "HasDoublePairs", False)),
+            "DestinationPriorityScore": float(getattr(r, "DestinationPriorityScore", 0.0) or 0.0),
+            "SourcePriorityScore": float(getattr(r, "SourcePriorityScore", 0.0) or 0.0),
+        }
+        for r in signal_frame.itertuples(index=False)
+    }
+    stock_integrity = validate_stock_snapshot_integrity(articles)
     demand, demand_diag = compute_hybrid_demand(sales, articles, meta)
     diag_lookup = {(r.Article, r.Shop): r for r in demand_diag.itertuples(index=False)}
     shop_total_stock, shop_capacity, shop_capacity_target = build_shop_capacity_state(meta, total)
@@ -503,10 +732,12 @@ def run_allocation(clean_sales_csv: Path, clean_articles_csv: Path, shops_xlsx: 
     # Step: allocate to fill needs (fascia high first), donors from low priority & low periodo.
     for article, shops_set in article_to_shops.items():
         shops_for_article = sorted(list(shops_set))
+        article_sizes = article_available_sizes.get(article) or list(SIZES)
+        article_reparto_value = article_reparto.get(article)
         article_shops = [(article, s) for s in shops_for_article]
         targets, _presence = compute_targets(meta, demand, article_shops)
 
-        # receivers: stores + online (not outlets), ordered by fascia asc then need desc
+        # receivers: notebook logic + business priority by fascia and local sales.
         receivers = []
         for s in shops_for_article:
             if s in EXCLUDE_SHOPS or s == WAREHOUSE:
@@ -516,6 +747,11 @@ def run_allocation(clean_sales_csv: Path, clean_articles_csv: Path, shops_xlsx: 
                 continue
             role = role_for_shop(s)
             if role in ("ONLINE", "STORE"):
+                sig = signal_lookup.get((article, s), {})
+                local_sales_signal = float(sig.get("NotebookVendutoSignal", sig.get("ObservedSalesSignal", sales_signal.get((article, s), 0.0))))
+                receiver_candidate = bool(sig.get("NotebookDestinationCandidate", sig.get("ReceiverEligibleBySales", local_sales_signal > 0.0)))
+                if role != "ONLINE" and not receiver_candidate:
+                    continue
                 need = max(0.0, targets[(article, s)] - total.get((article, s), 0.0))
                 if need <= 0:
                     continue
@@ -525,31 +761,45 @@ def run_allocation(clean_sales_csv: Path, clean_articles_csv: Path, shops_xlsx: 
                 if need <= 0:
                     capacity_blocks += 1
                     continue
-                receivers.append((int(float(fascia)) if not pd.isna(fascia) else 99, -need, s))
-        receivers.sort()
+                receivers.append(
+                    {
+                        "shop": s,
+                        "fascia_rank": int(float(fascia)) if not pd.isna(fascia) else 99,
+                        "sales_signal": local_sales_signal,
+                        "need": need,
+                        "low_stock_active": bool(sig.get("LowStockActiveCandidate", False)),
+                        "notebook_destination": receiver_candidate,
+                        "missing_core_sizes": int(sig.get("MissingCoreSizes", 0) or 0),
+                        "destination_priority_score": float(sig.get("DestinationPriorityScore", local_sales_signal)),
+                    }
+                )
+        receivers.sort(
+            key=lambda item: (
+                item["fascia_rank"],
+                0 if item["notebook_destination"] else 1,
+                0 if item["low_stock_active"] else 1,
+                -item["missing_core_sizes"],
+                -item["destination_priority_score"],
+                -item["sales_signal"],
+                -item["need"],
+                item["shop"],
+            )
+        )
 
-        # donors candidates (stores/outlets/warehouse), online never donates
-        donors = []
-        for s in shops_for_article:
-            if s in EXCLUDE_SHOPS or s == ONLINE:
-                continue
-            if (article, s) not in total:
-                continue
-            fascia = meta.get(s, {}).get("Fascia", np.nan)
-            # donor priority: higher fascia number first (lower priority shop), then low periodo
-            donors.append((int(float(fascia)) if not pd.isna(fascia) else 99, periodo.get((article, s), 0.0), s))
-        donors.sort(key=lambda x: (-x[0], x[1]))
-        online_donors = sorted(donors, key=lambda x: (0 if x[2] == WAREHOUSE else 1, -x[0], x[1]))
+        outlet = pick_outlet(meta, shops_for_article, demand, sales_signal, article)
 
-        outlet = pick_outlet(meta, shops_for_article, demand, article)
-
-        for _, _, recv in receivers:
+        for recv_meta in receivers:
+            recv = recv_meta["shop"]
             if free_capacity(recv, shop_total_stock, shop_capacity_target) < 1.0:
                 capacity_blocks += 1
                 continue
 
             fascia_recv = meta.get(recv, {}).get("Fascia", np.nan)
-            req_sizes = required_run_sizes(fascia_recv)
+            req_sizes = required_run_sizes(
+                fascia_recv,
+                reparto=article_reparto_value,
+                available_sizes=article_sizes,
+            )
 
             # fill required sizes first if missing
             for sz in req_sizes:
@@ -560,8 +810,20 @@ def run_allocation(clean_sales_csv: Path, clean_articles_csv: Path, shops_xlsx: 
                     continue
 
                 moved = False
-                donors_for_recv = online_donors if recv == ONLINE else donors
-                for _, _, donor in donors_for_recv:
+                donors_for_recv = prioritized_donors_for_size(
+                    meta,
+                    stock,
+                    total,
+                    demand,
+                    sales_signal,
+                    signal_lookup,
+                    article,
+                    recv,
+                    sz,
+                    shops_for_article,
+                )
+                for donor_meta in donors_for_recv:
+                    donor = donor_meta["shop"]
                     if donor == recv:
                         continue
                     if ops_budget_left(recv, ops_in_used, ops_in_budget) < 1.0:
@@ -569,21 +831,24 @@ def run_allocation(clean_sales_csv: Path, clean_articles_csv: Path, shops_xlsx: 
                         break
                     if ops_budget_left(donor, ops_out_used, ops_out_budget) < 1.0:
                         continue
-                    if donor != WAREHOUSE:
-                        keep = donor_keep_min(meta, demand, article, donor)
-                        if total[(article, donor)] <= keep:
-                            continue
+                    reason = {
+                        "warehouse": "Fill required run from M4",
+                        "duplicate": "Fill required run from duplicate stock",
+                        "single": "Fill required run from low-fascia single",
+                    }.get(donor_meta.get("stage"), "Fill required run")
                     if stock[(article, donor)].get(sz, 0.0) >= 1.0:
-                        stock[(article,donor)][sz] -= 1.0
-                        stock[(article,recv)][sz] = stock[(article,recv)].get(sz,0.0) + 1.0
-                        total[(article,donor)] -= 1.0
-                        total[(article,recv)] = total.get((article,recv),0.0) + 1.0
-                        shop_total_stock[donor] = shop_total_stock.get(donor, 0.0) - 1.0
-                        shop_total_stock[recv] = shop_total_stock.get(recv, 0.0) + 1.0
-                        ops_out_used[donor] = ops_out_used.get(donor, 0.0) + 1.0
-                        ops_in_used[recv] = ops_in_used.get(recv, 0.0) + 1.0
-                        transfers.append(
-                            {"Article": article, "Size": sz, "Qty": 1, "From": donor, "To": recv, "Reason": "Fill required run"}
+                        apply_transfer_move(
+                            stock,
+                            total,
+                            shop_total_stock,
+                            ops_out_used,
+                            ops_in_used,
+                            transfers,
+                            article,
+                            sz,
+                            donor,
+                            recv,
+                            reason,
                         )
                         moved = True
                         break
@@ -600,15 +865,27 @@ def run_allocation(clean_sales_csv: Path, clean_articles_csv: Path, shops_xlsx: 
                 continue
 
             # fill central core then rest
-            pri = req_sizes + [s for s in SIZES if s not in req_sizes]
+            pri = req_sizes + [s for s in article_sizes if s not in req_sizes]
             for sz in pri:
                 if need_left <= 0:
                     break
                 if free_capacity(recv, shop_total_stock, shop_capacity_target) < 1.0:
                     capacity_blocks += 1
                     break
-                donors_for_recv = online_donors if recv == ONLINE else donors
-                for _, _, donor in donors_for_recv:
+                donors_for_recv = prioritized_donors_for_size(
+                    meta,
+                    stock,
+                    total,
+                    demand,
+                    sales_signal,
+                    signal_lookup,
+                    article,
+                    recv,
+                    sz,
+                    shops_for_article,
+                )
+                for donor_meta in donors_for_recv:
+                    donor = donor_meta["shop"]
                     if donor == recv:
                         continue
                     if ops_budget_left(recv, ops_in_used, ops_in_budget) < 1.0:
@@ -616,26 +893,29 @@ def run_allocation(clean_sales_csv: Path, clean_articles_csv: Path, shops_xlsx: 
                         break
                     if ops_budget_left(donor, ops_out_used, ops_out_budget) < 1.0:
                         continue
-                    if donor != WAREHOUSE:
-                        keep = donor_keep_min(meta, demand, article, donor)
-                        if total[(article, donor)] <= keep:
-                            continue
+                    reason = {
+                        "warehouse": "Top-up to target from M4",
+                        "duplicate": "Top-up to target from duplicate stock",
+                        "single": "Top-up to target from low-fascia single",
+                    }.get(donor_meta.get("stage"), "Top-up to target")
                     if stock[(article, donor)].get(sz, 0.0) >= 1.0:
-                        stock[(article,donor)][sz] -= 1.0
-                        stock[(article,recv)][sz] = stock[(article,recv)].get(sz,0.0) + 1.0
-                        total[(article,donor)] -= 1.0
-                        total[(article,recv)] = total.get((article,recv),0.0) + 1.0
-                        shop_total_stock[donor] = shop_total_stock.get(donor, 0.0) - 1.0
-                        shop_total_stock[recv] = shop_total_stock.get(recv, 0.0) + 1.0
-                        ops_out_used[donor] = ops_out_used.get(donor, 0.0) + 1.0
-                        ops_in_used[recv] = ops_in_used.get(recv, 0.0) + 1.0
-                        transfers.append(
-                            {"Article": article, "Size": sz, "Qty": 1, "From": donor, "To": recv, "Reason": "Top-up to target"}
+                        apply_transfer_move(
+                            stock,
+                            total,
+                            shop_total_stock,
+                            ops_out_used,
+                            ops_in_used,
+                            transfers,
+                            article,
+                            sz,
+                            donor,
+                            recv,
+                            reason,
                         )
                         need_left -= 1
                         break
 
-        # Outlet fallback: if store cannot make run, drain extras to outlet
+        # Outlet fallback: if a line still has core size gaps, move the full remaining line to last-fascia outlet.
         if outlet:
             for s in list(shops_for_article):
                 if s in EXCLUDE_SHOPS or s in (WAREHOUSE, ONLINE):
@@ -647,46 +927,46 @@ def run_allocation(clean_sales_csv: Path, clean_articles_csv: Path, shops_xlsx: 
                     continue
                 if total[(article, s)] <= 0:
                     continue
-                if can_make_run(meta, stock, article, s):
+                if can_make_run(
+                    meta,
+                    stock,
+                    article,
+                    s,
+                    reparto=article_reparto_value,
+                    available_sizes=article_sizes,
+                ):
                     continue
 
-                keep = donor_keep_min(meta, demand, article, s)
-                req = required_run_sizes(fascia_s)
-                order = [x for x in SIZES if x not in req] + req
+                required_sizes = required_run_sizes(
+                    fascia_s,
+                    reparto=article_reparto_value,
+                    available_sizes=article_sizes,
+                )
+                order = [x for x in article_sizes if x not in required_sizes] + required_sizes
                 for sz in order:
                     while (
-                        total[(article, s)] > keep
-                        and stock[(article, s)].get(sz, 0.0) >= 1.0
+                        stock[(article, s)].get(sz, 0.0) >= 1.0
                         and free_capacity(outlet, shop_total_stock, shop_capacity_target) >= 1.0
                         and ops_budget_left(s, ops_out_used, ops_out_budget) >= 1.0
                         and ops_budget_left(outlet, ops_in_used, ops_in_budget) >= 1.0
                     ):
-                        stock[(article, s)][sz] -= 1.0
-                        stock.setdefault((article, outlet), {}).setdefault(sz, 0.0)
-                        stock[(article, outlet)][sz] = stock[(article, outlet)].get(sz, 0.0) + 1.0
-                        total[(article, s)] -= 1.0
-                        total[(article, outlet)] = total.get((article, outlet), 0.0) + 1.0
-                        shop_total_stock[s] = shop_total_stock.get(s, 0.0) - 1.0
-                        shop_total_stock[outlet] = shop_total_stock.get(outlet, 0.0) + 1.0
-                        ops_out_used[s] = ops_out_used.get(s, 0.0) + 1.0
-                        ops_in_used[outlet] = ops_in_used.get(outlet, 0.0) + 1.0
-                        transfers.append(
-                            {
-                                "Article": article,
-                                "Size": sz,
-                                "Qty": 1,
-                                "From": s,
-                                "To": outlet,
-                                "Reason": "Fallback to outlet (unfillable run)",
-                            }
+                        apply_transfer_move(
+                            stock,
+                            total,
+                            shop_total_stock,
+                            ops_out_used,
+                            ops_in_used,
+                            transfers,
+                            article,
+                            sz,
+                            s,
+                            outlet,
+                            "Move full line to outlet (size gaps)",
                         )
                     if ops_budget_left(s, ops_out_used, ops_out_budget) < 1.0 or ops_budget_left(outlet, ops_in_used, ops_in_budget) < 1.0:
                         ops_blocks += 1
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    demand_diag.to_csv(output_dir / "demand_diagnostics.csv", index=False)
     detailed_df = pd.DataFrame(transfers)
-    detailed_df.to_csv(output_dir / "suggested_transfers_detailed.csv", index=False)
 
     if detailed_df.empty:
         transfers_df = detailed_df
@@ -696,10 +976,8 @@ def run_allocation(clean_sales_csv: Path, clean_articles_csv: Path, shops_xlsx: 
             .sum()
             .sort_values(["Article", "From", "To", "Size"])
         )
-    transfers_df.to_csv(output_dir / "suggested_transfers.csv", index=False)
 
     shipment_plan = build_shipment_plan(transfers_df, run_date)
-    shipment_plan.to_csv(output_dir / "shipment_plan.csv", index=False)
     if shipment_plan.empty:
         shipment_summary = shipment_plan
     else:
@@ -711,7 +989,6 @@ def run_allocation(clean_sales_csv: Path, clean_articles_csv: Path, shops_xlsx: 
             .sum()
             .sort_values(["DispatchDate", "DispatchPolicy", "From", "To"])
         )
-    shipment_summary.to_csv(output_dir / "shipment_summary.csv", index=False)
 
     # Build features export (fast)
     rows = []
@@ -731,9 +1008,11 @@ def run_allocation(clean_sales_csv: Path, clean_articles_csv: Path, shops_xlsx: 
         demand_hybrid = float(getattr(diag, "DemandHybrid", demand.get((article, shop), 0.0))) if diag is not None else demand.get((article, shop), 0.0)
         demand_mode = str(getattr(diag, "DemandModelMode", "formula_only")) if diag is not None else "formula_only"
         demand_r2 = float(getattr(diag, "DemandModelQualityR2", 0.0)) if diag is not None else 0.0
+        sig = signal_lookup.get((article, shop), {})
         rows.append(
             {
                 "Article": article,
+                "Reparto": article_reparto.get(article, ""),
                 "Shop": shop,
                 "Fascia": fascia,
                 "IsOutlet": is_outlet(fascia),
@@ -746,6 +1025,21 @@ def run_allocation(clean_sales_csv: Path, clean_articles_csv: Path, shops_xlsx: 
                 "DemandModelMode": demand_mode,
                 "DemandModelQualityR2": demand_r2,
                 "Periodo_Qty": periodo.get((article, shop), 0.0),
+                "ObservedSalesSignal": sig.get("ObservedSalesSignal", sales_signal.get((article, shop), 0.0)),
+                "NotebookVendutoSignal": sig.get("NotebookVendutoSignal", sig.get("ObservedSalesSignal", sales_signal.get((article, shop), 0.0))),
+                "ReceiverEligibleBySales": sig.get("ReceiverEligibleBySales", sales_signal.get((article, shop), 0.0) > 0.0),
+                "StockDepth": sig.get("StockDepth", total.get((article, shop), 0.0)),
+                "ShopPriorityRank": sig.get("ShopPriorityRank", int(float(fascia)) if not pd.isna(fascia) else 99),
+                "MissingCoreSizes": sig.get("MissingCoreSizes", 0),
+                "CoreSizeCoverageRatio": sig.get("CoreSizeCoverageRatio", 0.0),
+                "LowStockActiveCandidate": sig.get("LowStockActiveCandidate", False),
+                "ZeroSalesSourceCandidate": sig.get("ZeroSalesSourceCandidate", False),
+                "NotebookDestinationCandidate": sig.get("NotebookDestinationCandidate", False),
+                "NotebookSourceCandidate": sig.get("NotebookSourceCandidate", False),
+                "DoublePairsAvailable": sig.get("DoublePairsAvailable", 0.0),
+                "HasDoublePairs": sig.get("HasDoublePairs", False),
+                "DestinationPriorityScore": sig.get("DestinationPriorityScore", 0.0),
+                "SourcePriorityScore": sig.get("SourcePriorityScore", 0.0),
                 "Stock_after": total.get((article, shop), 0.0),
                 "ShopCapacityPairs": cap,
                 "ShopCapacityTarget": cap_target,
@@ -761,9 +1055,34 @@ def run_allocation(clean_sales_csv: Path, clean_articles_csv: Path, shops_xlsx: 
             }
         )
     feat = pd.DataFrame(rows)
-    feat.to_csv(output_dir / "features_after.csv", index=False)
+    if write_outputs:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        demand_diag.to_csv(output_dir / "demand_diagnostics.csv", index=False)
+        detailed_df.to_csv(output_dir / "suggested_transfers_detailed.csv", index=False)
+        transfers_df.to_csv(output_dir / "suggested_transfers.csv", index=False)
+        shipment_plan.to_csv(output_dir / "shipment_plan.csv", index=False)
+        shipment_summary.to_csv(output_dir / "shipment_summary.csv", index=False)
+        feat.to_csv(output_dir / "features_after.csv", index=False)
+        signal_frame.to_csv(output_dir / "article_shop_signals.csv", index=False)
+        stock_integrity.to_csv(output_dir / "stock_integrity_report.csv", index=False)
 
-    return transfers_df, feat
+    return {
+        "transfers": transfers_df,
+        "transfers_detailed": detailed_df,
+        "features": feat,
+        "transfer_signals": signal_frame,
+        "stock_integrity": stock_integrity,
+        "shipment_plan": shipment_plan,
+        "shipment_summary": shipment_summary,
+        "demand_diagnostics": demand_diag,
+        "run_date": run_date,
+    }
+
+
+def run_allocation(clean_sales_csv: Path, clean_articles_csv: Path, shops_xlsx: Path, output_dir: Path):
+    sales = pd.read_csv(clean_sales_csv)
+    articles = pd.read_csv(clean_articles_csv)
+    return run_allocation_frames(sales, articles, shops_xlsx, output_dir, write_outputs=True)
 
 if __name__ == "__main__":
     root = Path(__file__).resolve().parent

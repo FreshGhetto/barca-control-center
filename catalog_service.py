@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -8,13 +9,17 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import pandas as pd
 
 from catalog_excel import ensure_xlsx, parse_situazione_articoli_excel
-from catalog_price import build_price_snapshot_from_files
+from catalog_price import build_article_metadata_from_files, build_price_snapshot_from_files
 from db_sync import get_db_dsn
 
 try:
     import psycopg
 except Exception:  # pragma: no cover
     psycopg = None
+
+
+_ARTICLE_CODE_RE = re.compile(r"^[A-Z0-9]{1,4}/[A-Z0-9]{2,}$", re.IGNORECASE)
+_ARTICLE_CODE_ANY_RE = re.compile(r"\b[A-Z0-9]{1,4}/[A-Z0-9]{2,}\b", re.IGNORECASE)
 
 
 def _require_psycopg():
@@ -83,6 +88,174 @@ def _emit_progress(progress_cb: Optional[Callable[[Dict[str, Any]], None]], **pa
         return
 
 
+def _first_non_empty_text(series: pd.Series) -> Optional[str]:
+    for value in series:
+        text = _txt(value)
+        if text:
+            return text
+    return None
+
+
+def _blank_text_to_na(series: pd.Series) -> pd.Series:
+    out = series.astype("object")
+    mask = out.fillna("").astype(str).str.strip().eq("")
+    return out.mask(mask, pd.NA)
+
+
+def _normalize_article_code(value: Any) -> str:
+    return str(value or "").strip().upper().replace(" ", "")
+
+
+def _extract_article_codes(text: Any, *, current_code: str = "") -> List[str]:
+    current = _normalize_article_code(current_code)
+    out: List[str] = []
+    seen: set[str] = set()
+    for raw in _ARTICLE_CODE_ANY_RE.findall(str(text or "")):
+        code = _normalize_article_code(raw)
+        if not code or code == current or code in seen:
+            continue
+        seen.add(code)
+        out.append(code)
+    return out
+
+
+def _resolve_catalog_alias_codes(conn, article_code: str) -> List[str]:
+    normalized = _normalize_article_code(article_code)
+    if not normalized or not _ARTICLE_CODE_RE.match(normalized):
+        return []
+
+    related: List[str] = []
+    seen = {normalized}
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT article_code, COALESCE(description, '')
+            FROM dim_article
+            WHERE article_code = %s
+               OR COALESCE(description, '') ILIKE %s
+            ORDER BY article_code
+            """,
+            (normalized, f"%{normalized}%"),
+        )
+        for raw_code, raw_description in cur.fetchall():
+            code = _normalize_article_code(raw_code)
+            if code and code not in seen:
+                seen.add(code)
+                related.append(code)
+            for candidate in _extract_article_codes(raw_description, current_code=code or normalized):
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+                related.append(candidate)
+    return related
+
+
+def _merge_catalog_article_metadata(catalog_df: pd.DataFrame, metadata_df: pd.DataFrame) -> pd.DataFrame:
+    if catalog_df is None or catalog_df.empty or metadata_df is None or metadata_df.empty:
+        return catalog_df.copy() if catalog_df is not None else pd.DataFrame()
+
+    overlay = metadata_df.rename(
+        columns={
+            "description": "meta_description",
+            "reparto": "meta_reparto",
+            "categoria": "meta_categoria",
+            "marchio": "meta_marchio",
+            "tipologia": "meta_tipologia",
+            "color": "meta_color",
+            "materiale": "meta_materiale",
+        }
+    )
+    out = catalog_df.merge(
+        overlay[
+            [
+                "season_code",
+                "article_code",
+                "meta_description",
+                "meta_reparto",
+                "meta_categoria",
+                "meta_marchio",
+                "meta_tipologia",
+                "meta_color",
+                "meta_materiale",
+            ]
+        ],
+        on=["season_code", "article_code"],
+        how="left",
+    )
+    for col in ("description", "reparto", "categoria", "marchio", "tipologia", "color"):
+        out[col] = _blank_text_to_na(out[col])
+    for src in ("meta_description", "meta_reparto", "meta_categoria", "meta_marchio", "meta_tipologia", "meta_color", "meta_materiale"):
+        out[src] = _blank_text_to_na(out[src])
+
+    out["description"] = out["description"].fillna(out["meta_description"])
+    out["reparto"] = out["reparto"].fillna(out["meta_reparto"])
+    out["categoria"] = out["categoria"].fillna(out["meta_categoria"])
+    out["marchio"] = out["marchio"].fillna(out["meta_marchio"])
+    out["tipologia"] = out["tipologia"].fillna(out["meta_tipologia"])
+    out["color"] = out["color"].fillna(out["meta_color"])
+    out["materiale"] = out["meta_materiale"]
+
+    return out.drop(
+        columns=[
+            "meta_description",
+            "meta_reparto",
+            "meta_categoria",
+            "meta_marchio",
+            "meta_tipologia",
+            "meta_color",
+            "meta_materiale",
+        ]
+    )
+
+
+def _build_article_meta(catalog_df: pd.DataFrame, metadata_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    article_cols = ["article_code", "description", "reparto", "categoria", "marchio", "tipologia", "color", "materiale"]
+
+    if catalog_df is not None and not catalog_df.empty:
+        base = catalog_df.copy()
+        if "materiale" not in base.columns:
+            base["materiale"] = None
+        frames.append(base[article_cols].copy())
+
+    if metadata_df is not None and not metadata_df.empty:
+        frames.append(metadata_df[article_cols].copy())
+
+    if frames:
+        article_meta = pd.concat(frames, ignore_index=True)
+        article_meta = article_meta[article_meta["article_code"].notna()].copy()
+        article_meta["article_code"] = article_meta["article_code"].astype(str).str.strip().str.upper().replace("", pd.NA)
+        article_meta = article_meta.dropna(subset=["article_code"])
+        article_meta = (
+            article_meta.groupby("article_code", as_index=False)
+            .agg(
+                {
+                    "description": _first_non_empty_text,
+                    "reparto": _first_non_empty_text,
+                    "categoria": _first_non_empty_text,
+                    "marchio": _first_non_empty_text,
+                    "tipologia": _first_non_empty_text,
+                    "color": _first_non_empty_text,
+                    "materiale": _first_non_empty_text,
+                }
+            )
+            .reset_index(drop=True)
+        )
+    else:
+        article_meta = pd.DataFrame(columns=article_cols)
+
+    if price_df is not None and not price_df.empty:
+        known_codes = set(article_meta["article_code"].astype(str).tolist())
+        price_only = price_df.loc[~price_df["article_code"].isin(known_codes), ["article_code"]].copy()
+        if not price_only.empty:
+            for col in ("description", "reparto", "categoria", "marchio", "tipologia", "color", "materiale"):
+                price_only[col] = None
+            article_meta = pd.concat([article_meta, price_only[article_cols]], ignore_index=True)
+
+    return article_meta.reset_index(drop=True)
+
+
 def _parse_catalog_excels(
     excel_files: Sequence[Path],
     sheet: int | str = 0,
@@ -122,6 +295,7 @@ def _parse_catalog_excels(
     df["supplier"] = df.get("fornitore", "").astype(str)
     df["reparto"] = df.get("reparto", "").astype(str)
     df["categoria"] = df.get("categoria", "").astype(str)
+    df["marchio"] = df.get("marchio", "").astype(str)
     df["tipologia"] = df.get("tipologia", "").astype(str)
     for col in ("giac", "con", "ven", "perc_ven"):
         df[col] = pd.to_numeric(df.get(col, 0.0), errors="coerce").fillna(0.0)
@@ -142,6 +316,7 @@ def _empty_catalog_df() -> pd.DataFrame:
             "supplier",
             "reparto",
             "categoria",
+            "marchio",
             "tipologia",
             "article_code",
             "description",
@@ -387,15 +562,43 @@ def import_catalog_to_db(
             progress = 50.0 + (current / max(total, 1.0)) * 16.0
             _emit_progress(progress_cb, progress=progress, **event)
 
+        def _meta_progress(event: Dict[str, Any]) -> None:
+            current = float(event.get("current") or 0)
+            total = float(event.get("total") or max(len(price_files), 1))
+            progress = 66.0 + (current / max(total, 1.0)) * 4.0
+            _emit_progress(progress_cb, progress=progress, **event)
+
         catalog_df = _parse_catalog_excels(excel_files, sheet=sheet, progress_cb=_excel_progress) if excel_files else _empty_catalog_df()
         if not excel_files:
             _emit_progress(progress_cb, stage="parsing_excel", progress=50.0, message="Nessun file Excel catalogo da elaborare")
 
         price_df, price_stats = build_price_snapshot_from_files(price_files, progress_cb=_price_progress)
+        metadata_df, metadata_stats = build_article_metadata_from_files(price_files, progress_cb=_meta_progress)
         if not price_files:
             _emit_progress(progress_cb, stage="parsing_price", progress=66.0, message="Nessun CSV prezzi da elaborare")
-        if catalog_df.empty and price_df.empty:
+            _emit_progress(progress_cb, stage="parsing_article_meta", progress=70.0, message="Nessun CSV metadati da elaborare")
+        if catalog_df.empty and price_df.empty and metadata_df.empty:
             raise RuntimeError("Import catalogo vuoto: nessuna riga utile trovata nei file caricati.")
+
+        inferred_catalog_seasons = sorted(
+            {
+                str(x).strip().upper()
+                for x in pd.concat(
+                    [
+                        price_df.get("season_code", pd.Series(dtype="object")),
+                        metadata_df.get("season_code", pd.Series(dtype="object")),
+                    ],
+                    ignore_index=True,
+                ).dropna()
+                if str(x).strip() and str(x).strip().upper() != "UNKNOWN"
+            }
+        )
+        if not catalog_df.empty and inferred_catalog_seasons:
+            season_fill = inferred_catalog_seasons[0] if len(inferred_catalog_seasons) == 1 else None
+            if season_fill:
+                unknown_mask = catalog_df["season_code"].astype(str).str.strip().str.upper().isin({"", "UNKNOWN"})
+                if bool(unknown_mask.any()):
+                    catalog_df.loc[unknown_mask, "season_code"] = season_fill
 
         _emit_progress(progress_cb, stage="preparing_rows", progress=70.0, message="Preparazione righe per il database")
         _emit_progress(progress_cb, stage="normalizing_existing_prices", progress=71.0, message="Allineamento prezzi stagioni gemelle già presenti")
@@ -411,6 +614,9 @@ def import_catalog_to_db(
                 price_df["price_listino"] = price_df["price_listino"].where(price_df["price_listino"].notna(), price_df["price_listino_prev"])
                 price_df["price_saldo"] = price_df["price_saldo"].where(price_df["price_saldo"].notna(), price_df["price_saldo_prev"])
                 price_df = price_df.drop(columns=["price_listino_prev", "price_saldo_prev"])
+        if not metadata_df.empty:
+            _emit_progress(progress_cb, stage="merging_article_meta", progress=72.0, message="Merge metadati articolo da CSV")
+            catalog_df = _merge_catalog_article_metadata(catalog_df, metadata_df)
         season_values = sorted(
             {
                 str(x)
@@ -418,6 +624,7 @@ def import_catalog_to_db(
                     [
                         catalog_df.get("season_code", pd.Series(dtype="object")),
                         price_df.get("season_code", pd.Series(dtype="object")),
+                        metadata_df.get("season_code", pd.Series(dtype="object")),
                     ],
                     ignore_index=True,
                 ).dropna()
@@ -427,27 +634,7 @@ def import_catalog_to_db(
 
         size_rows_base = _build_size_rows(catalog_df)
 
-        article_meta = (
-            catalog_df[
-                [
-                    "article_code",
-                    "description",
-                    "categoria",
-                    "tipologia",
-                    "color",
-                ]
-            ]
-            .drop_duplicates(subset=["article_code"], keep="last")
-            .reset_index(drop=True)
-        )
-        if not price_df.empty:
-            price_only = price_df.loc[~price_df["article_code"].isin(article_meta["article_code"]), ["article_code"]].copy()
-            if not price_only.empty:
-                price_only["description"] = None
-                price_only["categoria"] = None
-                price_only["tipologia"] = None
-                price_only["color"] = None
-                article_meta = pd.concat([article_meta, price_only], ignore_index=True)
+        article_meta = _build_article_meta(catalog_df, metadata_df, price_df)
 
         dim_articles = []
         for rec in article_meta.itertuples(index=False):
@@ -455,11 +642,12 @@ def import_catalog_to_db(
                 (
                     rec.article_code,
                     _txt(rec.description),
+                    _txt(rec.reparto),
                     _txt(rec.categoria),
                     _txt(rec.tipologia),
-                    None,
+                    _txt(rec.marchio),
                     _txt(rec.color),
-                    None,
+                    _txt(getattr(rec, "materiale", None)),
                 )
             )
 
@@ -513,7 +701,9 @@ def import_catalog_to_db(
         for path in price_files:
             name = path.name.lower()
             role = "price_csv"
-            if "listino" in name:
+            if "colore" in name:
+                role = "article_meta_color_csv"
+            elif "listino" in name:
                 role = "price_listino_csv"
             elif "saldo" in name:
                 role = "price_saldo_csv"
@@ -570,10 +760,11 @@ def import_catalog_to_db(
             ),
             "dim_article": _exec_many(
                 """
-                INSERT INTO dim_article (article_code, description, categoria, tipologia, marchio, colore, materiale)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO dim_article (article_code, description, reparto, categoria, tipologia, marchio, colore, materiale)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (article_code) DO UPDATE SET
                   description = COALESCE(EXCLUDED.description, dim_article.description),
+                  reparto = COALESCE(EXCLUDED.reparto, dim_article.reparto),
                   categoria = COALESCE(EXCLUDED.categoria, dim_article.categoria),
                   tipologia = COALESCE(EXCLUDED.tipologia, dim_article.tipologia),
                   marchio = COALESCE(EXCLUDED.marchio, dim_article.marchio),
@@ -663,6 +854,7 @@ def import_catalog_to_db(
             **metadata_seed,
             "catalog_seasons": season_values,
             "price_stats": price_stats,
+            "article_metadata_stats": metadata_stats,
             "status": "completed",
             "counts": counts,
             "price_normalization": {
@@ -796,7 +988,27 @@ def _catalog_facets(conn, source_run_id: Optional[str] = None) -> Dict[str, List
             tuple(params),
         )
         categorie = [str(row[0]) for row in cur.fetchall() if row and row[0]]
-    return {"seasons": seasons, "reparti": reparti, "suppliers": suppliers, "categorie": categorie}
+        cur.execute(
+            f"""
+            SELECT DISTINCT da.marchio
+            FROM {source_name} s
+            LEFT JOIN dim_article da
+              ON da.article_code = s.article_code
+            WHERE {where_sql}
+              AND da.marchio IS NOT NULL
+              AND da.marchio <> ''
+            ORDER BY da.marchio
+            """,
+            tuple(params),
+        )
+        marchi = [str(row[0]) for row in cur.fetchall() if row and row[0]]
+    return {
+        "seasons": seasons,
+        "reparti": reparti,
+        "suppliers": suppliers,
+        "categorie": categorie,
+        "marchi": marchi,
+    }
 
 
 def get_catalog_status(source_run_id: Optional[str] = None) -> Dict[str, Any]:
@@ -864,6 +1076,7 @@ def list_catalog_articles(
     season_code: str = "",
     reparto: str = "",
     categoria: str = "",
+    marchio: str = "",
     limit: int = 100,
     offset: int = 0,
     source_run_id: Optional[str] = None,
@@ -872,6 +1085,7 @@ def list_catalog_articles(
     dsn = get_db_dsn()
     with psycopg.connect(dsn) as conn:
         run_id = _pick_catalog_run_id(conn, source_run_id)
+        alias_search_codes: List[str] = []
         if source_run_id:
             source_name = "fact_catalog_article_store_snapshot"
             where_parts = ["s.run_id = %s::uuid", "s.store_code = 'XX'"]
@@ -893,8 +1107,10 @@ def list_catalog_articles(
             """
 
         if search.strip():
+            alias_search_codes = _resolve_catalog_alias_codes(conn, search.strip())
+            alias_sql = " OR s.article_code = ANY(%s)" if alias_search_codes else ""
             where_parts.append(
-                """
+                f"""
                 (
                   s.article_code ILIKE %s OR
                   COALESCE(s.description, '') ILIKE %s OR
@@ -902,12 +1118,16 @@ def list_catalog_articles(
                   COALESCE(s.supplier, '') ILIKE %s OR
                   COALESCE(s.reparto, '') ILIKE %s OR
                   COALESCE(s.categoria, '') ILIKE %s OR
-                  COALESCE(s.tipologia, '') ILIKE %s
+                  COALESCE(s.tipologia, '') ILIKE %s OR
+                  COALESCE(da.marchio, '') ILIKE %s
+                  {alias_sql}
                 )
                 """
             )
             needle = f"%{search.strip()}%"
-            params.extend([needle] * 7)
+            params.extend([needle] * 8)
+            if alias_search_codes:
+                params.append(alias_search_codes)
         if season_code.strip():
             where_parts.append("s.season_code = %s")
             params.append(season_code.strip().upper())
@@ -917,6 +1137,9 @@ def list_catalog_articles(
         if categoria.strip():
             where_parts.append("COALESCE(s.categoria, '') = %s")
             params.append(categoria.strip())
+        if marchio.strip():
+            where_parts.append("COALESCE(da.marchio, '') = %s")
+            params.append(marchio.strip())
 
         where_sql = " AND ".join(where_parts)
         with conn.cursor() as cur:
@@ -924,6 +1147,8 @@ def list_catalog_articles(
                 f"""
                 SELECT count(*)
                 FROM {source_name} s
+                LEFT JOIN dim_article da
+                  ON da.article_code = s.article_code
                 WHERE {where_sql}
                 """,
                 tuple(params),
@@ -941,6 +1166,7 @@ def list_catalog_articles(
                   COALESCE(s.reparto, '') AS reparto,
                   COALESCE(s.categoria, '') AS categoria,
                   COALESCE(s.tipologia, '') AS tipologia,
+                  COALESCE(da.marchio, '') AS marchio,
                   COALESCE(s.giac, 0) AS giac,
                   COALESCE(s.con, 0) AS con,
                   COALESCE(s.ven, 0) AS ven,
@@ -969,12 +1195,13 @@ def list_catalog_articles(
                         "reparto": str(row[5] or ""),
                         "categoria": str(row[6] or ""),
                         "tipologia": str(row[7] or ""),
-                        "giac": float(row[8] or 0),
-                        "con": float(row[9] or 0),
-                        "ven": float(row[10] or 0),
-                        "perc_ven": float(row[11] or 0),
-                        "price_listino": None if row[12] is None else float(row[12]),
-                        "price_saldo": None if row[13] is None else float(row[13]),
+                        "marchio": str(row[8] or ""),
+                        "giac": float(row[9] or 0),
+                        "con": float(row[10] or 0),
+                        "ven": float(row[11] or 0),
+                        "perc_ven": float(row[12] or 0),
+                        "price_listino": None if row[13] is None else float(row[13]),
+                        "price_saldo": None if row[14] is None else float(row[14]),
                     }
                 )
     return {"run_id": run_id, "rows": rows, "total": total, "offset": int(offset), "limit": int(limit)}
@@ -990,6 +1217,8 @@ def get_catalog_article_detail(
     dsn = get_db_dsn()
     with psycopg.connect(dsn) as conn:
         run_id = _pick_catalog_run_id(conn, source_run_id)
+        requested_code = _normalize_article_code(article_code)
+        alias_candidates = [requested_code] + _resolve_catalog_alias_codes(conn, requested_code)
         if source_run_id:
             source_name = "fact_catalog_article_store_snapshot"
             price_join = """
@@ -1021,7 +1250,7 @@ def get_catalog_article_detail(
                   AND article_code = %s
                 ORDER BY store_code, size
             """
-            params: Tuple[Any, ...] = (run_id, season_code, article_code.upper().replace(" ", ""))
+            params_prefix: Tuple[Any, ...] = (run_id, season_code)
         else:
             source_name = "vw_catalog_article_store_current"
             price_join = """
@@ -1049,36 +1278,44 @@ def get_catalog_article_detail(
                   AND article_code = %s
                 ORDER BY store_code, size
             """
-            params = (season_code, article_code.upper().replace(" ", ""))
+            params_prefix = (season_code,)
 
         with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                SELECT
-                  s.season_code,
-                  s.article_code,
-                  COALESCE(s.description, da.description, '') AS description,
-                  COALESCE(s.color, da.colore, '') AS color,
-                  COALESCE(s.supplier, '') AS supplier,
-                  COALESCE(s.reparto, '') AS reparto,
-                  COALESCE(s.categoria, '') AS categoria,
-                  COALESCE(s.tipologia, '') AS tipologia,
-                  COALESCE(s.giac, 0) AS giac,
-                  COALESCE(s.con, 0) AS con,
-                  COALESCE(s.ven, 0) AS ven,
-                  COALESCE(s.perc_ven, 0) AS perc_ven,
-                  p.price_listino AS price_listino,
-                  p.price_saldo AS price_saldo
-                FROM {source_name} s
-                LEFT JOIN dim_article da
-                  ON da.article_code = s.article_code
-                {price_join}
-                {summary_where}
-                LIMIT 1
-                """,
-                params,
-            )
-            row = cur.fetchone()
+            row = None
+            resolved_code = requested_code
+            for candidate_code in alias_candidates:
+                params = tuple(params_prefix + (candidate_code,))
+                cur.execute(
+                    f"""
+                    SELECT
+                      s.season_code,
+                      s.article_code,
+                      COALESCE(s.description, da.description, '') AS description,
+                      COALESCE(s.color, da.colore, '') AS color,
+                      COALESCE(s.supplier, '') AS supplier,
+                      COALESCE(s.reparto, '') AS reparto,
+                      COALESCE(s.categoria, '') AS categoria,
+                      COALESCE(s.tipologia, '') AS tipologia,
+                      COALESCE(da.marchio, '') AS marchio,
+                      COALESCE(s.giac, 0) AS giac,
+                      COALESCE(s.con, 0) AS con,
+                      COALESCE(s.ven, 0) AS ven,
+                      COALESCE(s.perc_ven, 0) AS perc_ven,
+                      p.price_listino AS price_listino,
+                      p.price_saldo AS price_saldo
+                    FROM {source_name} s
+                    LEFT JOIN dim_article da
+                      ON da.article_code = s.article_code
+                    {price_join}
+                    {summary_where}
+                    LIMIT 1
+                    """,
+                    params,
+                )
+                row = cur.fetchone()
+                if row:
+                    resolved_code = candidate_code
+                    break
             if not row:
                 raise ValueError(f"Articolo catalogo non trovato: {season_code} / {article_code}")
 
@@ -1091,17 +1328,21 @@ def get_catalog_article_detail(
                 "reparto": str(row[5] or ""),
                 "categoria": str(row[6] or ""),
                 "tipologia": str(row[7] or ""),
-                "giac": float(row[8] or 0),
-                "con": float(row[9] or 0),
-                "ven": float(row[10] or 0),
-                "perc_ven": float(row[11] or 0),
-                "price_listino": None if row[12] is None else float(row[12]),
-                "price_saldo": None if row[13] is None else float(row[13]),
+                "marchio": str(row[8] or ""),
+                "giac": float(row[9] or 0),
+                "con": float(row[10] or 0),
+                "ven": float(row[11] or 0),
+                "perc_ven": float(row[12] or 0),
+                "price_listino": None if row[13] is None else float(row[13]),
+                "price_saldo": None if row[14] is None else float(row[14]),
             }
+            if requested_code and requested_code != resolved_code:
+                summary["requested_article_code"] = requested_code
+                summary["resolved_article_code"] = resolved_code
 
             cur.execute(
                 stores_sql,
-                params,
+                tuple(params_prefix + (resolved_code,)),
             )
             stores = [
                 {
@@ -1118,7 +1359,7 @@ def get_catalog_article_detail(
 
             cur.execute(
                 sizes_sql,
-                params,
+                tuple(params_prefix + (resolved_code,)),
             )
             for size_row in cur.fetchall():
                 store_code = str(size_row[0] or "")

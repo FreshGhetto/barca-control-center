@@ -1,106 +1,11 @@
 import argparse
 from pathlib import Path
-import datetime as dt
-import pandas as pd
-import numpy as np
 
-from parse_data_v2 import parse_sales, parse_articles
-from allocator_v1 import run_allocation
-from orders_pipeline import run_orders_pipeline, has_order_inputs
-from ingest_agent import ingest_incoming
+from allocator_v1 import run_allocation_frames
 from db_sync import run_db_sync
-from db_inputs import export_latest_clean_inputs_from_db
+from db_inputs import load_latest_clean_inputs_from_db
 from db_orders import export_orders_outputs_from_db
-
-def newest_file(folder: Path, prefix: str) -> Path:
-    files = sorted(folder.glob(f"{prefix}_*.csv"))
-    if not files:
-        raise FileNotFoundError(f"Nessun file trovato in {folder} con pattern {prefix}_YYYY-MM.csv")
-    return files[-1]
-
-def load_valid_shop_codes(shops_cfg: Path):
-    try:
-        shops = pd.read_excel(shops_cfg, sheet_name=0)
-        cols = [str(c).strip().lower() for c in shops.columns]
-        sig_col = None
-        for c in cols:
-            if "sig" in c or "cod" in c or "shop" in c:
-                sig_col = shops.columns[cols.index(c)]
-                break
-        if sig_col is None:
-            return None
-        codes = (
-            shops[sig_col]
-            .astype(str)
-            .str.strip()
-            .str.upper()
-            .replace({"W": "WEB"})
-        )
-        codes = sorted({c for c in codes if c and c != "NAN"})
-        return codes or None
-    except Exception:
-        return None
-
-def harmonize_clean_outputs(clean_sales: Path, clean_stock: Path):
-    sales = pd.read_csv(clean_sales)
-    stock = pd.read_csv(clean_stock)
-    report_rows = []
-
-    # 1) Remove inert stock-only articles (all-zero rows, no sales counterpart).
-    sales_articles = set(sales["Article"].astype(str))
-    size_cols = [c for c in stock.columns if c.startswith("Size_")]
-    base_cols = ["Ricevuto", "Giacenza", "Consegnato", "Venduto"]
-    existing_base_cols = [c for c in base_cols if c in stock.columns]
-    signal_cols = existing_base_cols + size_cols
-    if signal_cols:
-        signal = stock[signal_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).clip(lower=0.0).sum(axis=1)
-    else:
-        signal = pd.Series(np.zeros(len(stock)), index=stock.index)
-    stock = stock.copy()
-    stock["__signal__"] = signal
-
-    stock_only_articles = sorted(set(stock["Article"].astype(str)) - sales_articles)
-    inert_articles = []
-    for art in stock_only_articles:
-        tot = float(stock.loc[stock["Article"].astype(str) == art, "__signal__"].sum())
-        if tot <= 0.0:
-            inert_articles.append(art)
-            report_rows.append({"kind": "drop_inert_stock_only_article", "article": art, "qty_signal": tot, "note": "Removed inert stock-only article (all zero)."})
-    if inert_articles:
-        stock = stock[~stock["Article"].astype(str).isin(inert_articles)].copy()
-
-    # 2) Add synthetic zero-sales rows for remaining stock-only active articles.
-    sales_articles = set(sales["Article"].astype(str))
-    remaining_stock_only = sorted(set(stock["Article"].astype(str)) - sales_articles)
-    if remaining_stock_only:
-        add = stock[stock["Article"].astype(str).isin(remaining_stock_only)][["snapshot_at", "Article", "Shop"]].drop_duplicates().copy()
-        sales_cols = list(sales.columns)
-        for c in sales_cols:
-            if c in add.columns:
-                continue
-            add[c] = 0.0
-        # Keep only target schema order.
-        add = add[sales_cols]
-        # Normalize types for numeric columns.
-        for c in sales_cols:
-            if c in ("snapshot_at", "Article", "Shop"):
-                continue
-            add[c] = pd.to_numeric(add[c], errors="coerce").fillna(0.0)
-        sales = pd.concat([sales, add], ignore_index=True)
-
-        for art in remaining_stock_only:
-            n = int((add["Article"].astype(str) == art).sum())
-            report_rows.append({"kind": "add_synthetic_zero_sales", "article": art, "qty_signal": n, "note": "Added synthetic zero-sales rows for active stock-only article."})
-
-    # Cleanup and write back.
-    stock = stock.drop(columns=["__signal__"], errors="ignore")
-    sales = sales.drop_duplicates(subset=["Article", "Shop"], keep="last")
-    stock = stock.drop_duplicates(subset=["Article", "Shop"], keep="last")
-    sales.to_csv(clean_sales, index=False)
-    stock.to_csv(clean_stock, index=False)
-
-    report = pd.DataFrame(report_rows)
-    return report
+from pipeline_common import harmonize_clean_frames
 
 
 def parse_args() -> argparse.Namespace:
@@ -179,24 +84,9 @@ def parse_args() -> argparse.Namespace:
     )
     return parser.parse_args()
 
-
-def pick_orders_root(root: Path, cli_orders_root: Path | None) -> Path | None:
-    candidates = []
-    if cli_orders_root is not None:
-        candidates.append(cli_orders_root)
-    else:
-        candidates.append(root / "input" / "orders")
-        candidates.append(Path(r"C:\Users\bacci\Downloads\Downloads\per_previsioni"))
-
-    for cand in candidates:
-        if has_order_inputs(cand):
-            return cand
-    return None
-
 def main():
     args = parse_args()
     root = Path(__file__).resolve().parent
-    inp = root / "input"
     out = root / "output"
     cfg = root / "config"
     out.mkdir(exist_ok=True)
@@ -209,104 +99,65 @@ def main():
     clean_stock = out / "clean_articles.csv"
 
     print("=== BARCA Unified Engine ===")
-    if args.source_db:
-        print("[STEP 0/3] Modalita' DB-first: lettura clean inputs dal database.")
-        try:
-            db_source = export_latest_clean_inputs_from_db(
-                clean_sales_csv=clean_sales,
-                clean_stock_csv=clean_stock,
-                source_run_id=args.source_db_run_id,
-                verbose=True,
-            )
-            print(
-                f"[STEP 0/3] DB source ok: run_id={db_source['source_run_id']}, "
-                f"sales={db_source['sales_rows']}, stock={db_source['stock_rows']}"
-            )
-        except Exception as exc:
-            print(f"[STEP 0/3] ERRORE DB source: {exc}")
-            raise SystemExit(1)
-    else:
-        if args.skip_ingest:
-            print("[STEP 0/3] Ingest raw saltato (--skip-ingest).")
-        else:
-            incoming_root = args.incoming_root or (root / "incoming")
-            print(f"[STEP 0/3] Avvio ingest raw da: {incoming_root}")
-            ingest_summary = ingest_incoming(
-                root=root,
-                incoming_dir=incoming_root,
-                move_processed=not args.keep_incoming,
-                verbose=True,
-            )
-            print(
-                f"[STEP 0/3] Ingest completato: "
-                f"ingested={ingest_summary['ingested']}, "
-                f"quarantine={ingest_summary['quarantine']}, "
-                f"errors={ingest_summary['errors']}"
-            )
+    if not args.source_db:
+        print("[MODE] Pipeline operativa DB-only: input CSV legacy disabilitati, abilito sorgente DB.")
+    if not args.skip_orders and not args.orders_source_db:
+        print("[MODE] Modulo ordini DB-only: input ordini da file disabilitati, abilito sorgente DB.")
 
-        sales_file = newest_file(inp, "sales")
-        stock_file = newest_file(inp, "stock")
-        snapshot_at = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        valid_codes = load_valid_shop_codes(shops_cfg)
+    args.source_db = True
+    args.skip_ingest = True
+    if not args.skip_orders:
+        args.orders_source_db = True
 
-        print("1) (Consigliato) metti i raw in .\\incoming\\ (csv/xlsx), ingest automatico.")
-        print("2) Oppure metti i file gia' standard in .\\input\\ come:")
-        print("   - sales_YYYY-MM.csv  (ANALISI ARTICOLI)")
-        print("   - stock_YYYY-MM.csv  (SITUAZIONE ARTICOLI)")
-        print("3) (Opzionale) metti i file ordini in .\\input\\orders\\")
-        print()
-        print(f"Sales file : {sales_file.name}")
-        print(f"Stock file : {stock_file.name}")
-        print(f"Shop config: {shops_cfg.name}")
-        print()
+    print("[STEP 0/3] Modalita' DB-only: lettura clean inputs esclusivamente dal database.")
+    try:
+        db_source = load_latest_clean_inputs_from_db(
+            source_run_id=args.source_db_run_id,
+            verbose=True,
+        )
+        sales_df = db_source["sales_df"]
+        stock_df = db_source["stock_df"]
+        print(
+            f"[STEP 0/3] DB source ok: run_id={db_source['source_run_id']}, "
+            f"sales={db_source['sales_rows']}, stock={db_source['stock_rows']}"
+        )
+    except Exception as exc:
+        print(f"[STEP 0/3] ERRORE DB source: {exc}")
+        raise SystemExit(1)
 
-        parse_sales(str(sales_file), str(clean_sales), valid_codes=valid_codes, snapshot_at=snapshot_at)
-        parse_articles(str(stock_file), str(clean_stock), valid_codes=valid_codes, snapshot_at=snapshot_at)
-
-    align_report = harmonize_clean_outputs(clean_sales, clean_stock)
+    sales_df, stock_df, align_report = harmonize_clean_frames(sales_df, stock_df)
+    sales_df.to_csv(clean_sales, index=False)
+    stock_df.to_csv(clean_stock, index=False)
     align_report.to_csv(out / "alignment_report.csv", index=False)
 
-    print("[STEP 1/3] Parsing completato. Avvio allocazione...")
-    run_allocation(clean_sales, clean_stock, shops_cfg, out)
+    print("[STEP 1/3] Inputs DB armonizzati. Avvio allocazione con regole fascia/vendite...")
+    alloc_result = run_allocation_frames(sales_df, stock_df, shops_cfg, out, write_outputs=True)
 
+    orders_source_run_id = None
     if args.skip_orders:
         print("\n[STEP 2/3] Modulo ordini saltato (--skip-orders).")
     else:
-        if args.orders_source_db:
-            print("\n[STEP 2/3] Modulo ordini DB-first: ricostruzione output da database.")
-            try:
-                ord_summary = export_orders_outputs_from_db(
-                    output_dir=out,
-                    source_run_id=args.orders_source_db_run_id,
-                    verbose=True,
+        print("\n[STEP 2/3] Modulo ordini DB-only: ricostruzione output dal database.")
+        try:
+            ord_summary = export_orders_outputs_from_db(
+                output_dir=out,
+                source_run_id=args.orders_source_db_run_id,
+                verbose=True,
+            )
+            orders_source_run_id = ord_summary.get("source_run_id")
+            if ord_summary.get("enabled", False):
+                print(
+                    "[STEP 2/3] Modulo ordini DB-first completato: "
+                    f"source_run_id={orders_source_run_id}"
                 )
-                if ord_summary.get("enabled", False):
-                    print(
-                        "[STEP 2/3] Modulo ordini DB-first completato: "
-                        f"source_run_id={ord_summary.get('source_run_id')}"
-                    )
-                else:
-                    print(
-                        "[STEP 2/3] Modulo ordini DB-first senza dati utili: "
-                        f"{ord_summary.get('reason', 'unknown')}"
-                    )
-            except Exception as exc:
-                print(f"[STEP 2/3] ERRORE modulo ordini DB-first: {exc}")
-                raise SystemExit(1)
-        else:
-            orders_root = pick_orders_root(root, args.orders_root)
-            if orders_root is None:
-                print("\n[STEP 2/3] Modulo ordini: nessun input trovato, skip.")
-                print("           Cerca in .\\input\\orders\\ oppure usa --orders-root <path>.")
             else:
-                print(f"\n[STEP 2/3] Avvio modulo ordini da: {orders_root}")
-                run_orders_pipeline(
-                    orders_root=orders_root,
-                    output_dir=out,
-                    fattore_copertura=float(args.orders_coverage),
-                    enable_full=not args.orders_math_only,
-                    verbose=True,
+                print(
+                    "[STEP 2/3] Modulo ordini DB-first senza dati utili: "
+                    f"{ord_summary.get('reason', 'unknown')}"
                 )
+        except Exception as exc:
+            print(f"[STEP 2/3] ERRORE modulo ordini DB-first: {exc}")
+            raise SystemExit(1)
 
     if args.sync_db:
         print("\n[STEP 3/3] Avvio sync PostgreSQL...")
@@ -316,6 +167,19 @@ def main():
                 create_schema=bool(args.db_create_schema),
                 run_type="app_pipeline",
                 verbose=True,
+                clean_sales_df=sales_df,
+                clean_stock_df=stock_df,
+                transfers_df=alloc_result["transfers"],
+                features_df=alloc_result["features"],
+                ingest_report={},
+                source_sales_stock_run_id=db_source.get("source_run_id"),
+                source_orders_run_id=orders_source_run_id,
+                include_orders=not args.skip_orders,
+                metadata_extra={
+                    "operating_mode": "db_only",
+                    "receiver_priority_rule": "fascia_then_local_sales_then_need",
+                    "donor_priority_rule": "lower_priority_shop_then_lower_local_sales",
+                },
             )
             print(f"[STEP 3/3] DB sync completata. run_id={db_summary.get('run_id')}")
         except Exception as exc:
@@ -328,13 +192,13 @@ def main():
     print(" - clean_sales.csv")
     print(" - clean_articles.csv")
     print(" - alignment_report.csv")
-    print(" - ingest/ingest_report_latest.json")
-    print(" - ingest/ingest_report_latest.csv")
     print(" - suggested_transfers.csv")
     print(" - suggested_transfers_detailed.csv")
     print(" - shipment_plan.csv")
     print(" - shipment_summary.csv")
     print(" - features_after.csv")
+    print(" - article_shop_signals.csv")
+    print(" - stock_integrity_report.csv")
     print(" - demand_diagnostics.csv")
     print(" - orders/orders_summary.json")
     print(" - orders/orders_run_log.txt")

@@ -119,13 +119,57 @@
                     <th class="sortable" data-key="article_code">Articolo</th>
                     <th class="sortable" data-key="size">Taglia</th>
                     <th class="sortable" data-key="from_shop_code">Da Negozio</th>
+                    <th class="sortable" data-key="from_observed_sales_signal">Venduto Da</th>
+                    <th class="sortable" data-key="from_zero_sales_source_candidate">Fonte Ferma</th>
                     <th class="sortable" data-key="to_shop_code">A Negozio</th>
+                    <th class="sortable" data-key="to_observed_sales_signal">Venduto A</th>
+                    <th class="sortable" data-key="to_missing_core_sizes">Buchi Core</th>
+                    <th class="sortable" data-key="to_destination_priority_score">Score Dest.</th>
                     <th class="sortable" data-key="reason">Motivo</th>
                     <th class="sortable" data-key="qty">Paia</th>
                   </tr>
                 </thead>
                 <tbody id="transferTableBody"></tbody>
               </table>
+            </div>
+          </article>
+
+          <article id="transferArticlePanel" class="panel subpanel article-detail-panel">
+            <div class="article-detail-header">
+              <div>
+                <h3>Dettaglio articolo per negozio e taglia</h3>
+                <p id="transferArticleSubtitle" class="muted">Clicca una riga trasferimento o inserisci un articolo per aprire la matrice.</p>
+              </div>
+              <div class="article-detail-actions">
+                <input id="transferArticleInput" type="text" placeholder="Codice articolo es. 59/5040CTM" />
+                <button id="transferArticleLoadBtn" class="btn secondary" type="button">Apri articolo</button>
+                <button id="transferArticleExportXlsxBtn" class="btn secondary" type="button">Excel articolo</button>
+              </div>
+            </div>
+            <div id="transferArticleSummary" class="article-summary-grid"></div>
+            <div id="transferArticleReasons" class="article-reason-pills"></div>
+            <div class="article-detail-grid">
+              <div class="article-detail-table panel inset-panel">
+                <h4>Movimenti articolo</h4>
+                <div class="table-wrap">
+                  <table id="transferArticleMovesTable">
+                    <thead>
+                      <tr>
+                        <th>Taglia</th>
+                        <th>Da</th>
+                        <th>A</th>
+                        <th>Motivo</th>
+                        <th>Paia</th>
+                      </tr>
+                    </thead>
+                    <tbody id="transferArticleMovesBody"></tbody>
+                  </table>
+                </div>
+              </div>
+              <div class="article-detail-matrix panel inset-panel">
+                <h4>Matrice negozio x taglia</h4>
+                <div id="transferArticleMatrix" class="article-matrix-wrap"></div>
+              </div>
             </div>
           </article>
         </section>
@@ -299,9 +343,9 @@
       <section class="panel view-panel" data-view="operations">
         <h2>Nuovo Aggiornamento</h2>
         <form id="runForm" class="form-grid">
-          <label><input type="checkbox" id="sourceDb" checked /> Usa dati gia' presenti nel database</label>
-          <label><input type="checkbox" id="skipIngest" checked /> Non rileggere i file in ingresso</label>
-          <label><input type="checkbox" id="ordersSourceDb" checked /> Usa ordini gia' presenti nel database</label>
+          <label><input type="checkbox" id="sourceDb" checked disabled /> Sorgente operativa DB-only</label>
+          <label><input type="checkbox" id="skipIngest" checked disabled /> Input file legacy disabilitati</label>
+          <label><input type="checkbox" id="ordersSourceDb" checked disabled /> Ordini letti dal database</label>
           <label><input type="checkbox" id="skipOrders" /> Aggiorna solo giacenze e trasferimenti</label>
           <label><input type="checkbox" id="syncDb" checked /> Aggiorna il database finale</label>
           <label><input type="checkbox" id="createSchema" /> Applica o aggiorna la struttura tabelle</label>
@@ -315,11 +359,11 @@
           <label class="inline-field">Codice run ordini
             <input type="text" id="ordersSourceDbRunId" placeholder="UUID opzionale" />
           </label>
-          <label class="inline-field">Cartella file ingresso (opzionale)
-            <input type="text" id="incomingRoot" placeholder="C:\path\incoming" />
+          <label class="inline-field">Cartella file ingresso
+            <input type="text" id="incomingRoot" placeholder="non usata in modalita' DB-only" disabled />
           </label>
-          <label class="inline-field">Cartella file ordini (opzionale)
-            <input type="text" id="ordersRoot" placeholder="C:\path\orders" />
+          <label class="inline-field">Cartella file ordini
+            <input type="text" id="ordersRoot" placeholder="non usata in modalita' DB-only" disabled />
           </label>
           <div class="form-actions">
             <button type="submit" class="btn primary">Avvia aggiornamento</button>
@@ -467,7 +511,7 @@
           </div>
           <p class="muted">
             Genera cataloghi `HTML`, `JPG` o entrambi dai dati presenti nel database.
-            Se non selezioni stagioni, reparti o categorie, il sistema usa tutto il catalogo corrente.
+            Se non selezioni stagioni, reparti, categorie o marchi, il sistema usa tutto il catalogo corrente.
           </p>
           <form id="catalogShowcaseForm" class="form-grid catalog-form">
             <label class="inline-field">Formato output
@@ -475,6 +519,12 @@
                 <option value="both" selected>HTML + JPG</option>
                 <option value="html">Solo HTML</option>
                 <option value="jpg">Solo JPG</option>
+              </select>
+            </label>
+            <label class="inline-field">Layout JPG
+              <select id="catalogShowcaseJpgLayout">
+                <option value="minimal" selected>Minimal</option>
+                <option value="detailed">Dettagliato</option>
               </select>
             </label>
             <label class="inline-field">Sorgente primaria foto
@@ -530,6 +580,20 @@
               <input id="catalogShowcaseCategoriaSearch" type="text" placeholder="Cerca categoria" />
               <div id="catalogShowcaseCategoriaOptions" class="catalog-filter-options"></div>
             </div>
+            <div class="catalog-filter-panel">
+              <div class="catalog-filter-head">
+                <div>
+                  <div class="catalog-filter-title">Filtra marchi</div>
+                  <div id="catalogShowcaseBrandStatus" class="catalog-filter-status">Tutti i marchi</div>
+                </div>
+                <div class="catalog-filter-actions">
+                  <button id="catalogShowcaseBrandAll" type="button" class="btn secondary compact">Tutti</button>
+                  <button id="catalogShowcaseBrandClear" type="button" class="btn secondary compact">Reset</button>
+                </div>
+              </div>
+              <input id="catalogShowcaseBrandSearch" type="text" placeholder="Cerca marchio" />
+              <div id="catalogShowcaseBrandOptions" class="catalog-filter-options"></div>
+            </div>
             <label class="inline-field">Codici manuali opzionali
               <textarea id="catalogShowcaseManualCodes" rows="5" placeholder="48/0005CBL&#10;48/01144BE"></textarea>
             </label>
@@ -553,33 +617,46 @@
         </article>
 
         <div class="runs-toolbar">
+          <select id="catalogRunFilter"></select>
           <input id="catalogSearch" type="text" placeholder="Cerca articolo / descrizione / fornitore" />
           <select id="catalogSeasonFilter"></select>
           <select id="catalogRepartoFilter"></select>
           <select id="catalogCategoriaFilter"></select>
+          <select id="catalogRowLimit">
+            <option value="100">100 righe</option>
+            <option value="250" selected>250 righe</option>
+            <option value="500">500 righe</option>
+          </select>
         </div>
 
         <div class="catalog-grid">
-          <div class="table-wrap">
-            <table id="catalogTable">
-              <thead>
-                <tr>
-                  <th>Stagione</th>
-                  <th>Articolo</th>
-                  <th>Descrizione</th>
-                  <th>Fornitore</th>
-                  <th>Reparto</th>
-                  <th>Categoria</th>
-                  <th>GIAC</th>
-                  <th>CON</th>
-                  <th>VEN</th>
-                  <th>%VEN</th>
-                  <th>Listino</th>
-                  <th>Saldo</th>
-                </tr>
-              </thead>
-              <tbody id="catalogTableBody"></tbody>
-            </table>
+          <div>
+            <div class="table-wrap">
+              <table id="catalogTable">
+                <thead>
+                  <tr>
+                    <th>Stagione</th>
+                    <th>Articolo</th>
+                    <th>Descrizione</th>
+                    <th>Fornitore</th>
+                    <th>Reparto</th>
+                    <th>Categoria</th>
+                    <th>GIAC</th>
+                    <th>CON</th>
+                    <th>VEN</th>
+                    <th>%VEN</th>
+                    <th>Listino</th>
+                    <th>Saldo</th>
+                  </tr>
+                </thead>
+                <tbody id="catalogTableBody"></tbody>
+              </table>
+            </div>
+            <div class="runs-pager">
+              <button id="catalogPrevPageBtn" class="btn secondary" type="button">Precedente</button>
+              <p id="catalogPageInfo" class="muted">Pagina 1</p>
+              <button id="catalogNextPageBtn" class="btn secondary" type="button">Successiva</button>
+            </div>
           </div>
 
           <article class="panel subpanel">

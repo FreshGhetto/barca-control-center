@@ -4,16 +4,18 @@ import csv
 import io
 import re
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
 
-_CODE_RE = re.compile(r"^\d{1,3}/[A-Z0-9]{2,}$", re.IGNORECASE)
+_CODE_RE = re.compile(r"^[A-Z0-9]{1,4}/[A-Z0-9]{2,}$", re.IGNORECASE)
 _DELIM_CANDIDATES = (";", ",", "\t", "|")
 _LISTINO_MARKERS = ("ANALISI ARTICOLI",)
 _SALDO_MARKERS = ("ANALISI LISTINI E RICARICHI",)
 _SEASON_RE = re.compile(r"(?<!\d)(?:20)?(\d{2})[\s_\-]*([A-Z])(?![A-Z0-9])", re.IGNORECASE)
+_COLOR_CONTEXT_RE = re.compile(r"^\d{1,3}\s+[A-Z]", re.IGNORECASE)
+_NUMERICISH_RE = re.compile(r"^[\d\s.,%-]+$")
 
 
 def _decode_best_effort(data: bytes) -> str:
@@ -67,6 +69,8 @@ def _read_rows(data: bytes) -> list[list[str]]:
 
 def _detect_price_kind(data: bytes) -> str:
     probe = _decode_best_effort(data)[:20000].upper()
+    if all(marker in probe for marker in ("MATERIALE", "COLORE", "MARCHIO", "ARTICOLO")):
+        return "metadata_color"
     if any(marker in probe for marker in _SALDO_MARKERS):
         return "saldo"
     if any(marker in probe for marker in _LISTINO_MARKERS):
@@ -93,6 +97,257 @@ def _emit_progress(progress_cb: Optional[Callable[[Dict[str, Any]], None]], **pa
         progress_cb(dict(payload))
     except Exception:
         return
+
+
+def _normalize_label(value: Any) -> Optional[str]:
+    text = str(value or "").replace("\xa0", " ").strip()
+    text = re.sub(r"\s+", " ", text)
+    return text or None
+
+
+def _normalize_reparto(value: Any) -> Optional[str]:
+    text = _normalize_label(value)
+    if not text:
+        return None
+    upper = text.upper()
+    if "SCARPE UOMO" in upper:
+        return "SCARPE UOMO"
+    if "SCARPE DONNA" in upper:
+        return "SCARPE DONNA"
+    if "ABBIGLIAMENTO UOMO" in upper:
+        return "ABBIGLIAMENTO UOMO"
+    if "ABBIGLIAMENTO DONNA" in upper:
+        return "ABBIGLIAMENTO DONNA"
+    if "TENNIS UNISEX" in upper:
+        return "TENNIS UNISEX"
+    if "PELLETTERIA" in upper:
+        return "PELLETTERIA"
+    return None
+
+
+def _is_numericish(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    return bool(_NUMERICISH_RE.fullmatch(text))
+
+
+def _clean_context_tokens(chunk: Sequence[str]) -> List[str]:
+    out: List[str] = []
+    for item in chunk:
+        text = _normalize_label(item)
+        if not text:
+            continue
+        upper = text.upper()
+        if upper in {"%", "ARTICOLO"}:
+            continue
+        if upper.startswith(("SUBTOTALE", "TOTALI", "VALORE ", "COSTO ")):
+            continue
+        if _is_numericish(text):
+            continue
+        out.append(text)
+    return out
+
+
+def _split_article_cell(value: Any) -> Tuple[Optional[str], Optional[str]]:
+    text = _normalize_label(value)
+    if not text:
+        return None, None
+    parts = text.split(maxsplit=1)
+    code = _normalize_code(parts[0]) if parts else ""
+    if not _is_article_code(code):
+        return None, None
+    description = parts[1].strip() if len(parts) > 1 else None
+    return code, description or None
+
+
+def _first_non_empty(series: pd.Series) -> Optional[str]:
+    for value in series:
+        text = _normalize_label(value)
+        if text:
+            return text
+    return None
+
+
+def _aggregate_article_metadata(frame: pd.DataFrame) -> pd.DataFrame:
+    columns = ["season_code", "article_code", "description", "reparto", "categoria", "marchio", "tipologia", "color", "materiale"]
+    if frame is None or frame.empty:
+        return pd.DataFrame(columns=columns)
+    out = frame.copy()
+    out["season_code"] = out["season_code"].astype(str).str.strip().str.upper().replace("", "UNKNOWN")
+    out["article_code"] = out["article_code"].astype(str).map(_normalize_code)
+    for col in ("description", "reparto", "categoria", "marchio", "tipologia", "color", "materiale"):
+        if col not in out.columns:
+            out[col] = None
+        out[col] = out[col].map(_normalize_label)
+    out = out[out["article_code"].map(_is_article_code)].copy()
+    if out.empty:
+        return pd.DataFrame(columns=columns)
+    grouped = (
+        out.groupby(["season_code", "article_code"], as_index=False)
+        .agg(
+            {
+                "description": _first_non_empty,
+                "reparto": _first_non_empty,
+                "categoria": _first_non_empty,
+                "marchio": _first_non_empty,
+                "tipologia": _first_non_empty,
+                "color": _first_non_empty,
+                "materiale": _first_non_empty,
+            }
+        )
+        .reindex(columns=columns)
+    )
+    return grouped.sort_values(["season_code", "article_code"]).reset_index(drop=True)
+
+
+def extract_article_metadata_from_color_csv_bytes(data: bytes) -> pd.DataFrame:
+    rows_out: List[Dict[str, Optional[str]]] = []
+    current_reparto = current_materiale = current_colore = current_marchio = None
+
+    for row in _read_rows(data):
+        if "ARTICOLO" not in row:
+            continue
+        elements = row[row.index("ARTICOLO") + 1 :]
+        if "TOTALI :" in elements:
+            elements = elements[: elements.index("TOTALI :")]
+        article_indices = [
+            idx
+            for idx, val in enumerate(elements)
+            if _split_article_cell(val)[0]
+        ]
+        last_idx = 0
+        for idx in article_indices:
+            pre_chunk = _clean_context_tokens(elements[last_idx:idx])
+            reparto_candidates = [_normalize_reparto(item) for item in pre_chunk if _normalize_reparto(item)]
+            if reparto_candidates:
+                current_reparto = reparto_candidates[-1]
+            color_candidates = [item for item in pre_chunk if _COLOR_CONTEXT_RE.match(item)]
+            if color_candidates:
+                current_colore = color_candidates[-1]
+            residual = [item for item in pre_chunk if _normalize_reparto(item) is None and item not in color_candidates]
+            if residual:
+                current_marchio = residual[-1]
+            if len(residual) >= 2:
+                current_materiale = residual[-2]
+
+            article_code, description = _split_article_cell(elements[idx])
+            if not article_code:
+                last_idx = idx + 1
+                continue
+            rows_out.append(
+                {
+                    "article_code": article_code,
+                    "description": description,
+                    "reparto": current_reparto,
+                    "categoria": None,
+                    "marchio": current_marchio,
+                    "tipologia": None,
+                    "color": current_colore,
+                    "materiale": current_materiale,
+                }
+            )
+            last_idx = idx + 1
+
+    if not rows_out:
+        return pd.DataFrame(columns=["article_code", "description", "reparto", "categoria", "marchio", "tipologia", "color", "materiale"])
+    return pd.DataFrame(rows_out)
+
+
+def extract_article_metadata_from_listino_csv_bytes(data: bytes) -> pd.DataFrame:
+    rows_out: List[Dict[str, Optional[str]]] = []
+    current_reparto = current_categoria = None
+
+    for row in _read_rows(data):
+        if "ARTICOLO" not in row:
+            continue
+        elements = row[row.index("ARTICOLO") + 1 :]
+        if "TOTALI :" in elements:
+            elements = elements[: elements.index("TOTALI :")]
+        article_indices = [
+            idx
+            for idx, val in enumerate(elements)
+            if _split_article_cell(val)[0]
+        ]
+        last_idx = 0
+        for idx in article_indices:
+            pre_chunk = _clean_context_tokens(elements[last_idx:idx])
+            reparto_candidates = [_normalize_reparto(item) for item in pre_chunk if _normalize_reparto(item)]
+            if reparto_candidates:
+                current_reparto = reparto_candidates[-1]
+            residual = [item for item in pre_chunk if _normalize_reparto(item) is None]
+            if residual:
+                current_categoria = residual[-1]
+
+            article_code, description = _split_article_cell(elements[idx])
+            if not article_code:
+                last_idx = idx + 1
+                continue
+            rows_out.append(
+                {
+                    "article_code": article_code,
+                    "description": description,
+                    "reparto": current_reparto,
+                    "categoria": current_categoria,
+                    "marchio": None,
+                    "tipologia": None,
+                    "color": None,
+                    "materiale": None,
+                }
+            )
+            last_idx = idx + 1
+
+    if not rows_out:
+        return pd.DataFrame(columns=["article_code", "description", "reparto", "categoria", "marchio", "tipologia", "color", "materiale"])
+    return pd.DataFrame(rows_out)
+
+
+def extract_article_metadata_from_saldo_csv_bytes(data: bytes) -> pd.DataFrame:
+    rows_out: List[Dict[str, Optional[str]]] = []
+    current_reparto = current_categoria = None
+
+    for row in _read_rows(data):
+        if "ARTICOLO" not in row:
+            continue
+        elements = row[row.index("ARTICOLO") + 1 :]
+        if "TOTALI :" in elements:
+            elements = elements[: elements.index("TOTALI :")]
+        article_indices = [
+            idx
+            for idx, val in enumerate(elements)
+            if _split_article_cell(val)[0]
+        ]
+        last_idx = 0
+        for idx in article_indices:
+            pre_chunk = _clean_context_tokens(elements[last_idx:idx])
+            reparto_candidates = [_normalize_reparto(item) for item in pre_chunk if _normalize_reparto(item)]
+            if reparto_candidates:
+                current_reparto = reparto_candidates[-1]
+            residual = [item for item in pre_chunk if _normalize_reparto(item) is None]
+            if residual:
+                current_categoria = residual[-1]
+
+            article_code, description = _split_article_cell(elements[idx])
+            if not article_code:
+                last_idx = idx + 1
+                continue
+            rows_out.append(
+                {
+                    "article_code": article_code,
+                    "description": description,
+                    "reparto": current_reparto,
+                    "categoria": current_categoria,
+                    "marchio": None,
+                    "tipologia": None,
+                    "color": None,
+                    "materiale": None,
+                }
+            )
+            last_idx = idx + 1
+
+    if not rows_out:
+        return pd.DataFrame(columns=["article_code", "description", "reparto", "categoria", "marchio", "tipologia", "color", "materiale"])
+    return pd.DataFrame(rows_out)
 
 
 def extract_listino_prices_from_csv_bytes(data: bytes) -> pd.DataFrame:
@@ -172,6 +427,7 @@ def build_price_snapshot_from_files(
         "input_files": 0,
         "listino_files": 0,
         "saldo_files": 0,
+        "metadata_files": 0,
         "skipped_files": 0,
         "merged_rows": 0,
     }
@@ -190,6 +446,20 @@ def build_price_snapshot_from_files(
         data = Path(path).read_bytes()
         season_code = _extract_season_code(Path(path).name, data)
         kind = _detect_price_kind(data)
+        if kind == "metadata_color":
+            stats["metadata_files"] += 1
+            _emit_progress(
+                progress_cb,
+                stage="parsing_price",
+                file_name=path.name,
+                current=idx,
+                total=total_files,
+                detected_kind="metadata_color_skipped",
+                season_code=season_code,
+                rows=0,
+                message=f"CSV metadati escluso dai prezzi {idx}/{total_files}: {path.name}",
+            )
+            continue
         if kind == "unknown":
             listino_probe = extract_listino_prices_from_csv_bytes(data)
             saldo_probe = extract_saldo_prices_from_csv_bytes(data)
@@ -282,5 +552,99 @@ def build_price_snapshot_from_files(
         total=total_files,
         merged_rows=int(len(merged)),
         message=f"CSV prezzi elaborati: {int(len(merged))} righe aggregate",
+    )
+    return merged, stats
+
+
+def build_article_metadata_from_files(
+    csv_files: Sequence[Path],
+    progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    frames: list[pd.DataFrame] = []
+    stats = {
+        "input_files": 0,
+        "color_files": 0,
+        "saldo_files": 0,
+        "listino_files": 0,
+        "skipped_files": 0,
+        "merged_rows": 0,
+    }
+
+    total_files = len(csv_files)
+    for idx, path in enumerate(csv_files, start=1):
+        stats["input_files"] += 1
+        _emit_progress(
+            progress_cb,
+            stage="parsing_article_meta",
+            file_name=path.name,
+            current=idx,
+            total=total_files,
+            message=f"Analisi CSV metadati {idx}/{total_files}: {path.name}",
+        )
+        data = Path(path).read_bytes()
+        season_code = _extract_season_code(Path(path).name, data)
+        kind = _detect_price_kind(data)
+
+        if kind == "metadata_color":
+            df = extract_article_metadata_from_color_csv_bytes(data)
+            stats["color_files"] += 1
+            detected_kind = "metadata_color"
+        elif kind == "saldo":
+            df = extract_article_metadata_from_saldo_csv_bytes(data)
+            stats["saldo_files"] += 1
+            detected_kind = "saldo"
+        elif kind == "listino":
+            df = extract_article_metadata_from_listino_csv_bytes(data)
+            stats["listino_files"] += 1
+            detected_kind = "listino"
+        else:
+            stats["skipped_files"] += 1
+            _emit_progress(
+                progress_cb,
+                stage="parsing_article_meta",
+                file_name=path.name,
+                current=idx,
+                total=total_files,
+                detected_kind="ignored",
+                season_code=season_code,
+                rows=0,
+                message=f"CSV metadati ignorato {idx}/{total_files}: {path.name}",
+            )
+            continue
+
+        if not df.empty:
+            df["season_code"] = season_code
+            df["source_rank"] = 0 if kind == "metadata_color" else 1 if kind == "saldo" else 2
+            frames.append(df)
+
+        _emit_progress(
+            progress_cb,
+            stage="parsing_article_meta",
+            file_name=path.name,
+            current=idx,
+            total=total_files,
+            detected_kind=detected_kind,
+            season_code=season_code,
+            rows=int(len(df)),
+            message=f"CSV metadati {detected_kind} {idx}/{total_files}: {path.name}",
+        )
+
+    if not frames:
+        merged = pd.DataFrame(columns=["season_code", "article_code", "description", "reparto", "categoria", "marchio", "tipologia", "color", "materiale"])
+    else:
+        merged_raw = pd.concat(frames, ignore_index=True)
+        if "source_rank" in merged_raw.columns:
+            merged_raw = merged_raw.sort_values(["season_code", "article_code", "source_rank"]).reset_index(drop=True)
+            merged_raw = merged_raw.drop(columns=["source_rank"])
+        merged = _aggregate_article_metadata(merged_raw)
+
+    stats["merged_rows"] = int(len(merged))
+    _emit_progress(
+        progress_cb,
+        stage="parsing_article_meta",
+        current=total_files,
+        total=total_files,
+        merged_rows=int(len(merged)),
+        message=f"CSV metadati elaborati: {int(len(merged))} righe aggregate",
     )
     return merged, stats

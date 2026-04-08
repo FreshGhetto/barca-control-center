@@ -62,7 +62,7 @@ def _catalog_key(season_code: str, article_code: str) -> str:
 
 
 def _parse_manual_codes(raw_value: str) -> List[str]:
-    tokens = re.findall(r"\b\d{1,3}/[A-Z0-9]{2,}\b", str(raw_value or ""), flags=re.IGNORECASE)
+    tokens = re.findall(r"\b[A-Z0-9]{1,3}/[A-Z0-9]{2,}\b", str(raw_value or ""), flags=re.IGNORECASE)
     out: List[str] = []
     seen = set()
     for item in tokens:
@@ -72,6 +72,154 @@ def _parse_manual_codes(raw_value: str) -> List[str]:
         seen.add(code)
         out.append(code)
     return out
+
+
+def _extract_alias_codes_from_description(description: str, current_code: str = "") -> List[str]:
+    text = str(description or "")
+    current = str(current_code or "").strip().upper().replace(" ", "")
+    out: List[str] = []
+    seen: set[str] = set()
+
+    for match in re.findall(r"\bNEW\s+([A-Z0-9]{1,3}/[A-Z0-9]{2,})\b", text, flags=re.IGNORECASE):
+        code = str(match or "").strip().upper().replace(" ", "")
+        if not code or code == current or code in seen:
+            continue
+        seen.add(code)
+        out.append(code)
+
+    for code in _parse_manual_codes(text):
+        if not code or code == current or code in seen:
+            continue
+        seen.add(code)
+        out.append(code)
+    return out
+
+
+def _article_metadata_score(article: Article, prices: Optional[Mapping[str, Optional[float]]] = None) -> int:
+    score = 0
+    if str(article.season or article.season_code or "").strip():
+        score += 2
+    if str(article.description or "").strip():
+        score += 1
+    if str(article.color or "").strip():
+        score += 1
+    if str(article.marchio or "").strip():
+        score += 1
+    if str(article.supplier or "").strip():
+        score += 3
+    if str(article.reparto or "").strip():
+        score += 1
+    if str(article.categoria or "").strip():
+        score += 2
+    if str(article.tipologia or "").strip():
+        score += 2
+    if article.stores:
+        score += 4
+    if article.size_totals:
+        score += 3
+    if prices:
+        if prices.get("prezzo_listino") is not None:
+            score += 2
+        if prices.get("prezzo_saldo") is not None:
+            score += 2
+    non_fallback_sources = [
+        src
+        for src in (article.source_files or set())
+        if str(src or "").strip() and str(src) != "manual_code_db_fallback"
+    ]
+    if non_fallback_sources:
+        score += 2
+    return score
+
+
+def _copy_store_row(row: CatalogStoreRow) -> CatalogStoreRow:
+    return CatalogStoreRow(
+        store=str(row.store or ""),
+        giac=float(row.giac or 0.0),
+        con=float(row.con or 0.0),
+        ven=float(row.ven or 0.0),
+        perc_ven=float(row.perc_ven or 0.0),
+        sizes=dict(row.sizes or {}),
+    )
+
+
+def _clone_article(article: Article) -> Article:
+    cloned = Article(
+        code=str(article.code or ""),
+        season=str(article.season or ""),
+        season_code=str(article.season_code or ""),
+        season_label=str(article.season_label or ""),
+        description=str(article.description or ""),
+        color=str(article.color or ""),
+        marchio=str(article.marchio or ""),
+        supplier=str(article.supplier or ""),
+        reparto=str(article.reparto or ""),
+        categoria=str(article.categoria or ""),
+        tipologia=str(article.tipologia or ""),
+        giac=float(article.giac or 0.0),
+        con=float(article.con or 0.0),
+        ven=float(article.ven or 0.0),
+        perc_ven=float(article.perc_ven or 0.0),
+    )
+    cloned.size_totals = dict(article.size_totals or {})
+    cloned.stores = {key: _copy_store_row(value) for key, value in (article.stores or {}).items()}
+    cloned.source_files = set(article.source_files or set())
+    return cloned
+
+
+def _apply_alias_metadata(
+    target: Article,
+    source: Article,
+    *,
+    target_prices: Optional[Dict[str, Optional[float]]] = None,
+    source_prices: Optional[Mapping[str, Optional[float]]] = None,
+) -> Tuple[Article, Dict[str, Optional[float]], bool]:
+    enriched = _clone_article(target)
+    prices = dict(target_prices or {})
+    changed = False
+
+    def fill_attr(attr: str) -> None:
+        nonlocal changed
+        current = str(getattr(enriched, attr, "") or "").strip()
+        incoming = str(getattr(source, attr, "") or "").strip()
+        if current or not incoming:
+            return
+        setattr(enriched, attr, incoming)
+        changed = True
+
+    for attr in ("season", "season_code", "season_label", "color", "marchio", "supplier", "reparto", "categoria", "tipologia"):
+        fill_attr(attr)
+
+    if not str(enriched.description or "").strip() and str(source.description or "").strip():
+        enriched.description = str(source.description or "")
+        changed = True
+
+    for price_key in ("prezzo_listino", "prezzo_saldo"):
+        if prices.get(price_key) is None and source_prices and source_prices.get(price_key) is not None:
+            prices[price_key] = float(source_prices[price_key])  # type: ignore[arg-type]
+            changed = True
+
+    if not enriched.stores and source.stores and _article_metadata_score(source, source_prices) >= 12:
+        enriched.stores = {key: _copy_store_row(value) for key, value in source.stores.items()}
+        enriched.recompute_totals()
+        changed = True
+
+    if not enriched.size_totals and source.size_totals:
+        enriched.size_totals = dict(source.size_totals or {})
+        changed = True
+
+    if source.source_files:
+        before = len(enriched.source_files)
+        enriched.source_files.update(source.source_files)
+        if len(enriched.source_files) != before:
+            changed = True
+
+    alias_marker = f"manual_code_alias:{str(source.code or '').strip().upper()}"
+    if str(source.code or "").strip() and alias_marker not in enriched.source_files:
+        enriched.source_files.add(alias_marker)
+        changed = True
+
+    return enriched, prices, changed
 
 
 def _compute_source_mode(primary_source: str, allow_fallback: bool) -> str:
@@ -148,23 +296,26 @@ def _load_catalog_articles_from_db(*, source_run_id: Optional[str] = None) -> Tu
             cur.execute(
                 f"""
                 SELECT
-                  season_code,
-                  article_code,
-                  COALESCE(description, '') AS description,
-                  COALESCE(color, '') AS color,
-                  COALESCE(supplier, '') AS supplier,
-                  COALESCE(reparto, '') AS reparto,
-                  COALESCE(categoria, '') AS categoria,
-                  COALESCE(tipologia, '') AS tipologia,
-                  store_code,
-                  COALESCE(giac, 0) AS giac,
-                  COALESCE(con, 0) AS con,
-                  COALESCE(ven, 0) AS ven,
-                  COALESCE(perc_ven, 0) AS perc_ven,
-                  COALESCE(source_file, '') AS source_file
-                FROM {source['store_table']}
-                WHERE {source['where_prefix']}season_code <> ''
-                ORDER BY season_code, article_code, store_code
+                  s.season_code,
+                  s.article_code,
+                  COALESCE(s.description, '') AS description,
+                  COALESCE(s.color, '') AS color,
+                  COALESCE(s.supplier, '') AS supplier,
+                  COALESCE(s.reparto, '') AS reparto,
+                  COALESCE(s.categoria, '') AS categoria,
+                  COALESCE(s.tipologia, '') AS tipologia,
+                  COALESCE(da.marchio, '') AS marchio,
+                  s.store_code,
+                  COALESCE(s.giac, 0) AS giac,
+                  COALESCE(s.con, 0) AS con,
+                  COALESCE(s.ven, 0) AS ven,
+                  COALESCE(s.perc_ven, 0) AS perc_ven,
+                  COALESCE(s.source_file, '') AS source_file
+                FROM {source['store_table']} s
+                LEFT JOIN dim_article da
+                  ON da.article_code = s.article_code
+                WHERE {source['where_prefix']}s.season_code <> ''
+                ORDER BY s.season_code, s.article_code, s.store_code
                 """,
                 tuple(source["params_prefix"]),
             )
@@ -185,25 +336,26 @@ def _load_catalog_articles_from_db(*, source_run_id: Optional[str] = None) -> Tu
                         reparto=str(row[5] or ""),
                         categoria=str(row[6] or ""),
                         tipologia=str(row[7] or ""),
-                        giac=float(row[9] or 0.0),
-                        con=float(row[10] or 0.0),
-                        ven=float(row[11] or 0.0),
-                        perc_ven=float(row[12] or 0.0),
+                        marchio=str(row[8] or ""),
+                        giac=float(row[10] or 0.0),
+                        con=float(row[11] or 0.0),
+                        ven=float(row[12] or 0.0),
+                        perc_ven=float(row[13] or 0.0),
                     )
                     articles[article_key] = article
-                source_file = str(row[13] or "").strip()
+                source_file = str(row[14] or "").strip()
                 if source_file:
                     article.source_files.add(source_file)
 
-                store_code = str(row[8] or "").strip().upper()
+                store_code = str(row[9] or "").strip().upper()
                 if not store_code or store_code == "XX":
                     continue
                 article.stores[store_code] = CatalogStoreRow(
                     store=store_code,
-                    giac=float(row[9] or 0.0),
-                    con=float(row[10] or 0.0),
-                    ven=float(row[11] or 0.0),
-                    perc_ven=float(row[12] or 0.0),
+                    giac=float(row[10] or 0.0),
+                    con=float(row[11] or 0.0),
+                    ven=float(row[12] or 0.0),
+                    perc_ven=float(row[13] or 0.0),
                 )
 
             cur.execute(
@@ -261,6 +413,160 @@ def _load_catalog_articles_from_db(*, source_run_id: Optional[str] = None) -> Tu
     return effective_run_id, articles, price_lookup
 
 
+def _load_manual_code_article_supplements(
+    *,
+    manual_codes: Sequence[str],
+    existing_articles: Mapping[str, Article],
+    existing_price_lookup: Optional[Mapping[str, Mapping[str, Optional[float]]]] = None,
+) -> Tuple[Dict[str, Article], Dict[str, Dict[str, Optional[float]]], List[str]]:
+    requested_codes = [
+        str(code or "").strip().upper().replace(" ", "")
+        for code in manual_codes
+        if str(code or "").strip()
+    ]
+    if not requested_codes:
+        return {}, {}, []
+
+    existing_codes = {
+        str(article.code or "").strip().upper().replace(" ", "")
+        for article in existing_articles.values()
+        if str(article.code or "").strip()
+    }
+    missing_codes = [code for code in requested_codes if code not in existing_codes]
+    if not missing_codes:
+        return {}, {}, []
+
+    _require_psycopg()
+    dsn = get_db_dsn()
+    supplements: Dict[str, Article] = {}
+    price_lookup: Dict[str, Dict[str, Optional[float]]] = {}
+    found_codes: set[str] = set()
+
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                  da.article_code,
+                  COALESCE(NULLIF(da.description, ''), NULLIF(fos.descrizione, ''), '') AS description,
+                  COALESCE(NULLIF(da.colore, ''), NULLIF(fos.colore, ''), '') AS color,
+                  COALESCE(NULLIF(da.marchio, ''), NULLIF(fos.marchio, ''), '') AS marchio,
+                  COALESCE(NULLIF(da.reparto, ''), '') AS reparto,
+                  COALESCE(NULLIF(da.categoria, ''), NULLIF(fos.categoria, ''), '') AS categoria,
+                  COALESCE(NULLIF(da.tipologia, ''), NULLIF(fos.tipologia, ''), '') AS tipologia,
+                  COALESCE(fos.giacenza, 0) AS giacenza,
+                  COALESCE(fos.venduto_totale, fos.venduto_periodo, 0) AS venduto,
+                  fos.prezzo_listino,
+                  fos.prezzo_vendita
+                FROM dim_article da
+                LEFT JOIN LATERAL (
+                  SELECT fos.*
+                  FROM fact_order_source fos
+                  JOIN etl_run r
+                    ON r.run_id = fos.run_id
+                  WHERE fos.article_code = da.article_code
+                    AND r.status = 'completed'
+                  ORDER BY COALESCE(r.finished_at, r.started_at) DESC, fos.run_id DESC
+                  LIMIT 1
+                ) fos
+                  ON TRUE
+                WHERE UPPER(da.article_code) = ANY(%s)
+                ORDER BY da.article_code
+                """,
+                (missing_codes,),
+            )
+            for row in cur.fetchall():
+                code = str(row[0] or "").strip().upper().replace(" ", "")
+                if not code:
+                    continue
+                found_codes.add(code)
+                giac = float(row[7] or 0.0)
+                ven = float(row[8] or 0.0)
+                con = max(0.0, giac + max(0.0, ven))
+                article = Article(
+                    code=code,
+                    season="",
+                    season_code="",
+                    season_label="",
+                    description=str(row[1] or ""),
+                    color=str(row[2] or ""),
+                    marchio=str(row[3] or ""),
+                    supplier="",
+                    reparto=str(row[4] or ""),
+                    categoria=str(row[5] or ""),
+                    tipologia=str(row[6] or ""),
+                    giac=giac,
+                    con=con,
+                    ven=ven,
+                    perc_ven=((ven / con) * 100.0) if con else 0.0,
+                )
+                article.source_files.add("manual_code_db_fallback")
+                supplements[_catalog_key("", code)] = article
+                price_lookup[_catalog_key("", code)] = {
+                    "prezzo_listino": None if row[9] is None else float(row[9]),
+                    "prezzo_saldo": None if row[10] is None else float(row[10]),
+                }
+
+    existing_by_code: Dict[str, List[Tuple[str, Article]]] = {}
+    for key, article in existing_articles.items():
+        code = str(article.code or "").strip().upper().replace(" ", "")
+        if not code:
+            continue
+        existing_by_code.setdefault(code, []).append((key, article))
+
+    for supplement_key, supplement_article in list(supplements.items()):
+        target_prices = dict(price_lookup.get(supplement_key, {}))
+        target_score = _article_metadata_score(supplement_article, target_prices)
+        alias_candidates = _extract_alias_codes_from_description(
+            supplement_article.description,
+            current_code=supplement_article.code,
+        )
+        if not alias_candidates:
+            continue
+
+        best_article: Optional[Article] = None
+        best_prices: Optional[Mapping[str, Optional[float]]] = None
+        best_score = target_score
+
+        for alias_code in alias_candidates:
+            exact_candidates = list(existing_by_code.get(alias_code, []))
+            if not exact_candidates:
+                exact_candidates = [
+                    (key, article)
+                    for key, article in supplements.items()
+                    if str(article.code or "").strip().upper().replace(" ", "") == alias_code
+                    and key != supplement_key
+                ]
+            for candidate_key, candidate_article in exact_candidates:
+                candidate_prices = None
+                if existing_price_lookup and candidate_key in existing_price_lookup:
+                    candidate_prices = existing_price_lookup[candidate_key]
+                elif candidate_key in price_lookup:
+                    candidate_prices = price_lookup[candidate_key]
+                candidate_score = _article_metadata_score(candidate_article, candidate_prices)
+                if candidate_score <= best_score:
+                    continue
+                best_article = candidate_article
+                best_prices = candidate_prices
+                best_score = candidate_score
+
+        if best_article is None:
+            continue
+
+        enriched_article, enriched_prices, changed = _apply_alias_metadata(
+            supplement_article,
+            best_article,
+            target_prices=target_prices,
+            source_prices=best_prices,
+        )
+        if changed:
+            supplements[supplement_key] = enriched_article
+            price_lookup[supplement_key] = enriched_prices
+
+    unresolved = [code for code in missing_codes if code not in found_codes]
+    return supplements, price_lookup, unresolved
+
+
 def _filter_article_keys(
     articles: Mapping[str, Article],
     *,
@@ -268,12 +574,27 @@ def _filter_article_keys(
     reparti: Sequence[str],
     suppliers: Sequence[str],
     categories: Sequence[str],
+    brands: Sequence[str],
     manual_codes: Sequence[str],
 ) -> List[str]:
+    def _manual_article_preference(article: Article) -> Tuple[int, int, float, float, float]:
+        season = _normalize_season_label(str(article.season or article.season_code or ""))
+        year = int(season[:2]) if len(season) == 3 and season[:2].isdigit() else -1
+        suffix = season[2] if len(season) == 3 else ""
+        suffix_rank = {"G": 0, "Y": 1, "E": 2, "I": 3}.get(suffix, -1)
+        return (
+            year,
+            suffix_rank,
+            float(article.con or 0.0),
+            float(article.ven or 0.0),
+            float(article.giac or 0.0),
+        )
+
     season_filter = {str(x or "").strip().upper() for x in seasons if str(x or "").strip()}
     reparto_filter = {str(x or "").strip().lower() for x in reparti if str(x or "").strip()}
     supplier_filter = {str(x or "").strip().lower() for x in suppliers if str(x or "").strip()}
     category_filter = {str(x or "").strip().lower() for x in categories if str(x or "").strip()}
+    brand_filter = {str(x or "").strip().lower() for x in brands if str(x or "").strip()}
     manual_filter = {str(x or "").strip().upper().replace(" ", "") for x in manual_codes if str(x or "").strip()}
 
     keys: List[str] = []
@@ -286,16 +607,27 @@ def _filter_article_keys(
             continue
         if category_filter and str(article.categoria or "").strip().lower() not in category_filter:
             continue
+        if brand_filter and str(article.marchio or "").strip().lower() not in brand_filter:
+            continue
         if manual_filter and str(article.code or "").strip().upper() not in manual_filter:
             continue
         keys.append(key)
 
+    if manual_filter:
+        picked_by_code: Dict[str, str] = {}
+        for key in keys:
+            code = str(articles[key].code or "").strip().upper()
+            current = picked_by_code.get(code)
+            if current is None or _manual_article_preference(articles[key]) > _manual_article_preference(articles[current]):
+                picked_by_code[code] = key
+        keys = list(picked_by_code.values())
+
     keys.sort(
         key=lambda item: (
+            str(articles[item].code or "").upper(),
             str(articles[item].season or articles[item].season_code or "").upper(),
             str(articles[item].reparto or "").upper(),
             str(articles[item].categoria or "").upper(),
-            str(articles[item].code or "").upper(),
         )
     )
     return keys
@@ -590,12 +922,21 @@ def _suppliers_filename_piece(values: Sequence[str]) -> str:
     )
 
 
+def _brands_filename_piece(values: Sequence[str]) -> str:
+    return _selection_filename_piece(
+        values,
+        empty_label="tutti-marchi",
+        plural_label="marchi",
+    )
+
+
 def _build_catalog_download_filename(
     *,
     selected_seasons: Sequence[str],
     selected_reparti: Sequence[str],
     selected_suppliers: Sequence[str],
     selected_categories: Sequence[str],
+    selected_brands: Sequence[str],
     manual_codes_count: int,
     export_mode: str,
     job_id: str,
@@ -608,6 +949,7 @@ def _build_catalog_download_filename(
     reparto_piece = _reparti_filename_piece(selected_reparti)
     supplier_piece = _suppliers_filename_piece(selected_suppliers) if any(str(x).strip() for x in selected_suppliers) else ""
     category_piece = _categories_filename_piece(selected_categories)
+    brand_piece = _brands_filename_piece(selected_brands) if any(str(x).strip() for x in selected_brands) else ""
 
     parts = [
         "catalogo-barca",
@@ -615,6 +957,7 @@ def _build_catalog_download_filename(
         reparto_piece,
         supplier_piece,
         category_piece,
+        brand_piece,
     ]
     if int(manual_codes_count or 0) > 0:
         parts.append(f"{int(manual_codes_count)}-codici")
@@ -637,10 +980,12 @@ def export_catalog_showcase(
     selected_reparti: Sequence[str],
     selected_suppliers: Sequence[str],
     selected_categories: Sequence[str],
+    selected_brands: Sequence[str],
     manual_codes_text: str = "",
     photo_root: str = "",
     photo_position: str = "xl",
     allow_position_variants: bool = True,
+    jpg_layout: str = "minimal",
     source_run_id: Optional[str] = None,
     progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
@@ -663,12 +1008,32 @@ def export_catalog_showcase(
         )
 
     manual_codes = _parse_manual_codes(manual_codes_text)
+    if manual_codes:
+        supplement_articles, supplement_prices, unresolved_manual_codes = _load_manual_code_article_supplements(
+            manual_codes=manual_codes,
+            existing_articles=articles,
+            existing_price_lookup=price_lookup,
+        )
+        if supplement_articles:
+            articles = {**articles, **supplement_articles}
+            price_lookup = {**price_lookup, **supplement_prices}
+            extra_note = (
+                f"Aggiunti {len(supplement_articles)} articoli da anagrafica DB "
+                "per codici manuali non presenti nel catalogo corrente."
+            )
+            article_source_note = f"{article_source_note} {extra_note}".strip()
+        if unresolved_manual_codes:
+            extra_note = (
+                f"Codici manuali non trovati nel DB: {len(unresolved_manual_codes)}."
+            )
+            article_source_note = f"{article_source_note} {extra_note}".strip()
     requested_keys = _filter_article_keys(
         articles,
         seasons=selected_seasons,
         reparti=selected_reparti,
         suppliers=selected_suppliers,
         categories=selected_categories,
+        brands=selected_brands,
         manual_codes=manual_codes,
     )
     if not requested_keys:
@@ -733,6 +1098,8 @@ def export_catalog_showcase(
         title_parts.append("Fornitori: " + ", ".join(sorted({str(x).strip() for x in selected_suppliers if str(x).strip()})))
     if selected_categories:
         title_parts.append("Categorie: " + ", ".join(sorted({str(x).strip().upper() for x in selected_categories if str(x).strip()})))
+    if selected_brands:
+        title_parts.append("Marchi: " + ", ".join(sorted({str(x).strip() for x in selected_brands if str(x).strip()})))
     if manual_codes:
         title_parts.append(f"Codici manuali: {len(manual_codes)}")
 
@@ -787,6 +1154,7 @@ def export_catalog_showcase(
         fetch_remote_bytes=fetch_image_bytes if use_web else None,
         title=title,
         price_lookup=price_lookup,
+        jpg_layout=jpg_layout,
         progress_cb=_forward_export_progress,
     )
 
@@ -852,6 +1220,7 @@ def export_catalog_showcase(
             "selected_reparti": [str(x) for x in selected_reparti],
             "selected_suppliers": [str(x) for x in selected_suppliers],
             "selected_categories": [str(x) for x in selected_categories],
+            "selected_brands": [str(x) for x in selected_brands],
             "manual_codes_count": len(manual_codes),
         },
         "download_filename": _build_catalog_download_filename(
@@ -859,6 +1228,7 @@ def export_catalog_showcase(
             selected_reparti=selected_reparti,
             selected_suppliers=selected_suppliers,
             selected_categories=selected_categories,
+            selected_brands=selected_brands,
             manual_codes_count=len(manual_codes),
             export_mode=str(export_mode or "both").strip().lower() or "both",
             job_id=job_id,
@@ -866,6 +1236,7 @@ def export_catalog_showcase(
         "photo_root": str(photo_root_path) if photo_root_path else "",
         "photo_position": str(photo_position or "xl"),
         "allow_position_variants": bool(allow_position_variants),
+        "jpg_layout": str(jpg_layout or "minimal").strip().lower() or "minimal",
         "local_index_summary": local_index_summary,
         "local_index_signature": local_index_signature,
         "zip_path": str(paths["zip_path"]),

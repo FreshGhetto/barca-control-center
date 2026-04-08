@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional
 import pandas as pd
 
 from db_sync import get_db_dsn
+from reparto_sizes import SUPPORTED_SIZES
 
 try:
     import psycopg
@@ -71,8 +72,42 @@ def export_latest_clean_inputs_from_db(
     Export clean_sales/clean_articles from the latest DB run (or explicit run_id)
     so the allocator pipeline can run with DB as primary source.
     """
+    payload = load_latest_clean_inputs_from_db(source_run_id=source_run_id, verbose=verbose)
+
+    clean_sales_csv.parent.mkdir(parents=True, exist_ok=True)
+    clean_stock_csv.parent.mkdir(parents=True, exist_ok=True)
+    payload["sales_df"].to_csv(clean_sales_csv, index=False)
+    payload["stock_df"].to_csv(clean_stock_csv, index=False)
+
+    summary = {
+        "source_run_id": payload["source_run_id"],
+        "sales_rows": int(len(payload["sales_df"])),
+        "stock_rows": int(len(payload["stock_df"])),
+        "clean_sales_csv": str(clean_sales_csv),
+        "clean_stock_csv": str(clean_stock_csv),
+    }
+    if verbose:
+        print(
+            f"[DB-SOURCE] run_id={payload['source_run_id']} -> sales={len(payload['sales_df'])} righe, "
+            f"stock={len(payload['stock_df'])} righe"
+        )
+    return summary
+
+
+def load_latest_clean_inputs_from_db(
+    *,
+    source_run_id: Optional[str] = None,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    Load clean_sales/clean_articles from the latest DB run (or explicit run_id)
+    returning in-memory DataFrames so runtime logic does not depend on CSV files.
+    """
     _require_psycopg()
     dsn = get_db_dsn()
+    size_select_sql = ",\n              ".join(
+        [f'fs.size_{size} AS "Size_{size}"' for size in SUPPORTED_SIZES]
+    )
 
     with psycopg.connect(dsn) as conn:
         run_id = _pick_source_run_id(conn, source_run_id)
@@ -108,20 +143,17 @@ def export_latest_clean_inputs_from_db(
               fs.snapshot_at,
               fs.article_code AS "Article",
               COALESCE(da.description, '') AS "Description",
+              COALESCE(da.reparto, '') AS "Reparto",
               fs.shop_code AS "Shop",
               fs.ricevuto AS "Ricevuto",
               fs.giacenza AS "Giacenza",
               fs.consegnato AS "Consegnato",
               fs.venduto AS "Venduto",
               fs.sellout_percent AS "Sellout_Percent",
-              fs.size_35 AS "Size_35",
-              fs.size_36 AS "Size_36",
-              fs.size_37 AS "Size_37",
-              fs.size_38 AS "Size_38",
-              fs.size_39 AS "Size_39",
-              fs.size_40 AS "Size_40",
-              fs.size_41 AS "Size_41",
-              fs.size_42 AS "Size_42",
+              """
+            + size_select_sql
+            + """
+              ,
               fs.valore_giac AS "Valore_Giac"
             FROM fact_stock_snapshot fs
             LEFT JOIN dim_article da ON da.article_code = fs.article_code
@@ -131,22 +163,16 @@ def export_latest_clean_inputs_from_db(
             (run_id,),
         )
 
-    clean_sales_csv.parent.mkdir(parents=True, exist_ok=True)
-    clean_stock_csv.parent.mkdir(parents=True, exist_ok=True)
-    sales_df.to_csv(clean_sales_csv, index=False)
-    stock_df.to_csv(clean_stock_csv, index=False)
-
-    summary = {
+    payload = {
         "source_run_id": run_id,
         "sales_rows": int(len(sales_df)),
         "stock_rows": int(len(stock_df)),
-        "clean_sales_csv": str(clean_sales_csv),
-        "clean_stock_csv": str(clean_stock_csv),
+        "sales_df": sales_df,
+        "stock_df": stock_df,
     }
     if verbose:
         print(
             f"[DB-SOURCE] run_id={run_id} -> sales={len(sales_df)} righe, "
             f"stock={len(stock_df)} righe"
         )
-    return summary
-
+    return payload

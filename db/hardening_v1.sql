@@ -128,6 +128,23 @@ END $$;
 
 DO $$
 BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_feature_signal_nonneg') THEN
+        ALTER TABLE public.fact_feature_state
+            ADD CONSTRAINT chk_feature_signal_nonneg
+            CHECK (
+                (observed_sales_signal IS NULL OR observed_sales_signal >= 0) AND
+                (stock_depth IS NULL OR stock_depth >= 0) AND
+                (shop_priority_rank IS NULL OR shop_priority_rank >= 0) AND
+                (missing_core_sizes IS NULL OR missing_core_sizes >= 0) AND
+                (core_size_coverage_ratio IS NULL OR (core_size_coverage_ratio >= 0 AND core_size_coverage_ratio <= 1)) AND
+                (destination_priority_score IS NULL OR destination_priority_score >= 0) AND
+                (source_priority_score IS NULL OR source_priority_score >= 0)
+            ) NOT VALID;
+    END IF;
+END $$;
+
+DO $$
+BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_order_forecast_nonneg') THEN
         ALTER TABLE public.fact_order_forecast
             ADD CONSTRAINT chk_order_forecast_nonneg

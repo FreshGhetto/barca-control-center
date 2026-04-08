@@ -38,6 +38,7 @@ from catalog_showcase_service import (
     list_catalog_showcase_results,
 )
 from db_sync import get_db_dsn
+from reparto_sizes import SUPPORTED_SIZES, required_core_sizes
 
 try:
     import psycopg
@@ -53,6 +54,7 @@ DEFAULT_UI_SETTINGS = {
     "developer_mode": False,
     "catalog_photo_root": "",
 }
+DASHBOARD_SIZES = list(SUPPORTED_SIZES)
 
 OUTPUT_FILES = [
     "clean_sales.csv",
@@ -63,6 +65,8 @@ OUTPUT_FILES = [
     "shipment_plan.csv",
     "shipment_summary.csv",
     "features_after.csv",
+    "article_shop_signals.csv",
+    "stock_integrity_report.csv",
     "demand_diagnostics.csv",
     "qa_report.json",
     "orders/orders_summary.json",
@@ -70,7 +74,19 @@ OUTPUT_FILES = [
 ]
 
 DASHBOARD_TABLE_COLUMNS: Dict[str, List[str]] = {
-    "transfer_proposals": ["article_code", "size", "from_shop_code", "to_shop_code", "reason", "qty"],
+    "transfer_proposals": [
+        "article_code",
+        "size",
+        "from_shop_code",
+        "from_observed_sales_signal",
+        "from_zero_sales_source_candidate",
+        "to_shop_code",
+        "to_observed_sales_signal",
+        "to_missing_core_sizes",
+        "to_destination_priority_score",
+        "reason",
+        "qty",
+    ],
     "order_proposals": [
         "module",
         "season_code",
@@ -151,6 +167,7 @@ def _friendly_run_type(run_type: Optional[str]) -> str:
         "manual_sync": "Sincronizzazione database",
         "app_pipeline_ui": "Avvio manuale da console",
         "catalog_import": "Import catalogo",
+        "detail_history_sync": "Arricchimento dettagli articoli",
     }
     return mapping.get(rt, str(run_type or "Run"))
 
@@ -518,10 +535,12 @@ class CatalogShowcasePayload(BaseModel):
     selected_reparti: List[str] = Field(default_factory=list)
     selected_suppliers: List[str] = Field(default_factory=list)
     selected_categories: List[str] = Field(default_factory=list)
+    selected_brands: List[str] = Field(default_factory=list)
     manual_codes_text: str = ""
     photo_root: Optional[str] = None
     photo_position: str = "xl"
     allow_position_variants: bool = True
+    jpg_layout: str = "minimal"
 
 
 @dataclass
@@ -619,6 +638,7 @@ class CatalogShowcaseJob:
     job_id: str
     created_at: str
     export_mode: str
+    jpg_layout: str
     primary_source: str
     allow_fallback: bool
     photo_position: str
@@ -657,6 +677,7 @@ class CatalogShowcaseJob:
             "started_at": self.started_at,
             "ended_at": self.ended_at,
             "export_mode": self.export_mode,
+            "jpg_layout": self.jpg_layout,
             "primary_source": self.primary_source,
             "allow_fallback": bool(self.allow_fallback),
             "photo_position": self.photo_position,
@@ -787,14 +808,12 @@ class RunManager:
             if value is not None and str(value).strip():
                 cmd.extend([flag, str(value)])
 
-        add_flag("--source-db", bool(opts.get("source_db")))
+        # Operational runs are DB-only: never fall back to CSV/file inputs.
+        add_flag("--source-db", True)
         add_opt("--source-db-run-id", opts.get("source_db_run_id"))
-        add_flag("--skip-ingest", bool(opts.get("skip_ingest")))
-        add_opt("--incoming-root", opts.get("incoming_root"))
-        add_flag("--keep-incoming", bool(opts.get("keep_incoming")))
+        add_flag("--skip-ingest", True)
         add_flag("--skip-orders", bool(opts.get("skip_orders")))
-        add_opt("--orders-root", opts.get("orders_root"))
-        add_flag("--orders-source-db", bool(opts.get("orders_source_db")))
+        add_flag("--orders-source-db", not bool(opts.get("skip_orders")))
         add_opt("--orders-source-db-run-id", opts.get("orders_source_db_run_id"))
         add_flag("--orders-math-only", bool(opts.get("orders_math_only")))
         if opts.get("orders_coverage") is not None:
@@ -1086,6 +1105,7 @@ class CatalogShowcaseManager:
             job_id=job_id,
             created_at=generated_at,
             export_mode=str(summary.get("export_mode") or "both"),
+            jpg_layout=str(summary.get("jpg_layout") or "minimal"),
             primary_source="web" if source_mode.startswith("web") else "local",
             allow_fallback=source_mode in {"local_then_web", "web_then_local"},
             photo_position=str(summary.get("photo_position") or "xl"),
@@ -1095,6 +1115,7 @@ class CatalogShowcaseManager:
                 "selected_reparti": [str(x) for x in (filters_raw.get("selected_reparti") or [])],
                 "selected_suppliers": [str(x) for x in (filters_raw.get("selected_suppliers") or [])],
                 "selected_categories": [str(x) for x in (filters_raw.get("selected_categories") or [])],
+                "selected_brands": [str(x) for x in (filters_raw.get("selected_brands") or [])],
                 "manual_codes_text": "",
             },
             status="success",
@@ -1179,10 +1200,12 @@ class CatalogShowcaseManager:
                 selected_reparti=list(options.get("selected_reparti") or []),
                 selected_suppliers=list(options.get("selected_suppliers") or []),
                 selected_categories=list(options.get("selected_categories") or []),
+                selected_brands=list(options.get("selected_brands") or []),
                 manual_codes_text=str(options.get("manual_codes_text") or ""),
                 photo_root=str(options.get("photo_root") or ""),
                 photo_position=str(options.get("photo_position") or "xl"),
                 allow_position_variants=bool(options.get("allow_position_variants", True)),
+                jpg_layout=str(options.get("jpg_layout") or "minimal"),
                 source_run_id=options.get("run_id"),
                 progress_cb=lambda payload: self._set_progress(job_id, payload),
             )
@@ -1226,12 +1249,14 @@ class CatalogShowcaseManager:
                 "selected_reparti": [str(x) for x in (options.get("selected_reparti") or [])],
                 "selected_suppliers": [str(x) for x in (options.get("selected_suppliers") or [])],
                 "selected_categories": [str(x) for x in (options.get("selected_categories") or [])],
+                "selected_brands": [str(x) for x in (options.get("selected_brands") or [])],
                 "manual_codes_text": str(options.get("manual_codes_text") or ""),
             }
             job = CatalogShowcaseJob(
                 job_id=datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8],
                 created_at=_now_iso(),
                 export_mode=str(options.get("export_mode") or "both"),
+                jpg_layout=str(options.get("jpg_layout") or "minimal"),
                 primary_source=str(options.get("primary_source") or "local"),
                 allow_fallback=bool(options.get("allow_fallback")),
                 photo_position=str(options.get("photo_position") or "xl"),
@@ -1848,6 +1873,19 @@ def _fetch_chart_rows(cur) -> List[Dict[str, Any]]:
     return out
 
 
+def _dashboard_required_sizes(fascia: Any, reparto: Any = None) -> List[int]:
+    return required_core_sizes(fascia, reparto=reparto, available_sizes=DASHBOARD_SIZES)
+
+
+def _dashboard_role_for_shop(shop_code: Optional[str]) -> str:
+    code = str(shop_code or "").strip().upper()
+    if code == "WEB":
+        return "ONLINE"
+    if code == "M4":
+        return "WAREHOUSE"
+    return "STORE"
+
+
 def _run_business_context(metadata: Optional[Dict[str, Any]], run_type: Optional[str]) -> Dict[str, Any]:
     md = metadata if isinstance(metadata, dict) else {}
     orders_jobs = md.get("orders_jobs") if isinstance(md.get("orders_jobs"), list) else []
@@ -2149,6 +2187,269 @@ def _dashboard_payload(run_id: Optional[str], table_limit: int = 30) -> Dict[str
     except Exception as exc:
         return {"connected": False, "reason": str(exc)}
 
+    return _dashboard_summary_payload(dsn=dsn, run_id=run_id, table_limit=table_limit)
+
+
+def _dashboard_article_detail_payload(run_id: Optional[str], article_code: Optional[str]) -> Dict[str, Any]:
+    if psycopg is None:
+        return {"connected": False, "reason": "psycopg non installato"}
+
+    article = _clean_text(article_code)
+    if not article:
+        return {"connected": True, "run": None, "article": None, "reason": "Articolo non specificato"}
+
+    try:
+        dsn = get_db_dsn()
+    except Exception as exc:
+        return {"connected": False, "reason": str(exc)}
+
+    return _dashboard_article_detail_payload_from_db(dsn=dsn, run_id=run_id, article=article)
+
+
+def _dashboard_article_detail_payload_from_db(
+    dsn: str,
+    run_id: Optional[str],
+    article: str,
+) -> Dict[str, Any]:
+    try:
+        with psycopg.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                run = _resolve_dashboard_run(cur, run_id)
+                if run is None:
+                    return {
+                        "connected": True,
+                        "run": None,
+                        "article": None,
+                        "reason": "Nessuna run disponibile",
+                    }
+
+                rid = run["run_id"]
+                cur.execute(
+                    """
+                    SELECT COALESCE(description, ''), COALESCE(reparto, '')
+                    FROM public.dim_article
+                    WHERE article_code = %s
+                    LIMIT 1
+                    """,
+                    (article,),
+                )
+                article_desc_row = cur.fetchone()
+                article_description = str(article_desc_row[0] or "") if article_desc_row else ""
+                article_reparto = str(article_desc_row[1] or "") if article_desc_row else ""
+                size_select_sql = ",\n                      ".join(
+                    [
+                        f"COALESCE(fs.size_{size}, 0) AS before_size_{size}, "
+                        f"COALESCE(ff.size_{size}, fs.size_{size}, 0) AS after_size_{size}"
+                        for size in DASHBOARD_SIZES
+                    ]
+                )
+
+                cur.execute(
+                    """
+                    WITH transfer_shops AS (
+                        SELECT from_shop_code AS shop_code
+                        FROM public.fact_transfer_suggestion
+                        WHERE run_id = %s::uuid
+                          AND article_code = %s
+                        UNION
+                        SELECT to_shop_code AS shop_code
+                        FROM public.fact_transfer_suggestion
+                        WHERE run_id = %s::uuid
+                          AND article_code = %s
+                    ),
+                    shops AS (
+                        SELECT shop_code
+                        FROM public.fact_stock_snapshot
+                        WHERE run_id = %s::uuid
+                          AND article_code = %s
+                        UNION
+                        SELECT shop_code
+                        FROM public.fact_feature_state
+                        WHERE run_id = %s::uuid
+                          AND article_code = %s
+                        UNION
+                        SELECT shop_code FROM transfer_shops
+                    )
+                    SELECT
+                      s.shop_code,
+                      COALESCE(ff.fascia, ds.fascia) AS fascia,
+                      COALESCE(ff.role, CASE WHEN s.shop_code = 'WEB' THEN 'ONLINE' WHEN s.shop_code = 'M4' THEN 'WAREHOUSE' ELSE 'STORE' END) AS role,
+                      COALESCE(ff.is_outlet, FALSE) AS is_outlet,
+                      COALESCE(ff.observed_sales_signal, 0) AS observed_sales_signal,
+                      COALESCE(ff.missing_core_sizes, 0) AS missing_core_sizes,
+                      COALESCE(ff.destination_priority_score, 0) AS destination_priority_score,
+                      COALESCE(ff.source_priority_score, 0) AS source_priority_score,
+                      COALESCE(ff.demand_hybrid, 0) AS demand_hybrid,
+                      COALESCE(fs.giacenza, 0) AS before_total,
+                      COALESCE(ff.stock_after, fs.giacenza, 0) AS after_total,
+                      """
+                    + size_select_sql
+                    + """
+                    FROM shops s
+                    LEFT JOIN public.fact_stock_snapshot fs
+                      ON fs.run_id = %s::uuid
+                     AND fs.article_code = %s
+                     AND fs.shop_code = s.shop_code
+                    LEFT JOIN public.fact_feature_state ff
+                      ON ff.run_id = %s::uuid
+                     AND ff.article_code = %s
+                     AND ff.shop_code = s.shop_code
+                    LEFT JOIN public.dim_shop ds
+                      ON ds.shop_code = s.shop_code
+                    ORDER BY COALESCE(ff.fascia, ds.fascia, 99), s.shop_code
+                    """,
+                    (rid, article, rid, article, rid, article, rid, article, rid, article, rid, article),
+                )
+                shop_rows_raw = _fetch_dict_rows(cur)
+
+                cur.execute(
+                    """
+                    SELECT
+                      t.article_code,
+                      t.size,
+                      t.from_shop_code,
+                      t.to_shop_code,
+                      COALESCE(t.reason, '') AS reason,
+                      t.qty
+                    FROM public.fact_transfer_suggestion t
+                    WHERE t.run_id = %s::uuid
+                      AND t.article_code = %s
+                    ORDER BY t.size ASC, t.from_shop_code ASC, t.to_shop_code ASC, t.reason ASC
+                    """,
+                    (rid, article),
+                )
+                movement_rows = _fetch_dict_rows(cur)
+
+        if not shop_rows_raw and not movement_rows:
+            return {
+                "connected": True,
+                "run": run,
+                "article": None,
+                "reason": f"Nessun dato per articolo {article}",
+            }
+
+        inbound_by_shop_size: Dict[tuple[str, int], float] = {}
+        outbound_by_shop_size: Dict[tuple[str, int], float] = {}
+        moved_qty_total = 0.0
+        for move in movement_rows:
+            size = int(_to_float(move.get("size")) or 0)
+            qty = _to_float(move.get("qty"))
+            from_shop = str(move.get("from_shop_code") or "").strip().upper()
+            to_shop = str(move.get("to_shop_code") or "").strip().upper()
+            if size <= 0 or qty <= 0:
+                continue
+            moved_qty_total += qty
+            outbound_by_shop_size[(from_shop, size)] = outbound_by_shop_size.get((from_shop, size), 0.0) + qty
+            inbound_by_shop_size[(to_shop, size)] = inbound_by_shop_size.get((to_shop, size), 0.0) + qty
+
+        shop_rows: List[Dict[str, Any]] = []
+        total_before = 0.0
+        total_after = 0.0
+        donor_shops = set()
+        receiver_shops = set()
+        outlet_qty = 0.0
+        reasons_map: Dict[str, float] = {}
+
+        for move in movement_rows:
+            donor_shops.add(str(move.get("from_shop_code") or "").strip().upper())
+            receiver_shops.add(str(move.get("to_shop_code") or "").strip().upper())
+            reason = str(move.get("reason") or "n/a")
+            qty = _to_float(move.get("qty"))
+            reasons_map[reason] = reasons_map.get(reason, 0.0) + qty
+            to_shop = str(move.get("to_shop_code") or "").strip().upper()
+            if to_shop:
+                matching = next((row for row in shop_rows_raw if str(row.get("shop_code") or "").strip().upper() == to_shop), None)
+                if matching and bool(matching.get("is_outlet")):
+                    outlet_qty += qty
+
+        for raw in shop_rows_raw:
+            shop_code = str(raw.get("shop_code") or "").strip().upper()
+            fascia = raw.get("fascia")
+            role = str(raw.get("role") or _dashboard_role_for_shop(shop_code))
+            before_total = _to_float(raw.get("before_total"))
+            after_total_row = _to_float(raw.get("after_total"))
+            demand_hybrid = _to_float(raw.get("demand_hybrid"))
+            observed_sales_signal = _to_float(raw.get("observed_sales_signal"))
+            missing_core_sizes = int(_to_float(raw.get("missing_core_sizes")) or 0)
+            inbound_total = 0.0
+            outbound_total = 0.0
+            required_sizes = set(_dashboard_required_sizes(fascia, reparto=article_reparto))
+            size_cells: List[Dict[str, Any]] = []
+
+            for size in DASHBOARD_SIZES:
+                before_qty = _to_float(raw.get(f"before_size_{size}"))
+                after_qty = _to_float(raw.get(f"after_size_{size}"))
+                inbound_qty = inbound_by_shop_size.get((shop_code, size), 0.0)
+                outbound_qty = outbound_by_shop_size.get((shop_code, size), 0.0)
+                inbound_total += inbound_qty
+                outbound_total += outbound_qty
+                size_cells.append(
+                    {
+                        "size": size,
+                        "before_qty": before_qty,
+                        "inbound_qty": inbound_qty,
+                        "outbound_qty": outbound_qty,
+                        "after_qty": after_qty,
+                        "delta_qty": after_qty - before_qty,
+                        "duplicate_before": max(0.0, before_qty - 1.0),
+                        "missing_after": bool(size in required_sizes and after_qty <= 0.0),
+                    }
+                )
+
+            total_before += before_total
+            total_after += after_total_row
+            shop_rows.append(
+                {
+                    "shop_code": shop_code,
+                    "fascia": fascia,
+                    "role": role,
+                    "is_outlet": bool(raw.get("is_outlet")),
+                    "observed_sales_signal": observed_sales_signal,
+                    "missing_core_sizes": missing_core_sizes,
+                    "destination_priority_score": _to_float(raw.get("destination_priority_score")),
+                    "source_priority_score": _to_float(raw.get("source_priority_score")),
+                    "demand_hybrid": demand_hybrid,
+                    "before_total": before_total,
+                    "inbound_total": inbound_total,
+                    "outbound_total": outbound_total,
+                    "after_total": after_total_row,
+                    "deficit_after": max(0.0, demand_hybrid - after_total_row),
+                    "size_cells": size_cells,
+                }
+            )
+
+        reasons = [
+            {"reason": reason, "qty": qty}
+            for reason, qty in sorted(reasons_map.items(), key=lambda item: item[1], reverse=True)
+        ]
+
+        article_payload = {
+                "article_code": article,
+                "description": article_description,
+                "reparto": article_reparto,
+                "total_before": total_before,
+            "total_after": total_after,
+            "moved_qty_total": moved_qty_total,
+            "donor_shops": int(len({s for s in donor_shops if s})),
+            "receiver_shops": int(len({s for s in receiver_shops if s})),
+            "outlet_qty": outlet_qty,
+            "movement_rows": int(len(movement_rows)),
+            "shop_rows": int(len(shop_rows)),
+            "reasons": reasons,
+        }
+        return {
+            "connected": True,
+            "run": run,
+            "article": article_payload,
+            "movements": movement_rows,
+            "shop_rows": shop_rows,
+            "sizes": DASHBOARD_SIZES,
+        }
+    except Exception as exc:
+        return {"connected": False, "reason": str(exc)}
+
+
+def _dashboard_summary_payload(dsn: str, run_id: Optional[str], table_limit: int) -> Dict[str, Any]:
     try:
         with psycopg.connect(dsn) as conn:
             with conn.cursor() as cur:
@@ -2354,9 +2655,28 @@ def _dashboard_payload(run_id: Optional[str], table_limit: int = 30) -> Dict[str
 
                 cur.execute(
                     """
-                    SELECT article_code, size, from_shop_code, to_shop_code, COALESCE(reason, '') AS reason, qty
-                    FROM public.fact_transfer_suggestion
-                    WHERE run_id = %s::uuid
+                    SELECT
+                      t.article_code,
+                      t.size,
+                      t.from_shop_code,
+                      ff.observed_sales_signal AS from_observed_sales_signal,
+                      ff.zero_sales_source_candidate AS from_zero_sales_source_candidate,
+                      t.to_shop_code,
+                      tf.observed_sales_signal AS to_observed_sales_signal,
+                      tf.missing_core_sizes AS to_missing_core_sizes,
+                      tf.destination_priority_score AS to_destination_priority_score,
+                      COALESCE(t.reason, '') AS reason,
+                      t.qty
+                    FROM public.fact_transfer_suggestion t
+                    LEFT JOIN public.fact_feature_state ff
+                      ON ff.run_id = t.run_id
+                     AND ff.article_code = t.article_code
+                     AND ff.shop_code = t.from_shop_code
+                    LEFT JOIN public.fact_feature_state tf
+                      ON tf.run_id = t.run_id
+                     AND tf.article_code = t.article_code
+                     AND tf.shop_code = t.to_shop_code
+                    WHERE t.run_id = %s::uuid
                     ORDER BY qty DESC, article_code ASC
                     LIMIT %s
                     """,
@@ -2832,10 +3152,12 @@ def api_catalog_showcase_start_job(payload: CatalogShowcasePayload):
                 "selected_reparti": payload.selected_reparti,
                 "selected_suppliers": payload.selected_suppliers,
                 "selected_categories": payload.selected_categories,
+                "selected_brands": payload.selected_brands,
                 "manual_codes_text": payload.manual_codes_text,
                 "photo_root": photo_root,
                 "photo_position": payload.photo_position,
                 "allow_position_variants": bool(payload.allow_position_variants),
+                "jpg_layout": payload.jpg_layout,
             }
         )
         return {"ok": True, "job": job.to_public()}
@@ -2918,10 +3240,12 @@ def api_catalog_showcase_export(payload: CatalogShowcasePayload):
             selected_reparti=payload.selected_reparti,
             selected_suppliers=payload.selected_suppliers,
             selected_categories=payload.selected_categories,
+            selected_brands=payload.selected_brands,
             manual_codes_text=payload.manual_codes_text,
             photo_root=photo_root,
             photo_position=payload.photo_position,
             allow_position_variants=bool(payload.allow_position_variants),
+            jpg_layout=payload.jpg_layout,
             source_run_id=payload.run_id,
         )
     except Exception as exc:
@@ -3000,6 +3324,85 @@ def api_dashboard(
     table_limit: int = Query(default=30, ge=5, le=200),
 ):
     return _dashboard_payload(run_id=run_id, table_limit=table_limit)
+
+
+@app.get("/api/dashboard/article-detail")
+def api_dashboard_article_detail(
+    article_code: str = Query(...),
+    run_id: Optional[str] = Query(default=None),
+):
+    payload = _dashboard_article_detail_payload(run_id=run_id, article_code=article_code)
+    if not payload.get("connected", False):
+        raise HTTPException(status_code=409, detail=payload.get("reason") or "dashboard articolo non disponibile")
+    if not payload.get("article"):
+        raise HTTPException(status_code=404, detail=payload.get("reason") or "articolo non trovato")
+    return payload
+
+
+@app.get("/api/dashboard/article-detail/export")
+def api_dashboard_article_detail_export(
+    article_code: str = Query(...),
+    run_id: Optional[str] = Query(default=None),
+):
+    payload = _dashboard_article_detail_payload(run_id=run_id, article_code=article_code)
+    if not payload.get("connected", False):
+        raise HTTPException(status_code=409, detail=payload.get("reason") or "dashboard articolo non disponibile")
+    article = payload.get("article")
+    if not article:
+        raise HTTPException(status_code=404, detail=payload.get("reason") or "articolo non trovato")
+
+    try:
+        import pandas as pd
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Export Excel non disponibile: {exc}")
+
+    summary_df = pd.DataFrame([article])
+    movements_df = pd.DataFrame(payload.get("movements") or [])
+    matrix_rows = []
+    for row in payload.get("shop_rows") or []:
+        item = {
+            "shop_code": row.get("shop_code"),
+            "fascia": row.get("fascia"),
+            "role": row.get("role"),
+            "is_outlet": row.get("is_outlet"),
+            "observed_sales_signal": row.get("observed_sales_signal"),
+            "missing_core_sizes": row.get("missing_core_sizes"),
+            "destination_priority_score": row.get("destination_priority_score"),
+            "source_priority_score": row.get("source_priority_score"),
+            "demand_hybrid": row.get("demand_hybrid"),
+            "before_total": row.get("before_total"),
+            "inbound_total": row.get("inbound_total"),
+            "outbound_total": row.get("outbound_total"),
+            "after_total": row.get("after_total"),
+            "deficit_after": row.get("deficit_after"),
+        }
+        for cell in row.get("size_cells") or []:
+            size = cell.get("size")
+            item[f"size_{size}_before"] = cell.get("before_qty")
+            item[f"size_{size}_in"] = cell.get("inbound_qty")
+            item[f"size_{size}_out"] = cell.get("outbound_qty")
+            item[f"size_{size}_after"] = cell.get("after_qty")
+            item[f"size_{size}_gap"] = cell.get("missing_after")
+        matrix_rows.append(item)
+    matrix_df = pd.DataFrame(matrix_rows)
+
+    run_short = str((payload.get("run") or {}).get("run_id") or "na")[:8]
+    article_code_safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(article.get("article_code") or "article")).strip("_") or "article"
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"barca_article_{article_code_safe}_{run_short}_{ts}.xlsx"
+
+    out_xlsx = io.BytesIO()
+    with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
+        summary_df.to_excel(writer, index=False, sheet_name="riepilogo")
+        movements_df.to_excel(writer, index=False, sheet_name="movimenti")
+        matrix_df.to_excel(writer, index=False, sheet_name="matrice")
+    out_xlsx.seek(0)
+
+    return StreamingResponse(
+        out_xlsx,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.get("/api/dashboard/export")

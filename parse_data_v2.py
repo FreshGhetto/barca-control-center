@@ -3,6 +3,7 @@ import csv
 import re
 from pathlib import Path
 import pandas as pd
+from reparto_sizes import SUPPORTED_SIZES, infer_reparto_from_path, infer_reparto_from_values
 
 VALID_CODES_DEFAULT = [
     'AR','AU','BO','BS','CA','CO','EU','EU2','LN','MC','MI',
@@ -10,7 +11,9 @@ VALID_CODES_DEFAULT = [
     'TV','VR','WEB','W','M4','MR','MP','SP'
 ]
 
-ARTICLE_CODE_RE = re.compile(r'^\d{2}/\S+')
+# Accept article prefixes wider than two digits to avoid cutting seasonal code variants.
+ARTICLE_CODE_RE = re.compile(r'^\d{1,3}/\S+')
+SIZE_LABEL_RE = re.compile(r'^\d{2}$')
 
 def clean_number(s):
     """Italian number format: 1.234,56 -> 1234.56. Also handles blanks and '-'."""
@@ -157,6 +160,27 @@ def _find_article_shop_block_in_stock_row(row, valid_codes):
     _, aidx, article, sidx, shop = candidates[0]
     return aidx, article, sidx, shop
 
+
+def _detect_stock_size_labels(rows):
+    for row in rows:
+        upper_row = [str(cell or '').strip().upper() for cell in row]
+        if 'NEG' not in upper_row or 'GIAC' not in upper_row or 'VEN' not in upper_row:
+            continue
+        labels = []
+        for cell in row:
+            text = str(cell or '').strip()
+            if not SIZE_LABEL_RE.match(text):
+                continue
+            try:
+                size = int(text)
+            except Exception:
+                continue
+            if size in SUPPORTED_SIZES and size not in labels:
+                labels.append(size)
+        if labels:
+            return labels
+    return [35, 36, 37, 38, 39, 40, 41, 42]
+
 def parse_sales(filepath, output_path, valid_codes=None, snapshot_at=None):
     """
     Parses "ANALISI ARTICOLI" export.
@@ -263,43 +287,49 @@ def parse_articles(filepath, output_path, valid_codes=None, snapshot_at=None):
     Expected cols: Article in 16, Desc in 17, Shop in 18, metrics 19.. and sizes 24..
     """
     valid_codes = set(valid_codes or VALID_CODES_DEFAULT)
+    with open(filepath, 'r', encoding='latin1', errors='ignore') as f:
+        all_rows = list(csv.reader(f))
+
+    size_labels = _detect_stock_size_labels(all_rows[:120])
+    reparto = infer_reparto_from_path(filepath)
+    if not reparto:
+        for row in all_rows[:40]:
+            reparto = infer_reparto_from_values(row)
+            if reparto:
+                break
 
     rows = []
-    with open(filepath, 'r', encoding='latin1', errors='ignore') as f:
-        reader = csv.reader(f)
-        for i, row in enumerate(reader):
-            if i == 0:
-                continue
-            if not row or len(row) < 20:
-                continue
+    for i, row in enumerate(all_rows):
+        if i == 0:
+            continue
+        if not row or len(row) < 20:
+            continue
 
-            art_idx, article, shop_idx, shop = _find_article_shop_block_in_stock_row(row, valid_codes)
-            if not article or art_idx is None or shop_idx is None:
-                continue
+        art_idx, article, shop_idx, shop = _find_article_shop_block_in_stock_row(row, valid_codes)
+        if not article or art_idx is None or shop_idx is None:
+            continue
 
-            desc = (row[art_idx + 1] or '').strip() if art_idx + 1 < len(row) else ''
-            m0 = shop_idx + 1
-            record = {
-                'snapshot_at': snapshot_at,
-                'Article': article,
-                'Description': desc,
-                'Shop': shop,
-                'Ricevuto': clean_non_negative(row[m0]) if len(row) > m0 else 0.0,
-                'Giacenza': clean_non_negative(row[m0 + 1]) if len(row) > m0 + 1 else 0.0,
-                'Consegnato': clean_non_negative(row[m0 + 2]) if len(row) > m0 + 2 else 0.0,
-                'Venduto': clean_non_negative(row[m0 + 3]) if len(row) > m0 + 3 else 0.0,
-                'Sellout_Percent': clean_number(row[m0 + 4]) if len(row) > m0 + 4 else 0.0,
-                'Size_35': clean_non_negative(row[m0 + 5]) if len(row) > m0 + 5 else 0.0,
-                'Size_36': clean_non_negative(row[m0 + 6]) if len(row) > m0 + 6 else 0.0,
-                'Size_37': clean_non_negative(row[m0 + 7]) if len(row) > m0 + 7 else 0.0,
-                'Size_38': clean_non_negative(row[m0 + 8]) if len(row) > m0 + 8 else 0.0,
-                'Size_39': clean_non_negative(row[m0 + 9]) if len(row) > m0 + 9 else 0.0,
-                'Size_40': clean_non_negative(row[m0 + 10]) if len(row) > m0 + 10 else 0.0,
-                'Size_41': clean_non_negative(row[m0 + 11]) if len(row) > m0 + 11 else 0.0,
-                'Size_42': clean_non_negative(row[m0 + 12]) if len(row) > m0 + 12 else 0.0,
-                'Valore_Giac': clean_non_negative(row[m0 + 13]) if len(row) > m0 + 13 else 0.0,
-            }
-            rows.append(record)
+        desc = (row[art_idx + 1] or '').strip() if art_idx + 1 < len(row) else ''
+        m0 = shop_idx + 1
+        record = {
+            'snapshot_at': snapshot_at,
+            'Article': article,
+            'Description': desc,
+            'Reparto': reparto or '',
+            'Shop': shop,
+            'Ricevuto': clean_non_negative(row[m0]) if len(row) > m0 else 0.0,
+            'Giacenza': clean_non_negative(row[m0 + 1]) if len(row) > m0 + 1 else 0.0,
+            'Consegnato': clean_non_negative(row[m0 + 2]) if len(row) > m0 + 2 else 0.0,
+            'Venduto': clean_non_negative(row[m0 + 3]) if len(row) > m0 + 3 else 0.0,
+            'Sellout_Percent': clean_number(row[m0 + 4]) if len(row) > m0 + 4 else 0.0,
+            'Valore_Giac': clean_non_negative(row[m0 + 5 + len(size_labels)]) if len(row) > m0 + 5 + len(size_labels) else 0.0,
+        }
+        for idx, size in enumerate(SUPPORTED_SIZES):
+            record[f'Size_{size}'] = 0.0
+        for offset, size in enumerate(size_labels):
+            idx = m0 + 5 + offset
+            record[f'Size_{size}'] = clean_non_negative(row[idx]) if len(row) > idx else 0.0
+        rows.append(record)
 
     df = pd.DataFrame(rows)
     if not df.empty:

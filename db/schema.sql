@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS dim_shop (
 CREATE TABLE IF NOT EXISTS dim_article (
     article_code TEXT PRIMARY KEY,
     description TEXT,
+    reparto TEXT,
     categoria TEXT,
     tipologia TEXT,
     marchio TEXT,
@@ -84,6 +85,12 @@ CREATE TABLE IF NOT EXISTS fact_stock_snapshot (
     size_40 NUMERIC(14, 2),
     size_41 NUMERIC(14, 2),
     size_42 NUMERIC(14, 2),
+    size_43 NUMERIC(14, 2),
+    size_44 NUMERIC(14, 2),
+    size_45 NUMERIC(14, 2),
+    size_46 NUMERIC(14, 2),
+    size_47 NUMERIC(14, 2),
+    size_48 NUMERIC(14, 2),
     valore_giac NUMERIC(14, 2),
     PRIMARY KEY (run_id, article_code, shop_code)
 );
@@ -114,6 +121,16 @@ CREATE TABLE IF NOT EXISTS fact_feature_state (
     demand_model_mode TEXT,
     demand_model_quality_r2 NUMERIC(10, 6),
     periodo_qty NUMERIC(14, 2),
+    observed_sales_signal NUMERIC(14, 2),
+    receiver_eligible_by_sales BOOLEAN,
+    stock_depth NUMERIC(14, 2),
+    shop_priority_rank INTEGER,
+    missing_core_sizes INTEGER,
+    core_size_coverage_ratio NUMERIC(10, 6),
+    low_stock_active_candidate BOOLEAN,
+    zero_sales_source_candidate BOOLEAN,
+    destination_priority_score NUMERIC(14, 4),
+    source_priority_score NUMERIC(14, 4),
     stock_after NUMERIC(14, 2),
     shop_capacity_pairs NUMERIC(14, 2),
     shop_capacity_target NUMERIC(14, 2),
@@ -133,8 +150,83 @@ CREATE TABLE IF NOT EXISTS fact_feature_state (
     size_40 NUMERIC(14, 2),
     size_41 NUMERIC(14, 2),
     size_42 NUMERIC(14, 2),
+    size_43 NUMERIC(14, 2),
+    size_44 NUMERIC(14, 2),
+    size_45 NUMERIC(14, 2),
+    size_46 NUMERIC(14, 2),
+    size_47 NUMERIC(14, 2),
+    size_48 NUMERIC(14, 2),
     PRIMARY KEY (run_id, article_code, shop_code)
 );
+
+ALTER TABLE IF EXISTS dim_article
+    ADD COLUMN IF NOT EXISTS reparto TEXT;
+
+ALTER TABLE IF EXISTS fact_stock_snapshot
+    ADD COLUMN IF NOT EXISTS size_43 NUMERIC(14, 2);
+
+ALTER TABLE IF EXISTS fact_stock_snapshot
+    ADD COLUMN IF NOT EXISTS size_44 NUMERIC(14, 2);
+
+ALTER TABLE IF EXISTS fact_stock_snapshot
+    ADD COLUMN IF NOT EXISTS size_45 NUMERIC(14, 2);
+
+ALTER TABLE IF EXISTS fact_stock_snapshot
+    ADD COLUMN IF NOT EXISTS size_46 NUMERIC(14, 2);
+
+ALTER TABLE IF EXISTS fact_stock_snapshot
+    ADD COLUMN IF NOT EXISTS size_47 NUMERIC(14, 2);
+
+ALTER TABLE IF EXISTS fact_stock_snapshot
+    ADD COLUMN IF NOT EXISTS size_48 NUMERIC(14, 2);
+
+ALTER TABLE IF EXISTS fact_feature_state
+    ADD COLUMN IF NOT EXISTS observed_sales_signal NUMERIC(14, 2);
+
+ALTER TABLE IF EXISTS fact_feature_state
+    ADD COLUMN IF NOT EXISTS receiver_eligible_by_sales BOOLEAN;
+
+ALTER TABLE IF EXISTS fact_feature_state
+    ADD COLUMN IF NOT EXISTS stock_depth NUMERIC(14, 2);
+
+ALTER TABLE IF EXISTS fact_feature_state
+    ADD COLUMN IF NOT EXISTS shop_priority_rank INTEGER;
+
+ALTER TABLE IF EXISTS fact_feature_state
+    ADD COLUMN IF NOT EXISTS missing_core_sizes INTEGER;
+
+ALTER TABLE IF EXISTS fact_feature_state
+    ADD COLUMN IF NOT EXISTS core_size_coverage_ratio NUMERIC(10, 6);
+
+ALTER TABLE IF EXISTS fact_feature_state
+    ADD COLUMN IF NOT EXISTS low_stock_active_candidate BOOLEAN;
+
+ALTER TABLE IF EXISTS fact_feature_state
+    ADD COLUMN IF NOT EXISTS zero_sales_source_candidate BOOLEAN;
+
+ALTER TABLE IF EXISTS fact_feature_state
+    ADD COLUMN IF NOT EXISTS destination_priority_score NUMERIC(14, 4);
+
+ALTER TABLE IF EXISTS fact_feature_state
+    ADD COLUMN IF NOT EXISTS source_priority_score NUMERIC(14, 4);
+
+ALTER TABLE IF EXISTS fact_feature_state
+    ADD COLUMN IF NOT EXISTS size_43 NUMERIC(14, 2);
+
+ALTER TABLE IF EXISTS fact_feature_state
+    ADD COLUMN IF NOT EXISTS size_44 NUMERIC(14, 2);
+
+ALTER TABLE IF EXISTS fact_feature_state
+    ADD COLUMN IF NOT EXISTS size_45 NUMERIC(14, 2);
+
+ALTER TABLE IF EXISTS fact_feature_state
+    ADD COLUMN IF NOT EXISTS size_46 NUMERIC(14, 2);
+
+ALTER TABLE IF EXISTS fact_feature_state
+    ADD COLUMN IF NOT EXISTS size_47 NUMERIC(14, 2);
+
+ALTER TABLE IF EXISTS fact_feature_state
+    ADD COLUMN IF NOT EXISTS size_48 NUMERIC(14, 2);
 
 CREATE TABLE IF NOT EXISTS fact_order_forecast (
     run_id UUID NOT NULL REFERENCES etl_run(run_id) ON DELETE CASCADE,

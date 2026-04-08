@@ -1,13 +1,14 @@
 # BARCA Unified Engine (Distribuzione + Ordini)
 
 ## Struttura cartelle
-- `incoming/` → cartella drop raw (`csv`/`xlsx`) per ingest automatico
-- `input/` → file mensili in ingresso (`sales_YYYY-MM.csv`, `stock_YYYY-MM.csv`)
+- `incoming/` → cartella drop raw (`csv`/`xlsx`) usata solo per popolare il DB
+- `input/` → file mensili intermedi (`sales_YYYY-MM.csv`, `stock_YYYY-MM.csv`) usati solo nel bootstrap DB
 - `input/orders/` → (opzionale) CSV progetto ordini (`*_sd_1.csv`, `*_sd_2.csv`, `*_sd_3.csv`)
 - `input/orders/history_detail/` → (opzionale) report `ANALISI ARTICOLI` con `Raffronta con venduto nel periodo` per arricchire storico ordini con marchio, colore, materiale e venduto periodo
-- `output/` → file generati dal motore (`clean_*`, `suggested_transfers.csv`, `features_after.csv`)
+- `output/` → export diagnostici del motore DB-only (`clean_*`, `suggested_transfers.csv`, `features_after.csv`)
 - `config/` → configurazioni (`lista-negozi.xlsx`, opzionale `lista-negozi_integrato.xlsx`)
 - `data/raw_original/` → copie archiviate dei file raw originali con nome sorgente
+- `analysis.py` → sostituisce il vecchio notebook con analisi riusabili dal motore e CLI diagnostica DB-first
 
 Capacita' negozi:
 - `config/lista-negozi_integrato.xlsx` e' la configurazione usata dal motore se presente.
@@ -19,13 +20,23 @@ python ops/rebuild_shop_capacity_config.py
 ```
 
 ## Cosa fa
-- Esegue un **ingest agent** sui raw:
+- Se devi alimentare il DB da file, usa `populate_db_from_raw.py`:
+  - esegue ingest raw
+  - parse di vendite/stock
+  - armonizzazione clean inputs
+  - bootstrap opzionale del modulo ordini
+  - sync completa nel DB PostgreSQL
+- Il runtime operativo `app.py` e la UI lavorano poi **solo dal DB**:
+  - leggono snapshot sales/stock gia' salvati
+  - leggono output ordini gia' salvati
+  - producono trasferimenti, diagnostica e nuova run DB
+- L'ingest da raw:
   - riconosce automaticamente il tipo file (vendite, stock, ordini sd_1/2/3/4, listini/ricarichi, storico articoli con venduto periodo)
   - converte eventuali Excel in CSV
   - rinomina in formato standard e deposita in `input/` e `input/orders/`
   - manda i file non riconosciuti in `incoming/_quarantine`
   - traccia report in `output/ingest/ingest_report_latest.json`
-- Legge 2 CSV mensili esportati dal gestionale:
+- Nel bootstrap DB legge 2 CSV mensili esportati dal gestionale:
   - `sales_YYYY-MM.csv` (report **ANALISI ARTICOLI**)
   - `stock_YYYY-MM.csv` (report **SITUAZIONE ARTICOLI**)
 - Pulisce i dati (numeri italiani, sigle negozi) e genera:
@@ -35,7 +46,9 @@ python ops/rebuild_shop_capacity_config.py
   - domanda prevista = blend tra modello AI (ridge out-of-fold) e formule business
   - formule business: vendite recenti, sellout, copertura stock, service level per fascia
   - priorità **fasce alte**
-  - donatori scelti tra fasce più basse e **vendite nel periodo più basse**
+  - donatori scelti tra fasce più basse e **vendite locali più basse**
+  - negozi riceventi ammessi solo se l'articolo ha gia' avuto venduto locale
+  - ranking riceventi basato su fascia, venduto locale, buchi taglie core e stock basso
   - micro-movimenti **anche 1 paio**
   - rispetto della **capacità negozio** (se disponibile in config) con buffer operativo
     per evitare saturazione completa del magazzino
@@ -64,10 +77,15 @@ python ops/rebuild_shop_capacity_config.py
   - logga tutti gli step in `output/orders/orders_run_log.txt`
 
 ## Come si usa (Windows)
+Bootstrap DB da raw:
 1. Metti i raw in `incoming/` (consigliato): CSV/Excel esportati dal gestionale.
-2. Doppio click su `RUN.bat`.
-3. Il sistema classifica/rinomina i file e avvia analisi.
-4. Leggi risultati in `output/`.
+2. Esegui `python populate_db_from_raw.py --db-create-schema` la prima volta, oppure doppio click su `RUN_POPULATE_DB.bat`.
+3. Verifica la run `raw_input_sync` nel DB.
+
+Runtime operativo DB-only:
+1. Doppio click su `RUN.bat` oppure esegui `python app.py --sync-db`.
+2. Il motore legge solo snapshot e ordini dal DB.
+3. Leggi risultati in `output/` e nella dashboard.
 
 Interfaccia enterprise web (non Streamlit):
 1. Doppio click su `RUN_UI.bat` oppure avvia da terminale.
@@ -78,22 +96,20 @@ Interfaccia enterprise web (non Streamlit):
 CLI utile:
 
 ```bash
-python app.py --skip-ingest
+python populate_db_from_raw.py --db-create-schema
+python populate_db_from_raw.py --skip-orders
+python populate_db_from_raw.py --skip-ingest --sales-file input/sales_2026-03.csv --stock-file input/stock_2026-03.csv
 python app.py --source-db
 python app.py --source-db --source-db-run-id <uuid_run>
-python app.py --orders-source-db
 python app.py --orders-source-db --orders-source-db-run-id <uuid_run>
 python app.py --source-db --orders-source-db --sync-db
 python -m uvicorn enterprise_ui:app --host 0.0.0.0 --port 8080
-python app.py --incoming-root "C:\path\incoming"
-python app.py --keep-incoming
-python app.py --orders-root "C:\path\to\per_previsioni"
-python app.py --orders-math-only
 python app.py --skip-orders
 python app.py --sync-db
 python app.py --sync-db --db-create-schema
 python db_sync.py --create-schema
 python db_sync.py
+python analysis.py --article 59/5040CTM
 ```
 
 Modalita' DB-first (pipeline guidata dal database):
@@ -102,6 +118,7 @@ Modalita' DB-first (pipeline guidata dal database):
 - usa `--orders-source-db` per ricostruire gli output del modulo ordini dalle tabelle DB
 - usa `--orders-source-db-run-id <uuid>` per forzare una run specifica ordini come sorgente
 - la sync DB ora salva anche le sorgenti ordini in `fact_order_source` e `fact_order_source_size`
+- `analysis.py` legge anch'esso solo dal DB e genera diagnostiche riusabili (`article_shop_signals.csv`, `stock_integrity_report.csv`)
 
 ## Database PostgreSQL (free, no license)
 Il progetto ora supporta sync su PostgreSQL (open source, senza licenza commerciale).
@@ -164,6 +181,8 @@ powershell -File .\ops\install_daily_backup_task.ps1 -RunAt "02:30"
 - `shipment_plan.csv` → piano spedizioni con data prevista, policy e stato consolidamento
 - `shipment_summary.csv` → riepilogo operativo giornaliero per tratta/policy
 - `features_after.csv` → stato stock post-simulazione + info fascia/demand/capacità
+- `article_shop_signals.csv` → segnali decisionali sorgente/destinazione usati dall'allocatore
+- `stock_integrity_report.csv` → controllo coerenza taglie/giacenza/consegnato per articolo-negozio
 - `demand_diagnostics.csv` → diagnostica del modello ibrido (DemandRule, DemandAI, blend, DemandHybrid)
 - `ingest/ingest_report_latest.json` → report ingest (classificazione, routing, errori)
 - `ingest/ingest_report_latest.csv` → dettaglio file processati/quarantena

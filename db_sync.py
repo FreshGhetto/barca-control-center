@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from reparto_sizes import DB_SIZE_COLUMNS, SUPPORTED_SIZES, infer_reparto_from_path, normalize_reparto
 
 try:
     import psycopg
@@ -36,6 +37,7 @@ def get_db_dsn() -> str:
     user = _env("BARCA_DB_USER")
     password = _env("BARCA_DB_PASSWORD")
     sslmode = _env("BARCA_DB_SSLMODE", "prefer")
+    connect_timeout = _env("BARCA_DB_CONNECT_TIMEOUT", "2")
     miss = [k for k, v in {
         "BARCA_DB_HOST": host,
         "BARCA_DB_NAME": dbname,
@@ -47,7 +49,23 @@ def get_db_dsn() -> str:
             f"Variabili DB mancanti: {miss}. "
             "Imposta BARCA_DB_HOST, BARCA_DB_NAME, BARCA_DB_USER, BARCA_DB_PASSWORD."
         )
-    return f"host={host} port={port} dbname={dbname} user={user} password={password} sslmode={sslmode}"
+    try:
+        timeout_seconds = max(1, int(str(connect_timeout).strip()))
+    except Exception:
+        timeout_seconds = 2
+    return (
+        f"host={host} port={port} dbname={dbname} user={user} password={password} "
+        f"sslmode={sslmode} connect_timeout={timeout_seconds}"
+    )
+
+
+DF_SIZE_COLUMNS = [f"Size_{size}" for size in SUPPORTED_SIZES]
+SQL_SIZE_INSERT_COLUMNS = ", ".join(DB_SIZE_COLUMNS)
+SQL_SIZE_UPDATE_COLUMNS = ", ".join(f"{col}=EXCLUDED.{col}" for col in DB_SIZE_COLUMNS)
+
+
+def _row_size_values(row: Any) -> Tuple[Optional[float], ...]:
+    return tuple(_f(row.get(col)) for col in DF_SIZE_COLUMNS)
 
 
 def _read_csv(path: Path) -> pd.DataFrame:
@@ -61,6 +79,14 @@ def _read_json(path: Path) -> Dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
+
+
+def _fetch_df(conn, sql: str, params: Sequence[Any] = ()) -> pd.DataFrame:
+    with conn.cursor() as cur:
+        cur.execute(sql, tuple(params))
+        rows = cur.fetchall()
+        cols = [d.name for d in cur.description]
+    return pd.DataFrame(rows, columns=cols)
 
 
 def _txt(v: Any) -> Optional[str]:
@@ -210,7 +236,15 @@ def _merge_art(dest: Dict[str, Dict[str, Optional[str]]], code: Any, row: Dict[s
         return
     rec = dest.setdefault(
         a,
-        {"description": None, "categoria": None, "tipologia": None, "marchio": None, "colore": None, "materiale": None},
+        {
+            "description": None,
+            "reparto": None,
+            "categoria": None,
+            "tipologia": None,
+            "marchio": None,
+            "colore": None,
+            "materiale": None,
+        },
     )
     for k in rec.keys():
         v = _class_label(row.get(k)) if k in {"categoria", "tipologia"} else _txt(row.get(k))
@@ -605,6 +639,7 @@ def _discover_native_order_bundle_seasons(root: Path) -> set[str]:
 def _parse_order_detail_report(path: Path) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
     current_reparto = current_colore = current_materiale = current_marchio = None
+    inferred_reparto = infer_reparto_from_path(path)
 
     with open(path, "r", encoding="utf-8-sig", errors="replace", newline="") as f:
         for row in csv.reader(f):
@@ -631,14 +666,18 @@ def _parse_order_detail_report(path: Path) -> pd.DataFrame:
                     and not item.startswith("VALORE")
                     and not item.startswith("COSTO")
                 ]
-                if len(pre_elements) >= 1:
-                    current_marchio = pre_elements[-1]
-                if len(pre_elements) >= 2:
-                    current_materiale = pre_elements[-2]
-                if len(pre_elements) >= 3:
-                    current_colore = pre_elements[-3]
-                if len(pre_elements) >= 4:
-                    current_reparto = pre_elements[-4]
+                reparto_candidates = [item for item in pre_elements if normalize_reparto(item) in {"SCARPE UOMO", "SCARPE DONNA"}]
+                if reparto_candidates:
+                    current_reparto = reparto_candidates[-1]
+                residual_elements = [item for item in pre_elements if item not in reparto_candidates]
+                if len(residual_elements) >= 1:
+                    current_marchio = residual_elements[-1]
+                if len(residual_elements) >= 2:
+                    current_materiale = residual_elements[-2]
+                if len(residual_elements) >= 3:
+                    current_colore = residual_elements[-3]
+                if not reparto_candidates and len(residual_elements) >= 4:
+                    current_reparto = residual_elements[-4]
 
                 raw_article = elements[idx].strip()
                 if not raw_article:
@@ -652,6 +691,7 @@ def _parse_order_detail_report(path: Path) -> pd.DataFrame:
                 rows.append(
                     {
                         "Codice_Articolo": _article(code),
+                        "Reparto": re.sub(r"\s+", " ", current_reparto).strip() if current_reparto else inferred_reparto,
                         "Categoria": None,
                         "Tipologia": None,
                         "Marchio": re.sub(r"\s+", " ", current_marchio).strip() if current_marchio else None,
@@ -666,13 +706,13 @@ def _parse_order_detail_report(path: Path) -> pd.DataFrame:
                         "Prezzo_Acquisto": None,
                         "Prezzo_Vendita": None,
                         "Fascia_Prezzo": None,
-                        "_Reparto": re.sub(r"\s+", " ", current_reparto).strip() if current_reparto else None,
                     }
                 )
                 last_idx = idx + 1
 
     columns = [
         "Codice_Articolo",
+        "Reparto",
         "Categoria",
         "Tipologia",
         "Marchio",
@@ -703,6 +743,7 @@ def _parse_order_detail_report(path: Path) -> pd.DataFrame:
         return None
 
     agg = {
+        "Reparto": _first_non_empty,
         "Categoria": _first_non_empty,
         "Tipologia": _first_non_empty,
         "Marchio": _first_non_empty,
@@ -719,6 +760,7 @@ def _parse_order_detail_report(path: Path) -> pd.DataFrame:
         "Fascia_Prezzo": _first_non_empty,
     }
     out = df.groupby("Codice_Articolo", as_index=False).agg(agg)
+    out["Reparto"] = out["Reparto"].map(lambda value: normalize_reparto(value) or inferred_reparto)
     for col in ("Venduto_Totale", "Venduto_Periodo", "Giacenza", "Venduto_Extra"):
         out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
     return out.reindex(columns=columns)
@@ -940,6 +982,54 @@ def _enrich_order_source_frame(
     return _apply_price_band(out)
 
 
+def _load_order_facts_from_db(conn, source_run_id: str) -> Dict[str, pd.DataFrame]:
+    return {
+        "forecast_main": _fetch_df(
+            conn,
+            """
+            SELECT module, season_code, mode, article_code, totale_qty, predizione_vendite, prezzo_acquisto, budget_acquisto
+            FROM fact_order_forecast
+            WHERE run_id = %s::uuid
+            ORDER BY module, mode, article_code
+            """,
+            (source_run_id,),
+        ),
+        "forecast_size": _fetch_df(
+            conn,
+            """
+            SELECT module, season_code, mode, article_code, size, qty
+            FROM fact_order_forecast_size
+            WHERE run_id = %s::uuid
+            ORDER BY module, mode, article_code, size
+            """,
+            (source_run_id,),
+        ),
+        "source_main": _fetch_df(
+            conn,
+            """
+            SELECT
+              module, season_code, article_code, categoria, tipologia, marchio, colore, materiale,
+              descrizione, venduto_totale, venduto_periodo, giacenza, venduto_extra, fascia_prezzo,
+              prezzo_listino, prezzo_acquisto, prezzo_vendita
+            FROM fact_order_source
+            WHERE run_id = %s::uuid
+            ORDER BY module, season_code, article_code
+            """,
+            (source_run_id,),
+        ),
+        "source_size": _fetch_df(
+            conn,
+            """
+            SELECT module, season_code, article_code, size, venduto_qty
+            FROM fact_order_source_size
+            WHERE run_id = %s::uuid
+            ORDER BY module, season_code, article_code, size
+            """,
+            (source_run_id,),
+        ),
+    }
+
+
 def run_db_sync(
     root: Path,
     *,
@@ -947,6 +1037,15 @@ def run_db_sync(
     schema_path: Optional[Path] = None,
     run_type: str = "manual_sync",
     verbose: bool = True,
+    clean_sales_df: Optional[pd.DataFrame] = None,
+    clean_stock_df: Optional[pd.DataFrame] = None,
+    transfers_df: Optional[pd.DataFrame] = None,
+    features_df: Optional[pd.DataFrame] = None,
+    ingest_report: Optional[Dict[str, Any]] = None,
+    source_sales_stock_run_id: Optional[str] = None,
+    source_orders_run_id: Optional[str] = None,
+    include_orders: bool = True,
+    metadata_extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     _require_psycopg()
     root = root.resolve()
@@ -956,41 +1055,60 @@ def run_db_sync(
     dsn = get_db_dsn()
     run_id = uuid.uuid4()
 
-    clean_sales = _read_csv(out / "clean_sales.csv")
-    clean_stock = _read_csv(out / "clean_articles.csv")
-    transfers = _read_csv(out / "suggested_transfers.csv")
-    features = _read_csv(out / "features_after.csv")
-    ingest = _read_json(out / "ingest" / "ingest_report_latest.json")
-    ord_summary = _read_json(out_orders / "orders_summary.json")
-    jobs = _order_jobs(out_orders, ord_summary)
-    ord_frames = [(_read_csv(j["path"]), j) for j in jobs]
-    source_jobs = _order_source_jobs(out_orders, ord_summary)
-    history_source_jobs = _order_source_history_jobs(out_orders, ord_summary)
+    clean_sales = clean_sales_df.copy() if isinstance(clean_sales_df, pd.DataFrame) else _read_csv(out / "clean_sales.csv")
+    clean_stock = clean_stock_df.copy() if isinstance(clean_stock_df, pd.DataFrame) else _read_csv(out / "clean_articles.csv")
+    transfers = transfers_df.copy() if isinstance(transfers_df, pd.DataFrame) else _read_csv(out / "suggested_transfers.csv")
+    features = features_df.copy() if isinstance(features_df, pd.DataFrame) else _read_csv(out / "features_after.csv")
+    ingest = dict(ingest_report or {}) if isinstance(ingest_report, dict) else _read_json(out / "ingest" / "ingest_report_latest.json")
 
-    merged_source_jobs: List[Dict[str, Any]] = []
-    seen_source_keys = set()
-    for job in source_jobs + history_source_jobs:
-        key = (job.get("module"), job.get("season"))
-        if key in seen_source_keys:
-            continue
-        seen_source_keys.add(key)
-        merged_source_jobs.append(job)
+    ord_summary: Dict[str, Any] = {}
+    jobs: List[Dict[str, Any]] = []
+    source_jobs: List[Dict[str, Any]] = []
+    history_source_jobs: List[Dict[str, Any]] = []
+    catalog_history_jobs: List[Dict[str, Any]] = []
+    detail_history_jobs: List[Dict[str, Any]] = []
+    ord_frames: List[Tuple[pd.DataFrame, Dict[str, Any]]] = []
+    ord_source_frames: List[Tuple[pd.DataFrame, Dict[str, Any]]] = []
+    order_db_payload: Optional[Dict[str, pd.DataFrame]] = None
 
-    catalog_price_df = _catalog_price_snapshot_df(dsn)
-    raw_ord_source_frames = [(_read_csv(j["path"]), j) for j in merged_source_jobs]
-    catalog_history_frames, catalog_history_jobs = _catalog_source_history_frames(
-        dsn,
-        [(j.get("module"), j.get("season")) for j in merged_source_jobs],
-    )
-    detail_history_frames, detail_history_jobs = _order_detail_history_frames(root)
-    native_bundle_seasons = _discover_native_order_bundle_seasons(root)
-    merged_ord_source_frames = _merge_order_source_frames(
-        raw_ord_source_frames + catalog_history_frames,
-        detail_history_frames,
-        native_bundle_seasons=native_bundle_seasons,
-    )
-    merged_ord_source_frames = _fill_missing_classifications(merged_ord_source_frames)
-    ord_source_frames = [(_enrich_order_source_frame(df, meta, catalog_price_df), meta) for df, meta in merged_ord_source_frames]
+    if include_orders:
+        if source_orders_run_id:
+            with psycopg.connect(dsn) as src_conn:
+                order_db_payload = _load_order_facts_from_db(src_conn, source_orders_run_id)
+            ord_summary = {"source": "db", "source_run_id": source_orders_run_id}
+        else:
+            ord_summary = _read_json(out_orders / "orders_summary.json")
+            jobs = _order_jobs(out_orders, ord_summary)
+            ord_frames = [(_read_csv(j["path"]), j) for j in jobs]
+            source_jobs = _order_source_jobs(out_orders, ord_summary)
+            history_source_jobs = _order_source_history_jobs(out_orders, ord_summary)
+
+            merged_source_jobs: List[Dict[str, Any]] = []
+            seen_source_keys = set()
+            for job in source_jobs + history_source_jobs:
+                key = (job.get("module"), job.get("season"))
+                if key in seen_source_keys:
+                    continue
+                seen_source_keys.add(key)
+                merged_source_jobs.append(job)
+
+            catalog_price_df = _catalog_price_snapshot_df(dsn)
+            raw_ord_source_frames = [(_read_csv(j["path"]), j) for j in merged_source_jobs]
+            catalog_history_frames, catalog_history_jobs = _catalog_source_history_frames(
+                dsn,
+                [(j.get("module"), j.get("season")) for j in merged_source_jobs],
+            )
+            detail_history_frames, detail_history_jobs = _order_detail_history_frames(root)
+            native_bundle_seasons = _discover_native_order_bundle_seasons(root)
+            merged_ord_source_frames = _merge_order_source_frames(
+                raw_ord_source_frames + catalog_history_frames,
+                detail_history_frames,
+                native_bundle_seasons=native_bundle_seasons,
+            )
+            merged_ord_source_frames = _fill_missing_classifications(merged_ord_source_frames)
+            ord_source_frames = [(_enrich_order_source_frame(df, meta, catalog_price_df), meta) for df, meta in merged_ord_source_frames]
+    else:
+        ord_summary = {"enabled": False, "source": "disabled"}
 
     cfg = _cfg_shops(root)
     shop_codes = set(cfg.keys())
@@ -1017,30 +1135,75 @@ def run_db_sync(
             _merge_art(
                 arts,
                 r.get("Article"),
-                {"description": r.get("Description"), "categoria": None, "tipologia": None, "marchio": None, "colore": None, "materiale": None},
+                {
+                    "description": r.get("Description"),
+                    "reparto": r.get("Reparto"),
+                    "categoria": None,
+                    "tipologia": None,
+                    "marchio": None,
+                    "colore": None,
+                    "materiale": None,
+                },
             )
     if "Article" in clean_sales.columns:
         for _, r in clean_sales.iterrows():
             _merge_art(
                 arts,
                 r.get("Article"),
-                {"description": None, "categoria": None, "tipologia": None, "marchio": None, "colore": None, "materiale": None},
-            )
-    for df in [d for d, _ in ord_source_frames if not d.empty] + [d for d, _ in ord_frames if not d.empty]:
-        for _, r in df.iterrows():
-            _merge_art(
-                arts,
-                r.get("Codice_Articolo"),
                 {
-                    "description": r.get("Descrizione"),
-                    "categoria": r.get("Categoria"),
-                    "tipologia": r.get("Tipologia"),
-                    "marchio": r.get("Marchio"),
-                    "colore": r.get("Colore"),
-                    "materiale": r.get("Materiale"),
+                    "description": None,
+                    "reparto": None,
+                    "categoria": None,
+                    "tipologia": None,
+                    "marchio": None,
+                    "colore": None,
+                    "materiale": None,
                 },
             )
-    dim_articles = [(k, v["description"], v["categoria"], v["tipologia"], v["marchio"], v["colore"], v["materiale"]) for k, v in sorted(arts.items())]
+    if order_db_payload is not None:
+        for _, r in order_db_payload["source_main"].iterrows():
+            _merge_art(
+                arts,
+                r.get("article_code"),
+                {
+                    "description": r.get("descrizione"),
+                    "reparto": r.get("reparto"),
+                    "categoria": r.get("categoria"),
+                    "tipologia": r.get("tipologia"),
+                    "marchio": r.get("marchio"),
+                    "colore": r.get("colore"),
+                    "materiale": r.get("materiale"),
+                },
+            )
+    else:
+        for df in [d for d, _ in ord_source_frames if not d.empty] + [d for d, _ in ord_frames if not d.empty]:
+            for _, r in df.iterrows():
+                _merge_art(
+                    arts,
+                    r.get("Codice_Articolo"),
+                    {
+                        "description": r.get("Descrizione"),
+                        "reparto": r.get("Reparto"),
+                        "categoria": r.get("Categoria"),
+                        "tipologia": r.get("Tipologia"),
+                        "marchio": r.get("Marchio"),
+                        "colore": r.get("Colore"),
+                        "materiale": r.get("Materiale"),
+                    },
+                )
+    dim_articles = [
+        (
+            k,
+            v["description"],
+            normalize_reparto(v["reparto"]),
+            v["categoria"],
+            v["tipologia"],
+            v["marchio"],
+            v["colore"],
+            v["materiale"],
+        )
+        for k, v in sorted(arts.items())
+    ]
 
     sales_map: Dict[Tuple[str, str], Tuple[Any, ...]] = {}
     for _, r in clean_sales.iterrows():
@@ -1061,8 +1224,7 @@ def run_db_sync(
             continue
         stock_map[(a, s)] = (
             run_id, _dt(r.get("snapshot_at")), a, s, _f(r.get("Ricevuto")), _f(r.get("Giacenza")), _f(r.get("Consegnato")), _f(r.get("Venduto")),
-            _clamp_num(r.get("Sellout_Percent"), low=0.0, high=250.0), _f(r.get("Size_35")), _f(r.get("Size_36")), _f(r.get("Size_37")), _f(r.get("Size_38")),
-            _f(r.get("Size_39")), _f(r.get("Size_40")), _f(r.get("Size_41")), _f(r.get("Size_42")), _f(r.get("Valore_Giac")),
+            _clamp_num(r.get("Sellout_Percent"), low=0.0, high=250.0), *_row_size_values(r), _f(r.get("Valore_Giac")),
         )
     stock_rows = list(stock_map.values())
 
@@ -1084,80 +1246,147 @@ def run_db_sync(
         feat_map[(a, s)] = (
             run_id, a, s, _i(r.get("Fascia")), _b(r.get("IsOutlet")), _txt(r.get("Role")), _f(r.get("DemandRaw")), _f(r.get("DemandRule")),
             _f(r.get("DemandAI")), _f(r.get("DemandBlendWeight")), _f(r.get("DemandHybrid")), _txt(r.get("DemandModelMode")),
-            _f(r.get("DemandModelQualityR2")), _f(r.get("Periodo_Qty")), _f(r.get("Stock_after")), _f(r.get("ShopCapacityPairs")),
-            _f(r.get("ShopCapacityTarget")), _f(r.get("ShopFreeCapacityAfter")), _txt(r.get("ShopCapacitySource")),
-            _f(r.get("CapacityBlockedMoves")), _f(r.get("OpsBlockedMoves")), _f(r.get("ShopInboundBudget")), _f(r.get("ShopOutboundBudget")),
-            _f(r.get("ShopInboundUsed")), _f(r.get("ShopOutboundUsed")), _f(r.get("Size_35")), _f(r.get("Size_36")),
-            _f(r.get("Size_37")), _f(r.get("Size_38")), _f(r.get("Size_39")), _f(r.get("Size_40")), _f(r.get("Size_41")), _f(r.get("Size_42")),
+            _f(r.get("DemandModelQualityR2")), _f(r.get("Periodo_Qty")), _f(r.get("ObservedSalesSignal")),
+            _b(r.get("ReceiverEligibleBySales")), _f(r.get("StockDepth")), _i(r.get("ShopPriorityRank")),
+            _i(r.get("MissingCoreSizes")), _f(r.get("CoreSizeCoverageRatio")), _b(r.get("LowStockActiveCandidate")),
+            _b(r.get("ZeroSalesSourceCandidate")), _f(r.get("DestinationPriorityScore")), _f(r.get("SourcePriorityScore")),
+            _f(r.get("Stock_after")), _f(r.get("ShopCapacityPairs")), _f(r.get("ShopCapacityTarget")),
+            _f(r.get("ShopFreeCapacityAfter")), _txt(r.get("ShopCapacitySource")), _f(r.get("CapacityBlockedMoves")),
+            _f(r.get("OpsBlockedMoves")), _f(r.get("ShopInboundBudget")), _f(r.get("ShopOutboundBudget")),
+            _f(r.get("ShopInboundUsed")), _f(r.get("ShopOutboundUsed")), *_row_size_values(r),
         )
     feat_rows = list(feat_map.values())
 
-    ord_main: Dict[Tuple[str, str, str, str], Tuple[Any, ...]] = {}
-    ord_size: Dict[Tuple[str, str, str, str, int], float] = {}
-    for df, meta in ord_frames:
-        module, mode, season = meta["module"], meta["mode"], meta["season"]
-        tot_col = "Ibrido_Totale" if mode == "hybrid" else "Da_Acquistare_Totale"
-        pred_col = "Predizione_Vendite" if mode == "math" else ("Vendita_Totale_Prevista" if mode == "rf" else None)
-        pref = "Ibrido_" if mode == "hybrid" else "Acquistare_"
-        size_cols = [c for c in df.columns if c.startswith(pref) and _size(c) is not None]
-        for _, r in df.iterrows():
-            a = _article(r.get("Codice_Articolo"))
+    if order_db_payload is not None:
+        ord_main_rows = []
+        for _, r in order_db_payload["forecast_main"].iterrows():
+            a = _article(r.get("article_code"))
             if not a:
                 continue
-            ord_main[(module, season, mode, a)] = (
-                run_id, module, season, mode, a, _clamp_num(r.get(tot_col), low=0.0),
-                _clamp_num(r.get(pred_col), low=0.0) if pred_col else None, _clamp_num(r.get("Prezzo_Acquisto"), low=0.0), _clamp_num(r.get("Budget_Acquisto"), low=0.0),
+            ord_main_rows.append(
+                (
+                    run_id,
+                    _txt(r.get("module")),
+                    _txt(r.get("season_code")),
+                    _txt(r.get("mode")),
+                    a,
+                    _clamp_num(r.get("totale_qty"), low=0.0),
+                    _clamp_num(r.get("predizione_vendite"), low=0.0),
+                    _clamp_num(r.get("prezzo_acquisto"), low=0.0),
+                    _clamp_num(r.get("budget_acquisto"), low=0.0),
+                )
             )
-            for c in size_cols:
-                z, q = _size(c), _clamp_num(r.get(c), low=0.0)
-                if z is None or q is None:
-                    continue
-                k = (module, season, mode, a, int(z))
-                ord_size[k] = ord_size.get(k, 0.0) + float(q)
-    ord_main_rows = list(ord_main.values())
-    ord_size_rows = [(run_id, m, s, mo, a, z, q) for (m, s, mo, a, z), q in ord_size.items() if abs(q) > 1e-12]
+        ord_size_rows = []
+        for _, r in order_db_payload["forecast_size"].iterrows():
+            a = _article(r.get("article_code"))
+            z = _i(r.get("size"))
+            q = _clamp_num(r.get("qty"), low=0.0)
+            if not a or z is None or q is None or abs(q) <= 1e-12:
+                continue
+            ord_size_rows.append((run_id, _txt(r.get("module")), _txt(r.get("season_code")), _txt(r.get("mode")), a, int(z), q))
 
-    ord_src_main: Dict[Tuple[str, str, str], Tuple[Any, ...]] = {}
-    ord_src_size: Dict[Tuple[str, str, str, int], float] = {}
-    for df, meta in ord_source_frames:
-        module, season = meta["module"], meta["season"]
-        size_cols = [c for c in df.columns if c.startswith("Venduto_") and _size(c) is not None]
-        for _, r in df.iterrows():
-            a = _article(r.get("Codice_Articolo"))
+        ord_src_main_rows = []
+        for _, r in order_db_payload["source_main"].iterrows():
+            a = _article(r.get("article_code"))
             if not a:
                 continue
-            ord_src_main[(module, season, a)] = (
-                run_id,
-                module,
-                season,
-                a,
-                _txt(r.get("Categoria")),
-                _txt(r.get("Tipologia")),
-                _txt(r.get("Marchio")),
-                _txt(r.get("Colore")),
-                _txt(r.get("Materiale")),
-                _txt(r.get("Descrizione")),
-                _clamp_num(r.get("Venduto_Totale"), low=0.0),
-                _clamp_num(r.get("Venduto_Periodo"), low=0.0),
-                _clamp_num(r.get("Giacenza"), low=0.0),
-                _clamp_num(r.get("Venduto_Extra"), low=0.0),
-                _txt(r.get("Fascia_Prezzo")),
-                _clamp_num(r.get("Prezzo_Listino"), low=0.0),
-                _clamp_num(r.get("Prezzo_Acquisto"), low=0.0),
-                _clamp_num(r.get("Prezzo_Vendita"), low=0.0),
+            ord_src_main_rows.append(
+                (
+                    run_id,
+                    _txt(r.get("module")),
+                    _txt(r.get("season_code")),
+                    a,
+                    _txt(r.get("categoria")),
+                    _txt(r.get("tipologia")),
+                    _txt(r.get("marchio")),
+                    _txt(r.get("colore")),
+                    _txt(r.get("materiale")),
+                    _txt(r.get("descrizione")),
+                    _clamp_num(r.get("venduto_totale"), low=0.0),
+                    _clamp_num(r.get("venduto_periodo"), low=0.0),
+                    _clamp_num(r.get("giacenza"), low=0.0),
+                    _clamp_num(r.get("venduto_extra"), low=0.0),
+                    _txt(r.get("fascia_prezzo")),
+                    _clamp_num(r.get("prezzo_listino"), low=0.0),
+                    _clamp_num(r.get("prezzo_acquisto"), low=0.0),
+                    _clamp_num(r.get("prezzo_vendita"), low=0.0),
+                )
             )
-            for c in size_cols:
-                z, q = _size(c), _clamp_num(r.get(c), low=0.0)
-                if z is None or q is None:
+        ord_src_size_rows = []
+        for _, r in order_db_payload["source_size"].iterrows():
+            a = _article(r.get("article_code"))
+            z = _i(r.get("size"))
+            q = _clamp_num(r.get("venduto_qty"), low=0.0)
+            if not a or z is None or q is None or abs(q) <= 1e-12:
+                continue
+            ord_src_size_rows.append((run_id, _txt(r.get("module")), _txt(r.get("season_code")), a, int(z), q))
+    else:
+        ord_main: Dict[Tuple[str, str, str, str], Tuple[Any, ...]] = {}
+        ord_size: Dict[Tuple[str, str, str, str, int], float] = {}
+        for df, meta in ord_frames:
+            module, mode, season = meta["module"], meta["mode"], meta["season"]
+            tot_col = "Ibrido_Totale" if mode == "hybrid" else "Da_Acquistare_Totale"
+            pred_col = "Predizione_Vendite" if mode == "math" else ("Vendita_Totale_Prevista" if mode == "rf" else None)
+            pref = "Ibrido_" if mode == "hybrid" else "Acquistare_"
+            size_cols = [c for c in df.columns if c.startswith(pref) and _size(c) is not None]
+            for _, r in df.iterrows():
+                a = _article(r.get("Codice_Articolo"))
+                if not a:
                     continue
-                k = (module, season, a, int(z))
-                ord_src_size[k] = ord_src_size.get(k, 0.0) + float(q)
-    ord_src_main_rows = list(ord_src_main.values())
-    ord_src_size_rows = [
-        (run_id, m, s, a, z, q)
-        for (m, s, a, z), q in ord_src_size.items()
-        if abs(q) > 1e-12
-    ]
+                ord_main[(module, season, mode, a)] = (
+                    run_id, module, season, mode, a, _clamp_num(r.get(tot_col), low=0.0),
+                    _clamp_num(r.get(pred_col), low=0.0) if pred_col else None, _clamp_num(r.get("Prezzo_Acquisto"), low=0.0), _clamp_num(r.get("Budget_Acquisto"), low=0.0),
+                )
+                for c in size_cols:
+                    z, q = _size(c), _clamp_num(r.get(c), low=0.0)
+                    if z is None or q is None:
+                        continue
+                    k = (module, season, mode, a, int(z))
+                    ord_size[k] = ord_size.get(k, 0.0) + float(q)
+        ord_main_rows = list(ord_main.values())
+        ord_size_rows = [(run_id, m, s, mo, a, z, q) for (m, s, mo, a, z), q in ord_size.items() if abs(q) > 1e-12]
+
+        ord_src_main: Dict[Tuple[str, str, str], Tuple[Any, ...]] = {}
+        ord_src_size: Dict[Tuple[str, str, str, int], float] = {}
+        for df, meta in ord_source_frames:
+            module, season = meta["module"], meta["season"]
+            size_cols = [c for c in df.columns if c.startswith("Venduto_") and _size(c) is not None]
+            for _, r in df.iterrows():
+                a = _article(r.get("Codice_Articolo"))
+                if not a:
+                    continue
+                ord_src_main[(module, season, a)] = (
+                    run_id,
+                    module,
+                    season,
+                    a,
+                    _txt(r.get("Categoria")),
+                    _txt(r.get("Tipologia")),
+                    _txt(r.get("Marchio")),
+                    _txt(r.get("Colore")),
+                    _txt(r.get("Materiale")),
+                    _txt(r.get("Descrizione")),
+                    _clamp_num(r.get("Venduto_Totale"), low=0.0),
+                    _clamp_num(r.get("Venduto_Periodo"), low=0.0),
+                    _clamp_num(r.get("Giacenza"), low=0.0),
+                    _clamp_num(r.get("Venduto_Extra"), low=0.0),
+                    _txt(r.get("Fascia_Prezzo")),
+                    _clamp_num(r.get("Prezzo_Listino"), low=0.0),
+                    _clamp_num(r.get("Prezzo_Acquisto"), low=0.0),
+                    _clamp_num(r.get("Prezzo_Vendita"), low=0.0),
+                )
+                for c in size_cols:
+                    z, q = _size(c), _clamp_num(r.get(c), low=0.0)
+                    if z is None or q is None:
+                        continue
+                    k = (module, season, a, int(z))
+                    ord_src_size[k] = ord_src_size.get(k, 0.0) + float(q)
+        ord_src_main_rows = list(ord_src_main.values())
+        ord_src_size_rows = [
+            (run_id, m, s, a, z, q)
+            for (m, s, a, z), q in ord_src_size.items()
+            if abs(q) > 1e-12
+        ]
 
     ing_rows = []
     for r in ingest.get("rows", []) if isinstance(ingest.get("rows"), list) else []:
@@ -1178,12 +1407,23 @@ def run_db_sync(
         base_meta = {
             "root": str(root),
             "create_schema": bool(create_schema),
+            "db_only_source": bool(
+                isinstance(clean_sales_df, pd.DataFrame)
+                or isinstance(clean_stock_df, pd.DataFrame)
+                or isinstance(transfers_df, pd.DataFrame)
+                or isinstance(features_df, pd.DataFrame)
+                or source_orders_run_id
+            ),
+            "source_sales_stock_run_id": source_sales_stock_run_id,
+            "source_orders_run_id": source_orders_run_id,
             "orders_jobs": [{"module": j["module"], "mode": j["mode"], "season": j["season"], "file": str(j["path"])} for j in jobs],
             "order_source_jobs": [{"module": j["module"], "season": j["season"], "file": str(j["path"])} for j in source_jobs],
             "order_source_history_jobs": [{"module": j["module"], "season": j["season"], "file": str(j["path"])} for j in history_source_jobs],
             "catalog_source_history_jobs": catalog_history_jobs,
             "order_detail_history_jobs": detail_history_jobs,
         }
+        if metadata_extra:
+            base_meta.update(dict(metadata_extra))
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO etl_run (run_id, run_type, status, metadata) VALUES (%s, %s, 'running', %s::jsonb)",
@@ -1197,6 +1437,9 @@ def run_db_sync(
             with conn.cursor() as cur:
                 cur.executemany(sql, rows)
             return len(rows)
+
+        stock_insert_placeholders = ", ".join(["%s"] * (9 + len(DB_SIZE_COLUMNS) + 1))
+        feature_insert_placeholders = ", ".join(["%s"] * (35 + len(DB_SIZE_COLUMNS)))
 
         counts = {
             "dim_shop": _exec_many(
@@ -1212,10 +1455,11 @@ def run_db_sync(
             ),
             "dim_article": _exec_many(
                 """
-                INSERT INTO dim_article (article_code, description, categoria, tipologia, marchio, colore, materiale)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO dim_article (article_code, description, reparto, categoria, tipologia, marchio, colore, materiale)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (article_code) DO UPDATE SET
                   description=COALESCE(EXCLUDED.description, dim_article.description),
+                  reparto=COALESCE(EXCLUDED.reparto, dim_article.reparto),
                   categoria=COALESCE(EXCLUDED.categoria, dim_article.categoria),
                   tipologia=COALESCE(EXCLUDED.tipologia, dim_article.tipologia),
                   marchio=COALESCE(EXCLUDED.marchio, dim_article.marchio),
@@ -1243,13 +1487,18 @@ def run_db_sync(
                 """
                 INSERT INTO fact_stock_snapshot (
                   run_id, snapshot_at, article_code, shop_code, ricevuto, giacenza, consegnato, venduto, sellout_percent,
-                  size_35, size_36, size_37, size_38, size_39, size_40, size_41, size_42, valore_giac
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                  """
+                + SQL_SIZE_INSERT_COLUMNS
+                + """, valore_giac
+                ) VALUES ("""
+                + stock_insert_placeholders
+                + """)
                 ON CONFLICT (run_id, article_code, shop_code) DO UPDATE SET
                   snapshot_at=EXCLUDED.snapshot_at, ricevuto=EXCLUDED.ricevuto, giacenza=EXCLUDED.giacenza, consegnato=EXCLUDED.consegnato,
                   venduto=EXCLUDED.venduto, sellout_percent=EXCLUDED.sellout_percent,
-                  size_35=EXCLUDED.size_35, size_36=EXCLUDED.size_36, size_37=EXCLUDED.size_37, size_38=EXCLUDED.size_38,
-                  size_39=EXCLUDED.size_39, size_40=EXCLUDED.size_40, size_41=EXCLUDED.size_41, size_42=EXCLUDED.size_42,
+                  """
+                + SQL_SIZE_UPDATE_COLUMNS
+                + """,
                   valore_giac=EXCLUDED.valore_giac
                 """,
                 stock_rows,
@@ -1266,21 +1515,33 @@ def run_db_sync(
                 """
                 INSERT INTO fact_feature_state (
                   run_id, article_code, shop_code, fascia, is_outlet, role, demand_raw, demand_rule, demand_ai, demand_blend_weight, demand_hybrid,
-                  demand_model_mode, demand_model_quality_r2, periodo_qty, stock_after, shop_capacity_pairs, shop_capacity_target, shop_free_capacity_after,
-                  shop_capacity_source, capacity_blocked_moves, ops_blocked_moves, shop_inbound_budget, shop_outbound_budget, shop_inbound_used, shop_outbound_used,
-                  size_35, size_36, size_37, size_38, size_39, size_40, size_41, size_42
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                  demand_model_mode, demand_model_quality_r2, periodo_qty, observed_sales_signal, receiver_eligible_by_sales, stock_depth, shop_priority_rank,
+                  missing_core_sizes, core_size_coverage_ratio, low_stock_active_candidate, zero_sales_source_candidate, destination_priority_score, source_priority_score,
+                  stock_after, shop_capacity_pairs, shop_capacity_target, shop_free_capacity_after, shop_capacity_source, capacity_blocked_moves, ops_blocked_moves,
+                  shop_inbound_budget, shop_outbound_budget, shop_inbound_used, shop_outbound_used, """
+                + SQL_SIZE_INSERT_COLUMNS
+                + """
+                ) VALUES ("""
+                + feature_insert_placeholders
+                + """)
                 ON CONFLICT (run_id, article_code, shop_code) DO UPDATE SET
                   fascia=EXCLUDED.fascia, is_outlet=EXCLUDED.is_outlet, role=EXCLUDED.role, demand_raw=EXCLUDED.demand_raw, demand_rule=EXCLUDED.demand_rule,
                   demand_ai=EXCLUDED.demand_ai, demand_blend_weight=EXCLUDED.demand_blend_weight, demand_hybrid=EXCLUDED.demand_hybrid,
                   demand_model_mode=EXCLUDED.demand_model_mode, demand_model_quality_r2=EXCLUDED.demand_model_quality_r2,
-                  periodo_qty=EXCLUDED.periodo_qty, stock_after=EXCLUDED.stock_after, shop_capacity_pairs=EXCLUDED.shop_capacity_pairs,
-                  shop_capacity_target=EXCLUDED.shop_capacity_target, shop_free_capacity_after=EXCLUDED.shop_free_capacity_after,
-                  shop_capacity_source=EXCLUDED.shop_capacity_source, capacity_blocked_moves=EXCLUDED.capacity_blocked_moves,
-                  ops_blocked_moves=EXCLUDED.ops_blocked_moves, shop_inbound_budget=EXCLUDED.shop_inbound_budget, shop_outbound_budget=EXCLUDED.shop_outbound_budget,
+                  periodo_qty=EXCLUDED.periodo_qty, observed_sales_signal=EXCLUDED.observed_sales_signal,
+                  receiver_eligible_by_sales=EXCLUDED.receiver_eligible_by_sales, stock_depth=EXCLUDED.stock_depth,
+                  shop_priority_rank=EXCLUDED.shop_priority_rank, missing_core_sizes=EXCLUDED.missing_core_sizes,
+                  core_size_coverage_ratio=EXCLUDED.core_size_coverage_ratio, low_stock_active_candidate=EXCLUDED.low_stock_active_candidate,
+                  zero_sales_source_candidate=EXCLUDED.zero_sales_source_candidate, destination_priority_score=EXCLUDED.destination_priority_score,
+                  source_priority_score=EXCLUDED.source_priority_score, stock_after=EXCLUDED.stock_after,
+                  shop_capacity_pairs=EXCLUDED.shop_capacity_pairs, shop_capacity_target=EXCLUDED.shop_capacity_target,
+                  shop_free_capacity_after=EXCLUDED.shop_free_capacity_after, shop_capacity_source=EXCLUDED.shop_capacity_source,
+                  capacity_blocked_moves=EXCLUDED.capacity_blocked_moves, ops_blocked_moves=EXCLUDED.ops_blocked_moves,
+                  shop_inbound_budget=EXCLUDED.shop_inbound_budget, shop_outbound_budget=EXCLUDED.shop_outbound_budget,
                   shop_inbound_used=EXCLUDED.shop_inbound_used, shop_outbound_used=EXCLUDED.shop_outbound_used,
-                  size_35=EXCLUDED.size_35, size_36=EXCLUDED.size_36, size_37=EXCLUDED.size_37, size_38=EXCLUDED.size_38,
-                  size_39=EXCLUDED.size_39, size_40=EXCLUDED.size_40, size_41=EXCLUDED.size_41, size_42=EXCLUDED.size_42
+                  """
+                + SQL_SIZE_UPDATE_COLUMNS
+                + """
                 """,
                 feat_rows,
             ),
