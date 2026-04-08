@@ -207,3 +207,43 @@ class CatalogApiWorkflowTests(unittest.TestCase, TempPathMixin):
                     timeout=120.0,
                     interval=1.0,
                 )
+
+    def test_catalog_showcase_async_job_lock_and_status(self) -> None:
+        payload = {
+            "run_id": self.catalog_run_id,
+            "export_mode": "html",
+            "primary_source": "web",
+            "allow_fallback": False,
+            "selected_seasons": [self.season_code],
+            "selected_reparti": [],
+            "selected_suppliers": [],
+            "selected_categories": [],
+            "selected_brands": [],
+            "manual_codes_text": self.article_code,
+            "photo_root": "",
+            "photo_position": "xl",
+            "allow_position_variants": True,
+            "jpg_layout": "minimal",
+        }
+        with self.ui_client() as client:
+            first = client.post("/api/catalog/showcase/jobs", json=payload)
+            self.assertEqual(first.status_code, 200, msg=first.text)
+            second = client.post("/api/catalog/showcase/jobs", json=payload)
+            self.assertEqual(second.status_code, 409)
+
+            job_id = first.json()["job"]["job_id"]
+            final = wait_for_status(
+                lambda: client.get(f"/api/catalog/showcase/jobs/{job_id}").json(),
+                success={"success"},
+                failure={"failed"},
+                timeout=180.0,
+                interval=1.0,
+            )
+            latest = client.get("/api/catalog/showcase/jobs/latest")
+            active = client.get("/api/catalog/showcase/jobs/active")
+
+        self.assertEqual(final.get("status"), "success")
+        self.assertEqual(latest.status_code, 200)
+        self.assertEqual(latest.json()["job"]["job_id"], job_id)
+        self.assertEqual(active.status_code, 200)
+        self.assertIsNone(active.json()["job"])

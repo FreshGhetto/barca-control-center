@@ -183,6 +183,10 @@ Note operative:
 - i test di integrazione usano PostgreSQL e creano database temporanei dedicati, poi li eliminano a fine esecuzione
 - se le variabili `BARCA_DB_*` non sono allineate, la suite prova a recuperare automaticamente le credenziali dal container Docker `barca-postgres`
 
+Guida operativa completa per onboarding, DB, utenti, ruoli, container, script e recovery:
+
+- `docs/onboarding_operativo_barca.md`
+
 Hardening DB v2 (retention/maintenance + runbook partizionamento):
 - esegui `db/hardening_v2.sql` in DataGrip
 - include funzioni:

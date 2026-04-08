@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import time
 import unittest
 
 from fastapi.testclient import TestClient
@@ -183,6 +184,32 @@ class FreshPipelineWorkflowTests(DatabaseIntegrationTestCase):
                 interval=1.0,
             )
             self.assertEqual(final.get("return_code"), 0)
+
+    def test_ui_run_manager_can_stop_running_pipeline(self) -> None:
+        with self.ui_client() as client:
+            response = client.post(
+                "/api/run",
+                json={
+                    "source_db_run_id": self.raw_run_id,
+                    "skip_orders": False,
+                    "sync_db": True,
+                    "db_create_schema": False,
+                },
+            )
+            self.assertEqual(response.status_code, 200, msg=response.text)
+            run_id = response.json()["run"]["run_id"]
+            time.sleep(1.0)
+            stop = client.post(f"/api/runs/{run_id}/stop")
+            self.assertEqual(stop.status_code, 200, msg=stop.text)
+
+            final = wait_for_status(
+                lambda: client.get(f"/api/runs/{run_id}").json(),
+                success={"stopped"},
+                failure={"failed"},
+                timeout=60.0,
+                interval=1.0,
+            )
+            self.assertEqual(final.get("status_raw"), "stopped")
 
 
 class HistoricalImportsWorkflowTests(DatabaseIntegrationTestCase, TempPathMixin):

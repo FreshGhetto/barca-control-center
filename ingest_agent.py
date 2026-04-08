@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import openpyxl
+import xlrd
 
 
 SUPPORTED_EXT = {".csv", ".xlsx", ".xlsm", ".xls"}
@@ -83,11 +84,29 @@ def _read_xlsx_preview(path: Path, max_rows: int = 120, max_cols: int = 120) -> 
         wb.close()
 
 
+def _read_xls_preview(path: Path, max_rows: int = 120, max_cols: int = 120) -> str:
+    book = xlrd.open_workbook(path)
+    try:
+        sheet = book.sheet_by_index(0)
+        rows = []
+        for ridx in range(min(sheet.nrows, max_rows)):
+            vals = []
+            for cidx in range(min(sheet.ncols, max_cols)):
+                value = sheet.cell_value(ridx, cidx)
+                vals.append("" if value is None else str(value))
+            rows.append(",".join(vals))
+        return "\n".join(rows)
+    finally:
+        book.release_resources()
+
+
 def _read_preview(path: Path) -> str:
     suffix = path.suffix.lower()
     if suffix == ".csv":
         return _read_csv_preview(path)
-    if suffix in {".xlsx", ".xlsm", ".xls"}:
+    if suffix == ".xls":
+        return _read_xls_preview(path)
+    if suffix in {".xlsx", ".xlsm"}:
         return _read_xlsx_preview(path)
     return ""
 
@@ -139,6 +158,18 @@ def _convert_to_csv(src: Path, dst: Path):
     suffix = src.suffix.lower()
     if suffix == ".csv":
         shutil.copy2(src, dst)
+        return
+
+    if suffix == ".xls":
+        book = xlrd.open_workbook(src)
+        try:
+            sheet = book.sheet_by_index(0)
+            with open(dst, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
+                for ridx in range(sheet.nrows):
+                    writer.writerow(["" if value is None else str(value) for value in sheet.row_values(ridx)])
+        finally:
+            book.release_resources()
         return
 
     wb = openpyxl.load_workbook(src, read_only=True, data_only=True)

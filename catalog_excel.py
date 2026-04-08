@@ -119,8 +119,11 @@ def _iter_rows_from_xlsx(xlsx_path: Path, sheet: int | str = 0) -> Tuple[str, It
         worksheet = workbook[sheet] if sheet in workbook.sheetnames else workbook.worksheets[0]
 
     def gen():
-        for row in worksheet.iter_rows(values_only=True):
-            yield list(row)
+        try:
+            for row in worksheet.iter_rows(values_only=True):
+                yield list(row)
+        finally:
+            workbook.close()
 
     return worksheet.title, gen()
 
