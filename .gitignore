@@ -4,7 +4,5 @@ __pycache__/
 .ipynb_checkpoints/
 incoming/
 input/orders/
-output/ingest/
-output/orders/
-output/ui/
+output/
 config/ui_settings.json
