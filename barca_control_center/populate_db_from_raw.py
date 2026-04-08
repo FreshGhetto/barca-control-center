@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -60,7 +61,7 @@ def parse_args() -> argparse.Namespace:
         "--orders-root",
         type=Path,
         default=None,
-        help="Root bundle ordini. Default: input/orders, poi fallback cartella legacy.",
+        help="Root bundle ordini. Default: input/orders, poi BARCA_ORDERS_ROOT se impostata.",
     )
     parser.add_argument(
         "--orders-coverage",
@@ -87,7 +88,9 @@ def _pick_orders_root(root: Path, cli_orders_root: Optional[Path]) -> Optional[P
         candidates.append(cli_orders_root)
     else:
         candidates.append(root / "input" / "orders")
-        candidates.append(Path(r"C:\Users\bacci\Downloads\Downloads\per_previsioni"))
+        env_orders_root = os.getenv("BARCA_ORDERS_ROOT")
+        if env_orders_root:
+            candidates.append(Path(env_orders_root).expanduser())
 
     for cand in candidates:
         if cand and has_order_inputs(cand):

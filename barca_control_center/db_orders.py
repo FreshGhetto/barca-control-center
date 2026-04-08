@@ -264,91 +264,110 @@ def export_orders_outputs_from_db(
     output_orders.mkdir(parents=True, exist_ok=True)
 
     dsn = get_db_dsn()
-    with psycopg.connect(dsn) as conn:
-        run_id = _pick_orders_source_run_id(conn, source_run_id)
-        main_df = _fetch_df(
-            conn,
-            """
-            SELECT
-              f.module,
-              f.season_code,
-              f.mode,
-              f.article_code,
-              f.totale_qty,
-              f.predizione_vendite,
-              f.prezzo_acquisto,
-              f.budget_acquisto,
-              da.categoria,
-              da.tipologia,
-              da.marchio,
-              da.colore,
-              da.materiale,
-              da.description
-            FROM fact_order_forecast f
-            LEFT JOIN dim_article da ON da.article_code = f.article_code
-            WHERE f.run_id = %s::uuid
-            ORDER BY f.module, f.mode, f.article_code
-            """,
-            (run_id,),
+    try:
+        with psycopg.connect(dsn) as conn:
+            run_id = _pick_orders_source_run_id(conn, source_run_id)
+            main_df = _fetch_df(
+                conn,
+                """
+                SELECT
+                  f.module,
+                  f.season_code,
+                  f.mode,
+                  f.article_code,
+                  f.totale_qty,
+                  f.predizione_vendite,
+                  f.prezzo_acquisto,
+                  f.budget_acquisto,
+                  da.categoria,
+                  da.tipologia,
+                  da.marchio,
+                  da.colore,
+                  da.materiale,
+                  da.description
+                FROM fact_order_forecast f
+                LEFT JOIN dim_article da ON da.article_code = f.article_code
+                WHERE f.run_id = %s::uuid
+                ORDER BY f.module, f.mode, f.article_code
+                """,
+                (run_id,),
+            )
+            size_df = _fetch_df(
+                conn,
+                """
+                SELECT
+                  module,
+                  season_code,
+                  mode,
+                  article_code,
+                  size,
+                  qty
+                FROM fact_order_forecast_size
+                WHERE run_id = %s::uuid
+                ORDER BY module, mode, article_code, size
+                """,
+                (run_id,),
+            )
+            source_main_df = _fetch_df(
+                conn,
+                """
+                SELECT
+                  module,
+                  season_code,
+                  article_code,
+                  categoria,
+                  tipologia,
+                  marchio,
+                  colore,
+                  materiale,
+                  descrizione,
+                  venduto_totale,
+                  venduto_periodo,
+                  giacenza,
+                  venduto_extra,
+                  fascia_prezzo,
+                  prezzo_listino,
+                  prezzo_acquisto,
+                  prezzo_vendita
+                FROM fact_order_source
+                WHERE run_id = %s::uuid
+                ORDER BY module, article_code
+                """,
+                (run_id,),
+            )
+            source_size_df = _fetch_df(
+                conn,
+                """
+                SELECT
+                  module,
+                  season_code,
+                  article_code,
+                  size,
+                  venduto_qty
+                FROM fact_order_source_size
+                WHERE run_id = %s::uuid
+                ORDER BY module, article_code, size
+                """,
+                (run_id,),
+            )
+    except RuntimeError as exc:
+        if "dati ordini disponibili" not in str(exc):
+            raise
+        summary = {
+            "enabled": False,
+            "reason": "no_orders_available",
+            "source": "db",
+            "source_run_id": None,
+            "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+        }
+        (output_orders / "orders_summary.json").write_text(
+            json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
         )
-        size_df = _fetch_df(
-            conn,
-            """
-            SELECT
-              module,
-              season_code,
-              mode,
-              article_code,
-              size,
-              qty
-            FROM fact_order_forecast_size
-            WHERE run_id = %s::uuid
-            ORDER BY module, mode, article_code, size
-            """,
-            (run_id,),
+        (output_orders / "orders_run_log.txt").write_text(
+            f"[{dt.datetime.now().strftime('%H:%M:%S')}] Nessun dato ordini disponibile nel database\n",
+            encoding="utf-8",
         )
-        source_main_df = _fetch_df(
-            conn,
-            """
-            SELECT
-              module,
-              season_code,
-              article_code,
-              categoria,
-              tipologia,
-              marchio,
-              colore,
-              materiale,
-              descrizione,
-              venduto_totale,
-              venduto_periodo,
-              giacenza,
-              venduto_extra,
-              fascia_prezzo,
-              prezzo_listino,
-              prezzo_acquisto,
-              prezzo_vendita
-            FROM fact_order_source
-            WHERE run_id = %s::uuid
-            ORDER BY module, article_code
-            """,
-            (run_id,),
-        )
-        source_size_df = _fetch_df(
-            conn,
-            """
-            SELECT
-              module,
-              season_code,
-              article_code,
-              size,
-              venduto_qty
-            FROM fact_order_source_size
-            WHERE run_id = %s::uuid
-            ORDER BY module, article_code, size
-            """,
-            (run_id,),
-        )
+        return summary
 
     if main_df.empty:
         summary = {
