@@ -9,7 +9,7 @@ def fetch_image_bytes(code: str) -> Tuple[Optional[bytes], Optional[str]]:
     """
     try:
         # Import lazy to keep app start fast
-        from catalog_legacy_imports import legacy_fetch_image_for_code
+        from .catalog_legacy_imports import legacy_fetch_image_for_code
         return legacy_fetch_image_for_code(code)
     except Exception as e:
         return None, f"image_fetch_unavailable:{type(e).__name__}"
