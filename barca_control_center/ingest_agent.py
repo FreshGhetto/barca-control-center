@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 
 import openpyxl
 import xlrd
-from input_formats import classify_input_file
+from .input_formats import classify_input_file
 
 
 SUPPORTED_EXT = {".csv", ".xlsx", ".xlsm", ".xls"}

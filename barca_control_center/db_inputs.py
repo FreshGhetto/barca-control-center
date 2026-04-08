@@ -5,8 +5,8 @@ from typing import Any, Dict, Optional
 
 import pandas as pd
 
-from db_sync import get_db_dsn
-from reparto_sizes import SUPPORTED_SIZES
+from .db_sync import get_db_dsn
+from .reparto_sizes import SUPPORTED_SIZES
 
 try:
     import psycopg

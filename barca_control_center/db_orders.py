@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional
 
 import pandas as pd
 
-from db_sync import get_db_dsn
+from .db_sync import get_db_dsn
 
 try:
     import psycopg

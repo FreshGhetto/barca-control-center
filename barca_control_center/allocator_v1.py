@@ -5,9 +5,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 import pandas as pd
 import numpy as np
-from analysis import build_article_shop_transfer_signals, validate_stock_snapshot_integrity
-from hybrid_demand import compute_hybrid_demand
-from reparto_sizes import SUPPORTED_SIZES, normalize_reparto, required_core_sizes
+from .analysis import build_article_shop_transfer_signals, validate_stock_snapshot_integrity
+from .hybrid_demand import compute_hybrid_demand
+from .reparto_sizes import SUPPORTED_SIZES, normalize_reparto, required_core_sizes
 
 SIZES = list(SUPPORTED_SIZES)
 EXCLUDE_SHOPS = {"MR", "MP", "SP", "SPW"}
@@ -1085,7 +1085,7 @@ def run_allocation(clean_sales_csv: Path, clean_articles_csv: Path, shops_xlsx: 
     return run_allocation_frames(sales, articles, shops_xlsx, output_dir, write_outputs=True)
 
 if __name__ == "__main__":
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parent.parent
     cfg = root / "config" / "lista-negozi_integrato.xlsx"
     if not cfg.exists():
         cfg = root / "config" / "lista-negozi.xlsx"

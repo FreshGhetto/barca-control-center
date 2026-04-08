@@ -8,9 +8,9 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
-from catalog_excel import ensure_xlsx, parse_situazione_articoli_excel
-from catalog_price import build_article_metadata_from_files, build_price_snapshot_from_files
-from db_sync import get_db_dsn
+from .catalog_excel import ensure_xlsx, parse_situazione_articoli_excel
+from .catalog_price import build_article_metadata_from_files, build_price_snapshot_from_files
+from .db_sync import get_db_dsn
 
 try:
     import psycopg

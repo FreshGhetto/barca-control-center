@@ -1,6 +1,7 @@
 # BARCA Unified Engine (Distribuzione + Ordini)
 
 ## Struttura cartelle
+- `barca_control_center/` -> package Python principale con la logica applicativa; il root del repo mantiene solo wrapper CLI/entrypoint
 - `incoming/` → cartella drop raw (`csv`/`xlsx`) usata solo per popolare il DB
 - `input/` → file mensili intermedi (`sales_YYYY-MM.csv`, `stock_YYYY-MM.csv`) usati solo nel bootstrap DB
 - `input/orders/` → (opzionale) CSV progetto ordini (`*_sd_1.csv`, `*_sd_2.csv`, `*_sd_3.csv`)

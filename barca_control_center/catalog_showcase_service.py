@@ -11,11 +11,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from catalog_image_provider import fetch_image_bytes
-from catalog_local_images import flatten_index, scan_local_images
-from catalog_models import Article, CatalogStoreRow
-from catalog_showcase import export_showcase_catalog
-from db_sync import get_db_dsn
+from .catalog_image_provider import fetch_image_bytes
+from .catalog_local_images import flatten_index, scan_local_images
+from .catalog_models import Article, CatalogStoreRow
+from .catalog_showcase import export_showcase_catalog
+from .db_sync import get_db_dsn
 
 try:
     import psycopg

@@ -172,7 +172,7 @@ def _newest_file(folder: Path, prefix: str):
     return files[-1] if files else None
 
 if __name__ == "__main__":
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parent.parent
     input_dir = root / "input"
     output_dir = root / "output"
     raw_dir = root / "data" / "raw_original"

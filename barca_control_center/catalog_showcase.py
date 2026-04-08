@@ -8,8 +8,8 @@ from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from PIL import Image, ImageDraw, ImageFont
 
-from catalog_local_images import lookup_local_image_path, normalize_code
-from catalog_models import Article
+from .catalog_local_images import lookup_local_image_path, normalize_code
+from .catalog_models import Article
 
 _INVALID_FS_CHARS_RE = re.compile(r'[<>:"/\\|?*]')
 

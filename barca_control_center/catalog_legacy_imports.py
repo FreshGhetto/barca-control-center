@@ -4,7 +4,7 @@ from typing import Optional, Tuple
 import importlib.util
 import sys
 
-_ROOT = Path(__file__).resolve().parent
+_ROOT = Path(__file__).resolve().parent.parent
 _LEGACY_DIR = _ROOT / "catalog_legacy"
 
 def _import_legacy_module(name: str, filename: str):

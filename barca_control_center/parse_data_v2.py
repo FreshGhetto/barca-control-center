@@ -3,7 +3,7 @@ import csv
 import re
 from pathlib import Path
 import pandas as pd
-from reparto_sizes import SUPPORTED_SIZES, infer_reparto_from_path, infer_reparto_from_values
+from .reparto_sizes import SUPPORTED_SIZES, infer_reparto_from_path, infer_reparto_from_values
 
 VALID_CODES_DEFAULT = [
     'AR','AU','BO','BS','CA','CO','EU','EU2','LN','MC','MI',

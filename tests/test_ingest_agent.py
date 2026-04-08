@@ -6,8 +6,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from ingest_agent import _classify_file, _convert_to_csv, _read_preview, ingest_incoming
-from input_formats import describe_known_input_formats
+from barca_control_center.ingest_agent import _classify_file, _convert_to_csv, _read_preview, ingest_incoming
+from barca_control_center.input_formats import describe_known_input_formats
 from tests._support import ROOT
 
 
@@ -123,8 +123,8 @@ class IngestAgentTests(unittest.TestCase):
         fake_book = _FakeBook()
         with tempfile.TemporaryDirectory(prefix="barca_ingest_xls_") as tmp_dir:
             dst = Path(tmp_dir) / "sample.csv"
-            with mock.patch("ingest_agent.xlrd.open_workbook", return_value=fake_book) as open_book, mock.patch(
-                "ingest_agent.openpyxl.load_workbook",
+            with mock.patch("barca_control_center.ingest_agent.xlrd.open_workbook", return_value=fake_book) as open_book, mock.patch(
+                "barca_control_center.ingest_agent.openpyxl.load_workbook",
                 side_effect=AssertionError("openpyxl non deve essere usato per .xls"),
             ):
                 preview = _read_preview(Path("campione.xls"))
