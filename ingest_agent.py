@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 import openpyxl
 import xlrd
+from input_formats import classify_input_file
 
 
 SUPPORTED_EXT = {".csv", ".xlsx", ".xlsm", ".xls"}
@@ -112,45 +113,7 @@ def _read_preview(path: Path) -> str:
 
 
 def _classify_file(path: Path, preview: str) -> Dict[str, Any]:
-    text = preview.upper()
-    fname = path.name.upper()
-
-    if "SITUAZIONE ARTICOLI PER NEGOZIO" in text:
-        return {"kind": "stock_report", "target_group": "distribution"}
-
-    if "ANALISI LISTINI E RICARICHI" in text:
-        return {"kind": "orders_prices", "target_group": "orders"}
-
-    if "_SD_3" in fname or "ANALISI PER SINGOLA TAGLIA" in text:
-        return {"kind": "orders_sd_3", "target_group": "orders"}
-
-    if "_SD_4" in fname or ("FASCE PRZ." in text and "LISTINO" in text and "ANALISI ARTICOLI" in text):
-        return {"kind": "orders_sd_4", "target_group": "orders"}
-
-    if "_SD_1" in fname:
-        return {"kind": "orders_sd_1", "target_group": "orders"}
-
-    if "_SD_2" in fname:
-        return {"kind": "orders_sd_2", "target_group": "orders"}
-
-    if "ANALISI ARTICOLI" in text:
-        if (
-            "RAFFRONTA CON VENDUTO NEL PERIODO" in text
-            and "COLORE" in text
-            and "MATERIALE" in text
-            and "MARCHIO" in text
-        ):
-            return {"kind": "orders_history_detail", "target_group": "orders"}
-        if "NEGOZIO" in text and "FORNITORE" in text:
-            return {"kind": "sales_report", "target_group": "distribution"}
-        if "TIPOLOGIA" in text and "MARCHIO" in text:
-            return {"kind": "orders_sd_1", "target_group": "orders"}
-        if "COLORE" in text and "MATERIALE" in text:
-            return {"kind": "orders_sd_2", "target_group": "orders"}
-        if "TAG" in text and "TOT" in text:
-            return {"kind": "orders_sd_3", "target_group": "orders"}
-
-    return {"kind": "unknown", "target_group": "quarantine"}
+    return classify_input_file(path, preview)
 
 
 def _convert_to_csv(src: Path, dst: Path):
@@ -243,6 +206,8 @@ def ingest_incoming(
             "status": "unknown",
             "kind": "",
             "target": "",
+            "confidence": 0.0,
+            "reasons": "",
             "note": "",
         }
         try:
@@ -250,6 +215,8 @@ def ingest_incoming(
             cls = _classify_file(src, preview)
             kind = cls["kind"]
             rec["kind"] = kind
+            rec["confidence"] = cls.get("confidence", 0.0)
+            rec["reasons"] = " | ".join(str(item) for item in cls.get("reasons", []))
 
             report_date = _extract_report_date(preview)
             season_code = _extract_season_code(preview, src.name)
@@ -261,7 +228,7 @@ def ingest_incoming(
                 shutil.copy2(src, q_path)
                 rec["status"] = "quarantine"
                 rec["target"] = str(q_path)
-                rec["note"] = "Formato non riconosciuto"
+                rec["note"] = str(cls.get("description", "Formato non riconosciuto"))
                 if move_processed:
                     src.unlink(missing_ok=True)
                 rows.append(rec)
@@ -302,7 +269,10 @@ def ingest_incoming(
     (reports_dir / "ingest_report_latest.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     (reports_dir / f"ingest_report_{tag}.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     with open(reports_dir / "ingest_report_latest.csv", "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["source", "filename", "status", "kind", "target", "note"])
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["source", "filename", "status", "kind", "target", "confidence", "reasons", "note"],
+        )
         writer.writeheader()
         writer.writerows(rows)
 

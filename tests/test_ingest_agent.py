@@ -6,7 +6,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from ingest_agent import _convert_to_csv, _read_preview, ingest_incoming
+from ingest_agent import _classify_file, _convert_to_csv, _read_preview, ingest_incoming
+from input_formats import describe_known_input_formats
 from tests._support import ROOT
 
 
@@ -42,6 +43,11 @@ class _FakeBook:
 
 
 class IngestAgentTests(unittest.TestCase):
+    def test_known_input_catalog_contains_core_families(self) -> None:
+        rows = describe_known_input_formats()
+        kinds = {row["kind"] for row in rows}
+        self.assertTrue({"sales_report", "stock_report", "orders_sd_1", "orders_sd_2", "orders_sd_3", "orders_prices"} <= kinds)
+
     def test_ingest_classifies_sales_stock_and_quarantine(self) -> None:
         with tempfile.TemporaryDirectory(prefix="barca_ingest_") as tmp_dir:
             root = Path(tmp_dir)
@@ -79,6 +85,39 @@ class IngestAgentTests(unittest.TestCase):
             row = summary["rows"][0]
             self.assertEqual(row["status"], "quarantine")
             self.assertTrue(Path(row["target"]).exists())
+
+    def test_classifier_uses_logical_headers_not_only_filename(self) -> None:
+        sd1_preview = (
+            "ANALISI ARTICOLI, Stagione:25I, REPARTO, CATEGORIA, TIPOLOGIA, BRAND, ARTICOLO, CON., VEND., PERIO"
+        )
+        prices_preview = (
+            "Analisi Listini e Ricarichi, REPARTO, CATEGORIA, PREZZO ACQUIS., PREZZO VENDITA, FASCE PRZ., RIC."
+        )
+
+        sd1 = _classify_file(Path("stagione_libera_totali.csv"), sd1_preview)
+        prices = _classify_file(Path("pricing_export_variant.csv"), prices_preview)
+
+        self.assertEqual(sd1["kind"], "orders_sd_1")
+        self.assertEqual(prices["kind"], "orders_prices")
+        self.assertGreater(sd1["confidence"], 0.5)
+        self.assertGreater(prices["confidence"], 0.5)
+
+    def test_ingest_report_includes_classification_reasons(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="barca_ingest_reasons_") as tmp_dir:
+            root = Path(tmp_dir)
+            incoming = root / "incoming"
+            incoming.mkdir(parents=True, exist_ok=True)
+            (incoming / SALES_RAW.name).write_bytes(SALES_RAW.read_bytes())
+
+            summary = ingest_incoming(root=root, incoming_dir=incoming, move_processed=False, verbose=False)
+
+            self.assertEqual(summary["ingested"], 1)
+            row = summary["rows"][0]
+            self.assertIn("header:", row["reasons"])
+            report_csv = root / "output" / "ingest" / "ingest_report_latest.csv"
+            report_text = report_csv.read_text(encoding="utf-8")
+            self.assertIn("confidence", report_text)
+            self.assertIn("reasons", report_text)
 
     def test_xls_preview_and_conversion_use_xlrd(self) -> None:
         fake_book = _FakeBook()

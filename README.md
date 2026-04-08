@@ -186,6 +186,7 @@ Note operative:
 Guida operativa completa per onboarding, DB, utenti, ruoli, container, script e recovery:
 
 - `docs/onboarding_operativo_barca.md`
+- `docs/formati_input_barca.md`
 
 Hardening DB v2 (retention/maintenance + runbook partizionamento):
 - esegui `db/hardening_v2.sql` in DataGrip
