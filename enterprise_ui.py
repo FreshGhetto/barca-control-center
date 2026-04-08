@@ -829,6 +829,7 @@ class RunManager:
 
     def _runner_thread(self, run_id: str):
         run: Optional[PipelineRun] = None
+        proc: Optional[subprocess.Popen[str]] = None
         with self.lock:
             run = next((r for r in self.runs if r.run_id == run_id), None)
             if run is None:
@@ -856,11 +857,12 @@ class RunManager:
                 self.current_proc = proc
 
             assert proc.stdout is not None
-            for line in proc.stdout:
-                with self.lock:
-                    if run is None:
-                        break
-                    self._append_log(run, line)
+            with proc.stdout:
+                for line in proc.stdout:
+                    with self.lock:
+                        if run is None:
+                            break
+                        self._append_log(run, line)
 
             rc = proc.wait()
             with self.lock:

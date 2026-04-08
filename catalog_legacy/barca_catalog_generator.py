@@ -121,10 +121,8 @@ def is_image_response(resp: requests.Response) -> bool:
 def is_barca_placeholder(img_bytes: bytes) -> bool:
     # placeholder molto uniforme => varianza bassa
     try:
-        im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        small = im.resize((90, 90))
-        px = list(small.getdata())
-        gray = [(r + g + b) // 3 for r, g, b in px]
+        im = Image.open(io.BytesIO(img_bytes)).convert("L")
+        gray = list(im.resize((90, 90)).tobytes())
         mean = sum(gray) / len(gray)
         var = sum((x - mean) ** 2 for x in gray) / len(gray)
         return var < 180

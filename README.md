@@ -159,6 +159,30 @@ Hardening DB enterprise (consigliato in produzione):
 
 Il file è: `db/hardening_v1.sql`
 
+## Regression Suite
+Il repository include ora una suite automatica `unittest` che copre:
+- compile/import smoke dei moduli Python principali
+- bootstrap raw su database PostgreSQL temporaneo creato da zero
+- runtime DB-only con `app.py --sync-db`
+- import storico shop-level e sync storico dettaglio ordini
+- API FastAPI per dashboard, export XLSX, catalogo e showcase
+
+Esecuzione:
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+Oppure su Windows:
+
+```bat
+RUN_TESTS.bat
+```
+
+Note operative:
+- i test di integrazione usano PostgreSQL e creano database temporanei dedicati, poi li eliminano a fine esecuzione
+- se le variabili `BARCA_DB_*` non sono allineate, la suite prova a recuperare automaticamente le credenziali dal container Docker `barca-postgres`
+
 Hardening DB v2 (retention/maintenance + runbook partizionamento):
 - esegui `db/hardening_v2.sql` in DataGrip
 - include funzioni:
