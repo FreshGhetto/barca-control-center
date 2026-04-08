@@ -448,8 +448,13 @@ def _catalog_source_history_frames(
     jobs: List[Dict[str, Any]] = []
     with psycopg.connect(dsn) as conn:
         with conn.cursor() as cur:
-            cur.execute(sql)
-            rows = cur.fetchall()
+            try:
+                cur.execute(sql)
+                rows = cur.fetchall()
+            except Exception as exc:
+                if exc.__class__.__name__ == "UndefinedTable":
+                    return frames, jobs
+                raise
 
     if not rows:
         return frames, jobs
@@ -532,8 +537,13 @@ def _catalog_price_snapshot_df(dsn: str) -> pd.DataFrame:
     """
     with psycopg.connect(dsn) as conn:
         with conn.cursor() as cur:
-            cur.execute(sql)
-            rows = cur.fetchall()
+            try:
+                cur.execute(sql)
+                rows = cur.fetchall()
+            except Exception as exc:
+                if exc.__class__.__name__ == "UndefinedTable":
+                    return pd.DataFrame(columns=["season_code", "article_code", "price_listino", "price_saldo"])
+                raise
     if not rows:
         return pd.DataFrame(columns=["season_code", "article_code", "price_listino", "price_saldo"])
     df = pd.DataFrame(rows, columns=["season_code", "article_code", "price_listino", "price_saldo"])
@@ -1054,6 +1064,13 @@ def run_db_sync(
     schema = schema_path or (root / "db" / "schema.sql")
     dsn = get_db_dsn()
     run_id = uuid.uuid4()
+    schema_sql = schema.read_text(encoding="utf-8") if create_schema else None
+
+    if schema_sql:
+        with psycopg.connect(dsn) as schema_conn:
+            with schema_conn.cursor() as cur:
+                cur.execute(schema_sql)
+            schema_conn.commit()
 
     clean_sales = clean_sales_df.copy() if isinstance(clean_sales_df, pd.DataFrame) else _read_csv(out / "clean_sales.csv")
     clean_stock = clean_stock_df.copy() if isinstance(clean_stock_df, pd.DataFrame) else _read_csv(out / "clean_articles.csv")
@@ -1397,11 +1414,11 @@ def run_db_sync(
         print(f"[DB] start run={run_id}")
     conn = psycopg.connect(dsn)
     try:
-        if create_schema:
+        if schema_sql:
             if verbose:
                 print(f"[DB] apply schema {schema}")
             with conn.cursor() as cur:
-                cur.execute(schema.read_text(encoding="utf-8"))
+                cur.execute(schema_sql)
             conn.commit()
 
         base_meta = {
