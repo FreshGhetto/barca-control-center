@@ -70,47 +70,47 @@ def _normalize_shop(series: pd.Series) -> pd.Series:
 
 
 def _extract_capacity_table(path: Path) -> pd.DataFrame:
-    xls = pd.ExcelFile(path)
-    preferred = ["lista_negozi_linked", "capacita_stimate_by_sigla", "capacita_stimate_by_store"]
-    ordered_sheets = [s for s in preferred if s in xls.sheet_names]
-    ordered_sheets.extend([s for s in xls.sheet_names if s not in ordered_sheets])
+    with pd.ExcelFile(path) as xls:
+        preferred = ["lista_negozi_linked", "capacita_stimate_by_sigla", "capacita_stimate_by_store"]
+        ordered_sheets = [s for s in preferred if s in xls.sheet_names]
+        ordered_sheets.extend([s for s in xls.sheet_names if s not in ordered_sheets])
 
-    for sheet in ordered_sheets:
-        df = pd.read_excel(path, sheet_name=sheet)
-        df.columns = [str(c).strip().lower() for c in df.columns]
+        for sheet in ordered_sheets:
+            df = pd.read_excel(xls, sheet_name=sheet)
+            df.columns = [str(c).strip().lower() for c in df.columns]
 
-        c_shop = _pick_column(df.columns.tolist(), "sigla", "sig", "cod", "shop", "negozio")
-        c_cap = _pick_column(
-            df.columns.tolist(),
-            "cap_eff_paia_linked",
-            "cap_eff_paia_sum",
-            "cap_eff_paia",
-            "cap_scaff_paia_linked",
-            "cap_scaff_paia_sum",
-            "cap_scaff_paia",
-        )
-        c_status = _pick_column(df.columns.tolist(), "capacity_link_status", "capacity_status")
+            c_shop = _pick_column(df.columns.tolist(), "sigla", "sig", "cod", "shop", "negozio")
+            c_cap = _pick_column(
+                df.columns.tolist(),
+                "cap_eff_paia_linked",
+                "cap_eff_paia_sum",
+                "cap_eff_paia",
+                "cap_scaff_paia_linked",
+                "cap_scaff_paia_sum",
+                "cap_scaff_paia",
+            )
+            c_status = _pick_column(df.columns.tolist(), "capacity_link_status", "capacity_status")
 
-        if not c_shop or not c_cap:
-            continue
+            if not c_shop or not c_cap:
+                continue
 
-        cap = pd.DataFrame(
-            {
-                "Shop": _normalize_shop(df[c_shop]),
-                "CapacityPairs": pd.to_numeric(df[c_cap], errors="coerce"),
-                "CapacityStatus": df[c_status].astype(str) if c_status else np.nan,
-                "CapacitySource": sheet,
-            }
-        )
-        cap = cap.dropna(subset=["CapacityPairs"])
-        cap = cap[cap["CapacityPairs"] > 0]
-        if cap.empty:
-            continue
+            cap = pd.DataFrame(
+                {
+                    "Shop": _normalize_shop(df[c_shop]),
+                    "CapacityPairs": pd.to_numeric(df[c_cap], errors="coerce"),
+                    "CapacityStatus": df[c_status].astype(str) if c_status else np.nan,
+                    "CapacitySource": sheet,
+                }
+            )
+            cap = cap.dropna(subset=["CapacityPairs"])
+            cap = cap[cap["CapacityPairs"] > 0]
+            if cap.empty:
+                continue
 
-        cap = cap.groupby("Shop", as_index=False).agg(
-            {"CapacityPairs": "max", "CapacityStatus": "first", "CapacitySource": "first"}
-        )
-        return cap
+            cap = cap.groupby("Shop", as_index=False).agg(
+                {"CapacityPairs": "max", "CapacityStatus": "first", "CapacitySource": "first"}
+            )
+            return cap
 
     return pd.DataFrame(columns=["Shop", "CapacityPairs", "CapacityStatus", "CapacitySource"])
 

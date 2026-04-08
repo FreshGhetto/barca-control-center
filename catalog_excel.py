@@ -21,12 +21,12 @@ def ensure_xlsx(path: str | Path) -> Path:
         return p
 
     out_path = p.with_suffix(".xlsx")
-    xls = pd.ExcelFile(p, engine="xlrd")
-    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
-        for sheet in xls.sheet_names:
-            df = pd.read_excel(xls, sheet_name=sheet, dtype=object)
-            safe_name = str(sheet)[:31] if sheet else "Sheet1"
-            df.to_excel(writer, sheet_name=safe_name, index=False)
+    with pd.ExcelFile(p, engine="xlrd") as xls:
+        with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+            for sheet in xls.sheet_names:
+                df = pd.read_excel(xls, sheet_name=sheet, dtype=object)
+                safe_name = str(sheet)[:31] if sheet else "Sheet1"
+                df.to_excel(writer, sheet_name=safe_name, index=False)
     return out_path
 
 

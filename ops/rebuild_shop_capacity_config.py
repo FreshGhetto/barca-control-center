@@ -154,30 +154,30 @@ def load_base_config(path: Path) -> pd.DataFrame:
 
 
 def load_capacity_source(path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
-    xls = pd.ExcelFile(path)
-    if "dati_stimati" in xls.sheet_names:
-        df = pd.read_excel(path, sheet_name="dati_stimati")
-        method = pd.read_excel(path, sheet_name="metodo_stima") if "metodo_stima" in xls.sheet_names else pd.DataFrame()
-    else:
-        df = pd.read_excel(path, sheet_name=xls.sheet_names[0], header=2)
-        cols = list(df.columns)
-        rename_map = {
-            cols[0]: "idx",
-            cols[1]: "negozio",
-            cols[2]: "cap_scaff_paia",
-            cols[3]: "cap_eff_paia",
-            cols[4]: "ratio_eff_vs_scaff",
-            cols[5]: "diff_paia",
-            cols[6]: "vendite_24_paia",
-            cols[7]: "giro_stock",
-            cols[8]: "stock_medio_ideale_paia",
-            cols[9]: "diff_eff_vs_ideale_paia",
-            cols[10]: "linee_eff",
-            cols[11]: "linee_ideali",
-            cols[12]: "diff_linee",
-        }
-        df = df.rename(columns=rename_map)
-        method = pd.DataFrame()
+    with pd.ExcelFile(path) as xls:
+        if "dati_stimati" in xls.sheet_names:
+            df = pd.read_excel(xls, sheet_name="dati_stimati")
+            method = pd.read_excel(xls, sheet_name="metodo_stima") if "metodo_stima" in xls.sheet_names else pd.DataFrame()
+        else:
+            df = pd.read_excel(xls, sheet_name=xls.sheet_names[0], header=2)
+            cols = list(df.columns)
+            rename_map = {
+                cols[0]: "idx",
+                cols[1]: "negozio",
+                cols[2]: "cap_scaff_paia",
+                cols[3]: "cap_eff_paia",
+                cols[4]: "ratio_eff_vs_scaff",
+                cols[5]: "diff_paia",
+                cols[6]: "vendite_24_paia",
+                cols[7]: "giro_stock",
+                cols[8]: "stock_medio_ideale_paia",
+                cols[9]: "diff_eff_vs_ideale_paia",
+                cols[10]: "linee_eff",
+                cols[11]: "linee_ideali",
+                cols[12]: "diff_linee",
+            }
+            df = df.rename(columns=rename_map)
+            method = pd.DataFrame()
 
     df = df.copy()
     df["negozio"] = df["negozio"].astype(str).str.strip()
