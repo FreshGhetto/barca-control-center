@@ -133,7 +133,9 @@ def main():
     print("[STEP 1/3] Inputs DB armonizzati. Avvio allocazione con regole fascia/vendite...")
     alloc_result = run_allocation_frames(sales_df, stock_df, shops_cfg, out, write_outputs=True)
 
+    ord_summary = {"enabled": False, "source": "disabled"}
     orders_source_run_id = None
+    orders_sync_enabled = False
     if args.skip_orders:
         print("\n[STEP 2/3] Modulo ordini saltato (--skip-orders).")
     else:
@@ -145,6 +147,7 @@ def main():
                 verbose=True,
             )
             orders_source_run_id = ord_summary.get("source_run_id")
+            orders_sync_enabled = bool(ord_summary.get("enabled", False) or orders_source_run_id)
             if ord_summary.get("enabled", False):
                 print(
                     "[STEP 2/3] Modulo ordini DB-first completato: "
@@ -173,8 +176,8 @@ def main():
                 features_df=alloc_result["features"],
                 ingest_report={},
                 source_sales_stock_run_id=db_source.get("source_run_id"),
-                source_orders_run_id=orders_source_run_id,
-                include_orders=not args.skip_orders,
+                source_orders_run_id=orders_source_run_id if orders_sync_enabled else None,
+                include_orders=orders_sync_enabled,
                 metadata_extra={
                     "operating_mode": "db_only",
                     "receiver_priority_rule": "fascia_then_local_sales_then_need",

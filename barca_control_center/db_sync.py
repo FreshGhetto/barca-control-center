@@ -1095,35 +1095,36 @@ def run_db_sync(
             ord_summary = {"source": "db", "source_run_id": source_orders_run_id}
         else:
             ord_summary = _read_json(out_orders / "orders_summary.json")
-            jobs = _order_jobs(out_orders, ord_summary)
-            ord_frames = [(_read_csv(j["path"]), j) for j in jobs]
-            source_jobs = _order_source_jobs(out_orders, ord_summary)
-            history_source_jobs = _order_source_history_jobs(out_orders, ord_summary)
+            if ord_summary.get("enabled") is not False:
+                jobs = _order_jobs(out_orders, ord_summary)
+                ord_frames = [(_read_csv(j["path"]), j) for j in jobs]
+                source_jobs = _order_source_jobs(out_orders, ord_summary)
+                history_source_jobs = _order_source_history_jobs(out_orders, ord_summary)
 
-            merged_source_jobs: List[Dict[str, Any]] = []
-            seen_source_keys = set()
-            for job in source_jobs + history_source_jobs:
-                key = (job.get("module"), job.get("season"))
-                if key in seen_source_keys:
-                    continue
-                seen_source_keys.add(key)
-                merged_source_jobs.append(job)
+                merged_source_jobs: List[Dict[str, Any]] = []
+                seen_source_keys = set()
+                for job in source_jobs + history_source_jobs:
+                    key = (job.get("module"), job.get("season"))
+                    if key in seen_source_keys:
+                        continue
+                    seen_source_keys.add(key)
+                    merged_source_jobs.append(job)
 
-            catalog_price_df = _catalog_price_snapshot_df(dsn)
-            raw_ord_source_frames = [(_read_csv(j["path"]), j) for j in merged_source_jobs]
-            catalog_history_frames, catalog_history_jobs = _catalog_source_history_frames(
-                dsn,
-                [(j.get("module"), j.get("season")) for j in merged_source_jobs],
-            )
-            detail_history_frames, detail_history_jobs = _order_detail_history_frames(root)
-            native_bundle_seasons = _discover_native_order_bundle_seasons(root)
-            merged_ord_source_frames = _merge_order_source_frames(
-                raw_ord_source_frames + catalog_history_frames,
-                detail_history_frames,
-                native_bundle_seasons=native_bundle_seasons,
-            )
-            merged_ord_source_frames = _fill_missing_classifications(merged_ord_source_frames)
-            ord_source_frames = [(_enrich_order_source_frame(df, meta, catalog_price_df), meta) for df, meta in merged_ord_source_frames]
+                catalog_price_df = _catalog_price_snapshot_df(dsn)
+                raw_ord_source_frames = [(_read_csv(j["path"]), j) for j in merged_source_jobs]
+                catalog_history_frames, catalog_history_jobs = _catalog_source_history_frames(
+                    dsn,
+                    [(j.get("module"), j.get("season")) for j in merged_source_jobs],
+                )
+                detail_history_frames, detail_history_jobs = _order_detail_history_frames(root)
+                native_bundle_seasons = _discover_native_order_bundle_seasons(root)
+                merged_ord_source_frames = _merge_order_source_frames(
+                    raw_ord_source_frames + catalog_history_frames,
+                    detail_history_frames,
+                    native_bundle_seasons=native_bundle_seasons,
+                )
+                merged_ord_source_frames = _fill_missing_classifications(merged_ord_source_frames)
+                ord_source_frames = [(_enrich_order_source_frame(df, meta, catalog_price_df), meta) for df, meta in merged_ord_source_frames]
     else:
         ord_summary = {"enabled": False, "source": "disabled"}
 
