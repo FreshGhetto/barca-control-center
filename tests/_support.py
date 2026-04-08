@@ -22,9 +22,6 @@ from psycopg import sql
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_PATH = ROOT / "db" / "schema.sql"
 PYTHON_EXE = Path(sys.executable)
-ORDER_DETAIL_HISTORY_DIR = ROOT / "input" / "orders" / "history_detail"
-
-
 def _connection_kwargs(env: Mapping[str, str]) -> Dict[str, Any]:
     return {
         "host": env.get("BARCA_DB_HOST", "localhost"),
@@ -271,6 +268,32 @@ def write_minimal_shop_report_csv(target_dir: Path, *, season_code: str = "25i")
         ["59/SHOPTEST", "", "BALLERINA TEST", "NERO", "WEB", "1", "2", "1", "50", "0", "1", "0"],
     ]
     with destination.open("w", encoding="latin1", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerows(rows)
+    return destination
+
+
+def write_minimal_order_detail_csv(target_dir: Path, *, season_code: str = "25i") -> Path:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    destination = target_dir / f"{season_code}_articoli_venduto_periodo.csv"
+    rows = [
+        [
+            "ANALISI ARTICOLI",
+            "Raffronta con venduto nel periodo",
+            "ARTICOLO",
+            "SCARPE DONNA",
+            "16  NERO",
+            "PL  PELLE",
+            "ACME",
+            "59/DETAILTEST MOCASSINO TEST",
+            "0",
+            "12",
+            "7",
+            "5",
+            "TOTALI :",
+        ]
+    ]
+    with destination.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerows(rows)
     return destination

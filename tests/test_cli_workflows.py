@@ -8,7 +8,6 @@ import unittest
 from fastapi.testclient import TestClient
 
 from tests._support import (
-    ORDER_DETAIL_HISTORY_DIR,
     TempPathMixin,
     apply_schema,
     fetch_json_rows,
@@ -20,6 +19,7 @@ from tests._support import (
     run_cli,
     temporary_database,
     wait_for_status,
+    write_minimal_order_detail_csv,
     write_minimal_shop_report_csv,
 )
 
@@ -221,7 +221,9 @@ class HistoricalImportsWorkflowTests(DatabaseIntegrationTestCase, TempPathMixin)
         super().setUpClass()
         fixture_root = cls.make_temp_dir()
         stock_dir = fixture_root / "shop_reports"
+        detail_dir = fixture_root / "history_detail"
         write_minimal_shop_report_csv(stock_dir)
+        write_minimal_order_detail_csv(detail_dir)
 
         apply_schema(cls.db_env)
 
@@ -236,7 +238,7 @@ class HistoricalImportsWorkflowTests(DatabaseIntegrationTestCase, TempPathMixin)
         detail_cmd = [
             "sync_order_detail_history.py",
             "--detail-dir",
-            str(ORDER_DETAIL_HISTORY_DIR),
+            str(detail_dir),
         ]
         detail_run = run_cli(detail_cmd, env=cls.db_env, timeout=240)
         _ensure_completed(detail_run, detail_cmd)
