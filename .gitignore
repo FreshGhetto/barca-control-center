@@ -5,4 +5,5 @@ __pycache__/
 incoming/
 input/orders/
 output/
+config/backup/
 config/ui_settings.json
