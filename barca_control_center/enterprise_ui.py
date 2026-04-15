@@ -165,6 +165,7 @@ def _friendly_run_type(run_type: Optional[str]) -> str:
     mapping = {
         "app_pipeline": "Aggiornamento completo",
         "manual_sync": "Sincronizzazione database",
+        "raw_input_sync": "Importazione raw",
         "app_pipeline_ui": "Avvio manuale da console",
         "catalog_import": "Import catalogo",
         "detail_history_sync": "Arricchimento dettagli articoli",
@@ -1384,7 +1385,12 @@ def _db_status() -> Dict[str, Any]:
                 latest = None
                 if row:
                     metadata = row[5] if isinstance(row[5], dict) else {}
-                    business_context = _run_business_context(metadata, row[1])
+                    business_context = _run_business_context_with_db_fallback(
+                        cur,
+                        run_id=str(row[0]),
+                        metadata=metadata,
+                        run_type=row[1],
+                    )
                     latest = {
                         "run_id": str(row[0]),
                         "run_type": row[1],
@@ -1526,38 +1532,42 @@ def _db_recent_runs(limit: int = 50) -> List[Dict[str, Any]]:
                     (limit,),
                 )
                 rows = cur.fetchall()
+                out: List[Dict[str, Any]] = []
+                for row in rows:
+                    metadata = row[5] if isinstance(row[5], dict) else {}
+                    started_at = row[3].isoformat() if row[3] else None
+                    ended_at = row[4].isoformat() if row[4] else None
+                    status_raw = row[2]
+                    business_context = _run_business_context_with_db_fallback(
+                        cur,
+                        run_id=str(row[0]),
+                        metadata=metadata,
+                        run_type=row[1],
+                    )
+                    out.append(
+                        {
+                            "run_id": str(row[0]),
+                            "created_at": started_at,
+                            "started_at": started_at,
+                            "ended_at": ended_at,
+                            "status": _status_to_ui(status_raw),
+                            "status_raw": status_raw,
+                            "return_code": None,
+                            "options": {},
+                            "error": None,
+                            "log_tail": [],
+                            "source": "db",
+                            "run_type": row[1],
+                            "run_type_label": business_context["friendly_run_type"],
+                            "status_label": _friendly_status(status_raw),
+                            "metadata": metadata,
+                            "business_context": business_context,
+                            "can_stop": False,
+                        }
+                    )
+                return out
     except Exception:
         return []
-
-    out: List[Dict[str, Any]] = []
-    for row in rows:
-        metadata = row[5] if isinstance(row[5], dict) else {}
-        started_at = row[3].isoformat() if row[3] else None
-        ended_at = row[4].isoformat() if row[4] else None
-        status_raw = row[2]
-        business_context = _run_business_context(metadata, row[1])
-        out.append(
-            {
-                "run_id": str(row[0]),
-                "created_at": started_at,
-                "started_at": started_at,
-                "ended_at": ended_at,
-                "status": _status_to_ui(status_raw),
-                "status_raw": status_raw,
-                "return_code": None,
-                "options": {},
-                "error": None,
-                "log_tail": [],
-                "source": "db",
-                "run_type": row[1],
-                "run_type_label": business_context["friendly_run_type"],
-                "status_label": _friendly_status(status_raw),
-                "metadata": metadata,
-                "business_context": business_context,
-                "can_stop": False,
-            }
-        )
-    return out
 
 
 def _db_recent_dashboard_runs(limit: int = 50) -> List[Dict[str, Any]]:
@@ -1583,38 +1593,42 @@ def _db_recent_dashboard_runs(limit: int = 50) -> List[Dict[str, Any]]:
                     (limit,),
                 )
                 rows = cur.fetchall()
+                out: List[Dict[str, Any]] = []
+                for row in rows:
+                    metadata = row[5] if isinstance(row[5], dict) else {}
+                    started_at = row[3].isoformat() if row[3] else None
+                    ended_at = row[4].isoformat() if row[4] else None
+                    status_raw = row[2]
+                    business_context = _run_business_context_with_db_fallback(
+                        cur,
+                        run_id=str(row[0]),
+                        metadata=metadata,
+                        run_type=row[1],
+                    )
+                    out.append(
+                        {
+                            "run_id": str(row[0]),
+                            "created_at": started_at,
+                            "started_at": started_at,
+                            "ended_at": ended_at,
+                            "status": _status_to_ui(status_raw),
+                            "status_raw": status_raw,
+                            "return_code": None,
+                            "options": {},
+                            "error": None,
+                            "log_tail": [],
+                            "source": "db",
+                            "run_type": row[1],
+                            "run_type_label": business_context["friendly_run_type"],
+                            "status_label": _friendly_status(status_raw),
+                            "metadata": metadata,
+                            "business_context": business_context,
+                            "can_stop": False,
+                        }
+                    )
+                return out
     except Exception:
         return []
-
-    out: List[Dict[str, Any]] = []
-    for row in rows:
-        metadata = row[5] if isinstance(row[5], dict) else {}
-        started_at = row[3].isoformat() if row[3] else None
-        ended_at = row[4].isoformat() if row[4] else None
-        status_raw = row[2]
-        business_context = _run_business_context(metadata, row[1])
-        out.append(
-            {
-                "run_id": str(row[0]),
-                "created_at": started_at,
-                "started_at": started_at,
-                "ended_at": ended_at,
-                "status": _status_to_ui(status_raw),
-                "status_raw": status_raw,
-                "return_code": None,
-                "options": {},
-                "error": None,
-                "log_tail": [],
-                "source": "db",
-                "run_type": row[1],
-                "run_type_label": business_context["friendly_run_type"],
-                "status_label": _friendly_status(status_raw),
-                "metadata": metadata,
-                "business_context": business_context,
-                "can_stop": False,
-            }
-        )
-    return out
 
 
 def _db_run_detail(run_id: str) -> Optional[Dict[str, Any]]:
@@ -1649,7 +1663,14 @@ def _db_run_detail(run_id: str) -> Optional[Dict[str, Any]]:
     started_at = row[3].isoformat() if row[3] else None
     ended_at = row[4].isoformat() if row[4] else None
     status_raw = row[2]
-    business_context = _run_business_context(metadata, row[1])
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            business_context = _run_business_context_with_db_fallback(
+                cur,
+                run_id=str(row[0]),
+                metadata=metadata,
+                run_type=row[1],
+            )
     return {
         "run_id": str(row[0]),
         "created_at": started_at,
@@ -1980,6 +2001,161 @@ def _run_business_context(metadata: Optional[Dict[str, Any]], run_type: Optional
     }
 
 
+def _run_business_context_with_db_fallback(
+    cur,
+    *,
+    run_id: str,
+    metadata: Optional[Dict[str, Any]],
+    run_type: Optional[str],
+) -> Dict[str, Any]:
+    base_metadata = metadata if isinstance(metadata, dict) else {}
+    business_context = _run_business_context(base_metadata, run_type)
+
+    candidate_run_ids: List[str] = []
+    run_id_txt = str(run_id or "").strip()
+    if run_id_txt:
+        candidate_run_ids.append(run_id_txt)
+    source_run_txt = str(base_metadata.get("source_orders_run_id") or "").strip()
+    if source_run_txt and source_run_txt not in candidate_run_ids:
+        candidate_run_ids.append(source_run_txt)
+
+    if not candidate_run_ids:
+        return business_context
+
+    inferred_orders_jobs: List[Dict[str, Any]] = []
+    inferred_source_jobs: List[Dict[str, Any]] = []
+    seen_orders = set()
+    seen_source = set()
+
+    for candidate_run_id in candidate_run_ids:
+        cur.execute(
+            """
+            SELECT module, season_code, mode
+            FROM public.fact_order_forecast
+            WHERE run_id = %s::uuid
+              AND season_code IS NOT NULL
+            GROUP BY module, season_code, mode
+            ORDER BY module, season_code, mode
+            """,
+            (candidate_run_id,),
+        )
+        for module, season_code, mode in cur.fetchall():
+            module_txt = _clean_text(module)
+            season_txt = _clean_text(season_code)
+            mode_txt = _clean_text(mode)
+            key = (module_txt, season_txt, mode_txt)
+            if not module_txt or not season_txt or not mode_txt or key in seen_orders:
+                continue
+            seen_orders.add(key)
+            inferred_orders_jobs.append(
+                {
+                    "module": module_txt,
+                    "season": season_txt,
+                    "mode": mode_txt,
+                    "source": "db_fact_order_forecast",
+                }
+            )
+
+        cur.execute(
+            """
+            SELECT module, season_code
+            FROM public.fact_order_source
+            WHERE run_id = %s::uuid
+              AND season_code IS NOT NULL
+            GROUP BY module, season_code
+            ORDER BY module, season_code
+            """,
+            (candidate_run_id,),
+        )
+        for module, season_code in cur.fetchall():
+            module_txt = _clean_text(module)
+            season_txt = _clean_text(season_code)
+            key = (module_txt, season_txt)
+            if not module_txt or not season_txt or key in seen_source:
+                continue
+            seen_source.add(key)
+            inferred_source_jobs.append(
+                {
+                    "module": module_txt,
+                    "season": season_txt,
+                    "source": "db_fact_order_source",
+                }
+            )
+
+        if inferred_orders_jobs or inferred_source_jobs:
+            break
+
+    if not inferred_orders_jobs and not inferred_source_jobs:
+        return business_context
+
+    inferred_current_seasons: List[str] = []
+    inferred_cont_seasons: List[str] = []
+    for item in inferred_orders_jobs + inferred_source_jobs:
+        module_txt = _canonical_module_name(item.get("module"))
+        season_txt = _clean_text(item.get("season"))
+        if not season_txt:
+            continue
+        if module_txt == "current" and season_txt not in inferred_current_seasons:
+            inferred_current_seasons.append(season_txt)
+        if module_txt == "continuativa" and season_txt not in inferred_cont_seasons:
+            inferred_cont_seasons.append(season_txt)
+
+    latest_pair_codes: List[str] = []
+    latest_pair_label: Optional[str] = None
+    pair_buckets: Dict[tuple[str, int], List[str]] = {}
+    for code in inferred_current_seasons + inferred_cont_seasons:
+        family = _season_family_key(code)
+        year_num = _season_year_number(code)
+        code_txt = _clean_text(code)
+        if family is None or year_num is None or not code_txt:
+            continue
+        bucket = pair_buckets.setdefault((family, int(year_num)), [])
+        code_norm = code_txt.upper()
+        if code_norm not in bucket:
+            bucket.append(code_norm)
+    pair_candidates = [
+        (family, year_num, codes)
+        for (family, year_num), codes in pair_buckets.items()
+        if len(codes) >= 2
+    ]
+    if pair_candidates:
+        family, year_num, codes = sorted(
+            pair_candidates,
+            key=lambda item: (int(item[1]), len(item[2])),
+            reverse=True,
+        )[0]
+        latest_pair_codes = sorted(codes, key=_season_pair_code_sort_key)
+        latest_pair_label = _season_pair_display_label(family, year_num, latest_pair_codes)
+
+    inferred_metadata = dict(base_metadata)
+    if inferred_orders_jobs:
+        inferred_metadata["orders_jobs"] = inferred_orders_jobs
+    if inferred_source_jobs:
+        inferred_metadata["order_source_jobs"] = inferred_source_jobs
+    inferred_context = _run_business_context(inferred_metadata, run_type)
+    if (
+        business_context.get("current_seasons")
+        or business_context.get("continuativa_seasons")
+        or business_context.get("current_modes")
+        or business_context.get("continuativa_modes")
+    ):
+        out_context = dict(business_context)
+    else:
+        out_context = inferred_context
+
+    out_context["available_current_seasons"] = inferred_current_seasons
+    out_context["available_continuativa_seasons"] = inferred_cont_seasons
+    out_context["available_current_season_labels"] = [
+        _friendly_season_label(code, "current") or code for code in inferred_current_seasons
+    ]
+    out_context["available_continuativa_season_labels"] = [
+        _friendly_season_label(code, "continuativa") or code for code in inferred_cont_seasons
+    ]
+    out_context["latest_pair_codes"] = latest_pair_codes
+    out_context["latest_pair_label"] = latest_pair_label
+    return out_context
+
+
 def _to_float(value: Any) -> float:
     try:
         return float(value if value is not None else 0.0)
@@ -2107,7 +2283,7 @@ def _build_kpi_deltas(current_kpis: Dict[str, Any], baseline_kpis: Optional[Dict
 def _dashboard_run_where_sql(alias: str = "etl_run") -> str:
     return f"""
         lower(COALESCE({alias}.status, '')) IN ('completed', 'success', 'done', 'ok')
-        AND lower(COALESCE({alias}.run_type, '')) IN ('app_pipeline', 'app_pipeline_ui', 'manual_sync')
+        AND lower(COALESCE({alias}.run_type, '')) IN ('app_pipeline', 'app_pipeline_ui', 'manual_sync', 'raw_input_sync')
         AND (
           EXISTS (SELECT 1 FROM public.fact_sales_snapshot s WHERE s.run_id = {alias}.run_id LIMIT 1)
           OR EXISTS (SELECT 1 FROM public.fact_stock_snapshot s WHERE s.run_id = {alias}.run_id LIMIT 1)
@@ -2165,7 +2341,12 @@ def _resolve_dashboard_run(cur, run_id: Optional[str]) -> Optional[Dict[str, Any
     if not row:
         return None
     metadata = row[5] if isinstance(row[5], dict) else {}
-    business_context = _run_business_context(metadata, row[1])
+    business_context = _run_business_context_with_db_fallback(
+        cur,
+        run_id=str(row[0]),
+        metadata=metadata,
+        run_type=row[1],
+    )
     return {
         "run_id": str(row[0]),
         "run_type": row[1],
@@ -2517,7 +2698,12 @@ def _dashboard_summary_payload(dsn: str, run_id: Optional[str], table_limit: int
 
                 if prev_row:
                     prev_metadata = prev_row[5] if isinstance(prev_row[5], dict) else {}
-                    prev_business_context = _run_business_context(prev_metadata, prev_row[1])
+                    prev_business_context = _run_business_context_with_db_fallback(
+                        cur,
+                        run_id=str(prev_row[0]),
+                        metadata=prev_metadata,
+                        run_type=prev_row[1],
+                    )
                     baseline_run = {
                         "run_id": str(prev_row[0]),
                         "run_type": prev_row[1],

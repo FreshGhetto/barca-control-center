@@ -4,8 +4,10 @@ import contextlib
 import json
 import time
 import unittest
+import uuid
 
 from fastapi.testclient import TestClient
+import psycopg
 
 from tests._support import (
     TempPathMixin,
@@ -130,6 +132,7 @@ class FreshPipelineWorkflowTests(DatabaseIntegrationTestCase):
             db_status = client.get("/api/db/status")
             outputs = client.get("/api/outputs")
             runs = client.get("/api/runs?limit=5")
+            dashboard_runs = client.get("/api/dashboard/runs?limit=20")
             detail = client.get(f"/api/runs/{self.app_run_id}")
             dashboard = client.get(f"/api/dashboard?run_id={self.app_run_id}&table_limit=5")
             article_detail = client.get(
@@ -148,6 +151,7 @@ class FreshPipelineWorkflowTests(DatabaseIntegrationTestCase):
         self.assertTrue(db_status.json()["connected"])
         self.assertEqual(outputs.status_code, 200)
         self.assertEqual(runs.status_code, 200)
+        self.assertEqual(dashboard_runs.status_code, 200)
         self.assertEqual(detail.status_code, 200)
         self.assertEqual(dashboard.status_code, 200)
         self.assertEqual(article_detail.status_code, 200)
@@ -300,3 +304,74 @@ class HistoricalImportsWorkflowTests(DatabaseIntegrationTestCase, TempPathMixin)
         )
         self.assertGreater(int(order_rows or 0), 0)
         self.assertGreater(int(article_rows or 0), 0)
+
+
+class DashboardSeasonContextTests(DatabaseIntegrationTestCase):
+    def test_dashboard_runs_expose_latest_pair_from_available_db_seasons(self) -> None:
+        apply_schema(self.db_env)
+        run_id = str(uuid.uuid4())
+        metadata = {
+            "orders_jobs": [
+                {"module": "current", "season": "25i", "mode": "math"},
+                {"module": "continuativa", "season": "25y", "mode": "math"},
+            ],
+            "order_source_jobs": [
+                {"module": "current", "season": "25i"},
+                {"module": "continuativa", "season": "25y"},
+            ],
+        }
+        conn_kwargs = {
+            "host": self.db_env.get("BARCA_DB_HOST", "localhost"),
+            "port": int(self.db_env.get("BARCA_DB_PORT", "5432")),
+            "dbname": self.db_env.get("BARCA_DB_NAME", "barca"),
+            "user": self.db_env.get("BARCA_DB_USER", "barca_user"),
+            "password": self.db_env.get("BARCA_DB_PASSWORD", ""),
+            "sslmode": self.db_env.get("BARCA_DB_SSLMODE", "prefer"),
+            "connect_timeout": int(self.db_env.get("BARCA_DB_CONNECT_TIMEOUT", "2")),
+        }
+        with psycopg.connect(**conn_kwargs) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO etl_run (run_id, run_type, status, metadata) VALUES (%s::uuid, %s, %s, %s::jsonb)",
+                    (run_id, "raw_input_sync", "completed", json.dumps(metadata, ensure_ascii=False)),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO dim_article (article_code, description, reparto, categoria, tipologia, marchio, colore, materiale)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    ("59/PAIRTEST", "ARTICOLO TEST COPPIA", "SCARPE DONNA", "BALLERINA", "TEST", "ACME", "NERO", "PELLE"),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO fact_order_forecast (
+                      run_id, module, season_code, mode, article_code, totale_qty, predizione_vendite, prezzo_acquisto, budget_acquisto
+                    ) VALUES (%s::uuid, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (run_id, "current", "25i", "math", "59/PAIRTEST", 5, 7, 10, 50),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO fact_order_source (
+                      run_id, module, season_code, article_code, categoria, tipologia, marchio, colore, materiale,
+                      descrizione, venduto_totale, venduto_periodo, giacenza, venduto_extra, fascia_prezzo, prezzo_listino, prezzo_acquisto, prezzo_vendita
+                    ) VALUES
+                      (%s::uuid, 'current', '26E', '59/PAIRTEST', 'BALLERINA', 'TEST', 'ACME', 'NERO', 'PELLE', 'TEST 26E', 10, 5, 2, 0, 'MEDIO', 100, 50, 80),
+                      (%s::uuid, 'continuativa', '26G', '59/PAIRTEST', 'BALLERINA', 'TEST', 'ACME', 'NERO', 'PELLE', 'TEST 26G', 12, 6, 3, 0, 'MEDIO', 100, 50, 80)
+                    """,
+                    (run_id, run_id),
+                )
+            conn.commit()
+
+        with self.ui_client() as client:
+            dashboard_runs = client.get("/api/dashboard/runs?limit=50")
+
+        self.assertEqual(dashboard_runs.status_code, 200)
+        row = next((item for item in dashboard_runs.json()["runs"] if item.get("run_id") == run_id), None)
+        self.assertIsNotNone(row)
+        ctx = row["business_context"]
+        self.assertEqual(ctx.get("current_seasons"), ["25i"])
+        self.assertEqual(ctx.get("continuativa_seasons"), ["25y"])
+        self.assertIn("26E", ctx.get("available_current_seasons", []))
+        self.assertIn("26G", ctx.get("available_continuativa_seasons", []))
+        self.assertEqual(ctx.get("latest_pair_codes"), ["26E", "26G"])

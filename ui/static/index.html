@@ -47,11 +47,18 @@
         <div class="panel-head">
           <h2>Dashboard Operativa</h2>
           <div class="dashboard-actions">
-            <select id="dashboardRunSelect"></select>
+            <label class="dashboard-select-group">
+              <span class="dashboard-select-label">Coppia stagioni</span>
+              <select id="dashboardSeasonPairSelect"></select>
+            </label>
+            <label class="dashboard-select-group">
+              <span class="dashboard-select-label">Aggiornamento</span>
+              <select id="dashboardRunSelect"></select>
+            </label>
             <button id="dashboardRefreshBtn" class="btn secondary" type="button">Aggiorna Dashboard</button>
           </div>
         </div>
-        <p id="dashboardSubtitle" class="muted">Seleziona un aggiornamento per analizzare distribuzione giacenze e ordini.</p>
+        <p id="dashboardSubtitle" class="muted">La dashboard carica di default l'ultima coppia di stagioni disponibile; puoi cambiare coppia o aggiornamento in alto.</p>
         <div id="dashboardRunContext" class="context-ribbon"></div>
         <p id="dashboardWarn" class="alert hidden">--</p>
         <div id="dashboardQuickFacts" class="quick-facts"></div>

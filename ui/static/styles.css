@@ -227,16 +227,38 @@ body {
   display: flex;
   gap: 8px;
   align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.dashboard-select-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 240px;
+}
+
+.dashboard-select-label {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: var(--muted);
 }
 
 .dashboard-actions select {
-  min-width: 360px;
+  min-width: 0;
+  width: 100%;
   border-radius: 8px;
   border: 1px solid #bfd0c7;
   padding: 8px 10px;
   font-size: 13px;
   background: #fff;
   color: var(--ink);
+}
+
+.dashboard-actions .btn {
+  align-self: flex-end;
 }
 
 .alert {
@@ -1822,9 +1844,15 @@ td.metric-alert {
     flex-direction: column;
     align-items: stretch;
   }
+  .dashboard-select-group {
+    min-width: 0;
+  }
   .dashboard-actions select {
     min-width: 0;
     width: 100%;
+  }
+  .dashboard-actions .btn {
+    align-self: stretch;
   }
   .catalog-summary-grid {
     grid-template-columns: repeat(2, minmax(180px, 1fr));

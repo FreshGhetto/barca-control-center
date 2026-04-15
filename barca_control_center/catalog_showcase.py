@@ -12,6 +12,9 @@ from .catalog_local_images import lookup_local_image_path, normalize_code
 from .catalog_models import Article
 
 _INVALID_FS_CHARS_RE = re.compile(r'[<>:"/\\|?*]')
+_MINIMAL_A6_CANVAS = (1240, 1748)
+_DETAILED_A4_CANVAS = (1748, 2480)
+_EXPORT_JPEG_DPI = (300, 300)
 
 
 def _article_alias_codes(article: Article) -> List[str]:
@@ -58,10 +61,21 @@ def _sanitize_folder_name(value: str, fallback: str) -> str:
     return s[:80] if s else fallback
 
 
+def _jpg_reparto_folder_name(value: str) -> str:
+    normalized = re.sub(r"\s+", " ", str(value or "")).strip().upper()
+    if not normalized:
+        return "REPARTO_SCONOSCIUTO"
+    if "DONNA" in normalized:
+        return "DONNA"
+    if "UOMO" in normalized:
+        return "UOMO"
+    return _sanitize_folder_name(normalized, "REPARTO_SCONOSCIUTO")
+
+
 def _save_bytes_as_jpeg(data: bytes, out_path: Path) -> None:
     with Image.open(io.BytesIO(data)) as im:
         rgb = im.convert("RGB")
-        rgb.save(out_path, "JPEG", quality=95, subsampling=0, optimize=True)
+        rgb.save(out_path, "JPEG", quality=95, subsampling=0, optimize=True, dpi=_EXPORT_JPEG_DPI)
 
 
 def _as_optional_float(value: object) -> Optional[float]:
@@ -309,10 +323,17 @@ def _draw_image_box(
     img_bytes: Optional[bytes],
     placeholder_font: ImageFont.ImageFont,
     placeholder_fill: Tuple[int, int, int] = (90, 96, 110),
+    corner_radius: int = 22,
+    box_fill: Tuple[int, int, int] = (255, 255, 255),
+    border_color: Optional[Tuple[int, int, int]] = (205, 214, 225),
+    border_width: int = 3,
+    inner_pad: int = 14,
 ) -> None:
-    draw.rounded_rectangle(box, radius=22, fill=(255, 255, 255), outline=(205, 214, 225), width=3)
+    outline = border_color if border_width > 0 else None
+    draw.rounded_rectangle(box, radius=max(0, corner_radius), fill=box_fill, outline=outline, width=max(0, border_width))
     x0, y0, x1, y1 = box
-    inner = (x0 + 14, y0 + 14, x1 - 14, y1 - 14)
+    pad = max(0, inner_pad)
+    inner = (x0 + pad, y0 + pad, x1 - pad, y1 - pad)
     if img_bytes:
         try:
             with Image.open(io.BytesIO(img_bytes)) as prod:
@@ -633,62 +654,142 @@ def _render_showcase_jpg_minimal(
     *,
     listino_price: Optional[float] = None,
     saldo_price: Optional[float] = None,
-    canvas_w: int = 1300,
-    canvas_h: int = 1500,
+    canvas_w: int = _MINIMAL_A6_CANVAS[0],
+    canvas_h: int = _MINIMAL_A6_CANVAS[1],
 ) -> Image.Image:
     """
-    Simple showcase card:
-      - big product image
-      - bottom row with CODE + VEN / ORD / GIAC
+    Minimal showcase card sized as A6 @ 300 DPI.
+    Printed 2x2, four cards fill one A4 much more efficiently.
     """
     img = Image.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
     draw = ImageDraw.Draw(img)
 
-    m = 36
-    footer_h = 320
-    photo_box = (m, m, canvas_w - m, canvas_h - footer_h - m)
-    draw.rectangle((6, 6, canvas_w - 6, canvas_h - 6), outline=(0, 0, 0), width=6)
-    draw.rectangle(photo_box, outline=(0, 0, 0), width=3)
+    scale = min(canvas_w / float(_MINIMAL_A6_CANVAS[0]), canvas_h / float(_MINIMAL_A6_CANVAS[1]))
+    m = max(26, int(38 * scale))
+    photo_m = max(10, int(14 * scale))
+    photo_top = max(10, int(14 * scale))
+    photo_bottom_gap = max(8, int(12 * scale))
+    outer_border = max(4, int(6 * scale))
+    footer_h = max(360, int(420 * scale))
+    section_gap = max(18, int(26 * scale))
+    photo_box = (photo_m, photo_top, canvas_w - photo_m, canvas_h - footer_h - photo_bottom_gap)
+    draw.rectangle(
+        (outer_border, outer_border, canvas_w - outer_border, canvas_h - outer_border),
+        outline=(0, 0, 0),
+        width=outer_border,
+    )
 
-    f_code = _load_font(74)
-    f_val = _load_font(56)
-    f_price = _load_font(38)
-    f_desc = _load_font(31)
+    f_code = _load_font(max(52, int(70 * scale)))
+    f_val = _load_font(max(52, int(70 * scale)))
+    f_price = _load_font(max(34, int(50 * scale)))
+    f_desc = _load_font(max(28, int(40 * scale)))
+    f_meta = _load_font(max(34, int(50 * scale)))
+    f_meta_small = _load_font(max(28, int(40 * scale)))
 
-    _draw_image_box(img, draw, box=photo_box, img_bytes=img_bytes, placeholder_font=f_desc, placeholder_fill=(70, 70, 70))
+    _draw_image_box(
+        img,
+        draw,
+        box=photo_box,
+        img_bytes=img_bytes,
+        placeholder_font=f_desc,
+        placeholder_fill=(70, 70, 70),
+        corner_radius=0,
+        border_width=0,
+        inner_pad=0,
+    )
 
     code = article.code or ""
     ven = float(article.ven or 0.0)
     ord_v = float(article.con or 0.0)  # ORD mapped to CON from Barca DB
     giac = float(article.giac or 0.0)
+    perc_ven = float(article.perc_ven or 0.0)
+    if not perc_ven and ord_v > 0:
+        perc_ven = (ven / ord_v) * 100.0
 
-    y0 = canvas_h - footer_h + 24
+    y0 = photo_box[3] + section_gap
     code_text = code or "-"
-    price_text = f"LISTINO {_format_price(listino_price)}    SALDO {_format_price(saldo_price)}"
+    price_text = f"LIST {_format_price(listino_price)}    SAL {_format_price(saldo_price)}"
 
+    code_text = _truncate_text(draw, code_text, f_code, max(120, canvas_w - (m * 2)))
     draw.text((m, y0), code_text, font=f_code, fill=(0, 0, 0))
     code_box = draw.textbbox((m, y0), code_text, font=f_code)
     price_box = draw.textbbox((0, 0), price_text, font=f_price)
     price_w = max(0, price_box[2] - price_box[0])
     price_right_x = canvas_w - m - price_w
-    min_price_x = code_box[2] + 24
+    min_price_x = code_box[2] + max(18, int(24 * scale))
 
     if price_right_x >= min_price_x:
         price_x = price_right_x
-        price_y = y0 + 18
-        kpi_y = y0 + 110
+        price_y = y0 + max(12, int(18 * scale))
+        _, code_h = _text_size(draw, code_text, f_code)
+        kpi_y = y0 + code_h + max(18, int(28 * scale))
     else:
         # Fallback per codici molto lunghi: prezzi sotto il codice.
         price_x = m
-        price_y = y0 + 92
-        kpi_y = y0 + 150
+        _, code_h = _text_size(draw, code_text, f_code)
+        price_y = y0 + code_h + max(10, int(14 * scale))
+        _, price_h = _text_size(draw, price_text, f_price)
+        kpi_y = price_y + price_h + max(14, int(20 * scale))
 
     draw.text((price_x, price_y), price_text, font=f_price, fill=(0, 0, 0))
-    draw.text((m, kpi_y), f"VEN {ven:.0f}    ORD {ord_v:.0f}    GIAC {giac:.0f}", font=f_val, fill=(0, 0, 0))
+    kpi_single_line = f"VEN {ven:.0f} ORD {ord_v:.0f} GIAC {giac:.0f} PV {perc_ven:.0f}%"
+    max_kpi_width = max(120, canvas_w - (m * 2))
+    kpi_single_box = draw.textbbox((0, 0), kpi_single_line, font=f_val)
+    kpi_single_w = max(0, kpi_single_box[2] - kpi_single_box[0])
+    if kpi_single_w <= max_kpi_width:
+        draw.text((m, kpi_y), kpi_single_line, font=f_val, fill=(0, 0, 0))
+        _, kpi_h = _text_size(draw, kpi_single_line, f_val)
+    else:
+        kpi_lines = [
+            f"VEN {ven:.0f}    ORD {ord_v:.0f}",
+            f"GIAC {giac:.0f}    PV {perc_ven:.0f}%",
+        ]
+        kpi_gap = max(4, int(8 * scale))
+        kpi_line_y = kpi_y
+        kpi_h = 0
+        for idx, kpi_line in enumerate(kpi_lines):
+            draw.text((m, kpi_line_y), kpi_line, font=f_val, fill=(0, 0, 0))
+            _, line_h = _text_size(draw, kpi_line, f_val)
+            kpi_h += line_h
+            if idx < len(kpi_lines) - 1:
+                kpi_line_y += line_h + kpi_gap
+                kpi_h += kpi_gap
 
     desc = " • ".join([x for x in [article.description, article.color] if x])
+    info_y = kpi_y + kpi_h
     if desc:
-        draw.text((m, kpi_y + 74), desc[:80], font=f_desc, fill=(70, 70, 70))
+        info_y = _draw_wrapped_text(
+            draw,
+            x=m,
+            y=kpi_y + kpi_h + max(10, int(14 * scale)),
+            text=desc,
+            font=f_desc,
+            fill=(70, 70, 70),
+            max_width=max(120, canvas_w - (m * 2)),
+            max_lines=2,
+            line_gap=max(6, int(8 * scale)),
+        )
+
+    meta_lines = [
+        (f"REPARTO {str(article.reparto or '-').strip() or '-'}", f_meta_small),
+        (f"CATEGORIA {str(article.categoria or '-').strip() or '-'}", f_meta_small),
+        (f"MARCHIO {str(article.marchio or '-').strip() or '-'}", f_meta),
+        (f"FORNITORE {str(article.supplier or '-').strip() or '-'}", f_meta),
+    ]
+    meta_y = info_y + max(12, int(16 * scale))
+    for meta_line, meta_font in meta_lines:
+        meta_y = _draw_wrapped_text(
+            draw,
+            x=m,
+            y=meta_y,
+            text=meta_line,
+            font=meta_font,
+            fill=(90, 90, 90),
+            max_width=max(120, canvas_w - (m * 2)),
+            max_lines=1,
+            line_gap=max(3, int(5 * scale)),
+        )
+        meta_y += max(6, int(8 * scale))
 
     return img
 
@@ -1035,7 +1136,7 @@ def render_showcase_jpg(
     layout_key = str(layout or "minimal").strip().lower()
     if layout_key == "detailed":
         if canvas_w == 1300 and canvas_h == 1500:
-            canvas_w, canvas_h = 1748, 2480
+            canvas_w, canvas_h = _DETAILED_A4_CANVAS
         return _render_showcase_jpg_detailed(
             article,
             img_bytes,
@@ -1044,6 +1145,8 @@ def render_showcase_jpg(
             canvas_w=canvas_w,
             canvas_h=canvas_h,
         )
+    if canvas_w == 1300 and canvas_h == 1500:
+        canvas_w, canvas_h = _MINIMAL_A6_CANVAS
     return _render_showcase_jpg_minimal(
         article,
         img_bytes,
@@ -1963,8 +2066,9 @@ def export_showcase_catalog(
 
         if do_jpg:
             try:
+                reparto_folder = _jpg_reparto_folder_name(art.reparto)
                 cat_folder = _sanitize_folder_name(art.categoria, "CATEGORIA_SCONOSCIUTA")
-                jpg_cat_dir = jpg_dir / cat_folder
+                jpg_cat_dir = jpg_dir / reparto_folder / cat_folder
                 jpg_cat_dir.mkdir(parents=True, exist_ok=True)
                 out_path = jpg_cat_dir / code_file
                 card = render_showcase_jpg(
@@ -1974,7 +2078,7 @@ def export_showcase_catalog(
                     saldo_price=saldo_price,
                     layout=jpg_layout,
                 )
-                card.save(out_path, "JPEG", quality=95, subsampling=0, optimize=True)
+                card.save(out_path, "JPEG", quality=95, subsampling=0, optimize=True, dpi=_EXPORT_JPEG_DPI)
                 exported_jpg += 1
             except Exception as e:
                 errors.append(f"{art.season or '-'}\t{art.code}\trender_jpg\t{type(e).__name__}:{e}")

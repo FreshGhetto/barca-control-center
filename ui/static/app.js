@@ -10,9 +10,12 @@ const state = {
   runsLimit: 40,
   runsTotal: 0,
   dashboardRuns: [],
+  dashboardSeasonPairs: [],
+  dashboardSeasonPairKey: null,
   dashboardRunId: null,
   dashboardData: null,
   dashboardRefreshing: false,
+  dashboardSectionUserSelected: false,
   selectedTransferArticle: "",
   transferArticleDetail: null,
   catalogStatus: null,
@@ -54,6 +57,7 @@ const state = {
   },
 };
 let runsFilterDebounce = null;
+const DASHBOARD_NO_PAIR_KEY = "__no_pair__";
 
 const el = {
   refreshBtn: document.getElementById("refreshBtn"),
@@ -87,6 +91,7 @@ const el = {
   tabDev: document.getElementById("tabDev"),
   viewPanels: Array.from(document.querySelectorAll(".view-panel")),
   viewTabs: Array.from(document.querySelectorAll(".view-tab[data-view-target]")),
+  dashboardSeasonPairSelect: document.getElementById("dashboardSeasonPairSelect"),
   dashboardRunSelect: document.getElementById("dashboardRunSelect"),
   dashboardRefreshBtn: document.getElementById("dashboardRefreshBtn"),
   dashboardSubtitle: document.getElementById("dashboardSubtitle"),
@@ -942,6 +947,242 @@ function friendlySeasonLabel(code, moduleHint = null) {
   if (year) return `${year} (${raw})`;
   if (moduleLabel) return `${moduleLabel} ${raw}`;
   return raw;
+}
+
+function seasonYearNumber(code) {
+  const raw = seasonYearLabel(code);
+  const yearNum = Number(raw || 0);
+  return Number.isFinite(yearNum) && yearNum > 0 ? yearNum : null;
+}
+
+function seasonPairFamilyKey(code) {
+  const raw = String(code || "").trim().toUpperCase();
+  if (!raw) return null;
+  const suffix = raw.slice(-1);
+  if (suffix === "I" || suffix === "Y") return "winter";
+  if (suffix === "E" || suffix === "G") return "summer";
+  return null;
+}
+
+function seasonPairCodeRank(code) {
+  const raw = String(code || "").trim().toUpperCase();
+  const suffix = raw.slice(-1);
+  if (suffix === "I" || suffix === "E") return 0;
+  if (suffix === "Y" || suffix === "G") return 1;
+  return 9;
+}
+
+function compareSeasonPairCodes(a, b) {
+  const rankA = seasonPairCodeRank(a);
+  const rankB = seasonPairCodeRank(b);
+  if (rankA !== rankB) return rankA - rankB;
+  return String(a || "").localeCompare(String(b || ""), "it", { sensitivity: "base" });
+}
+
+function seasonPairDisplayLabel(family, yearNum, codes) {
+  const familyLabel = family === "winter" ? "Inv." : (family === "summer" ? "Est." : "Stg.");
+  const normalizedCodes = Array.from(
+    new Set((codes || []).map((code) => String(code || "").trim().toUpperCase()).filter(Boolean)),
+  ).sort(compareSeasonPairCodes);
+  const codePart = normalizedCodes.length > 0 ? ` (${normalizedCodes.join("+")})` : "";
+  return yearNum ? `${familyLabel} ${yearNum}${codePart}` : `${familyLabel}${codePart}`;
+}
+
+function pairDescriptorFromCodes(codes, labelHint = "") {
+  const buckets = new Map();
+  const addCode = (code) => {
+    const rawCode = String(code || "").trim().toUpperCase();
+    const family = seasonPairFamilyKey(rawCode);
+    const yearNum = seasonYearNumber(rawCode);
+    if (!rawCode || !family || !yearNum) return;
+    const key = `${family}:${yearNum}`;
+    if (!buckets.has(key)) {
+      buckets.set(key, {
+        key,
+        family,
+        yearNum,
+        codes: [],
+      });
+    }
+    const bucket = buckets.get(key);
+    if (!bucket.codes.includes(rawCode)) bucket.codes.push(rawCode);
+  };
+
+  (Array.isArray(codes) ? codes : []).forEach((code) => addCode(code));
+  const candidates = Array.from(buckets.values()).filter((bucket) => bucket.codes.length >= 2);
+  if (candidates.length === 0) return null;
+
+  candidates.sort((a, b) => {
+    if (b.codes.length !== a.codes.length) return b.codes.length - a.codes.length;
+    if (b.yearNum !== a.yearNum) return b.yearNum - a.yearNum;
+    return String(a.family || "").localeCompare(String(b.family || ""), "it", { sensitivity: "base" });
+  });
+
+  const best = candidates[0];
+  best.codes.sort(compareSeasonPairCodes);
+  return {
+    key: best.key,
+    family: best.family,
+    yearNum: best.yearNum,
+    codes: best.codes.slice(),
+    label: String(labelHint || "").trim() || seasonPairDisplayLabel(best.family, best.yearNum, best.codes),
+  };
+}
+
+function extractRunSeasonPair(run) {
+  const ctx = run?.business_context || {};
+  const latestPair = pairDescriptorFromCodes(ctx.latest_pair_codes, ctx.latest_pair_label);
+  if (latestPair) return latestPair;
+  return pairDescriptorFromCodes([
+    ...(Array.isArray(ctx.current_seasons) ? ctx.current_seasons : []),
+    ...(Array.isArray(ctx.continuativa_seasons) ? ctx.continuativa_seasons : []),
+  ]);
+}
+
+function dashboardRunTimestamp(run) {
+  const raw = run?.started_at || run?.ended_at || run?.created_at || null;
+  const stamp = raw ? Date.parse(raw) : NaN;
+  return Number.isFinite(stamp) ? stamp : 0;
+}
+
+function dashboardRunCount(run, key) {
+  const value = Number(run?.metadata?.counts?.[key] ?? 0);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function dashboardRunSelectionScore(run) {
+  const transferRows = dashboardRunCount(run, "fact_transfer_suggestion");
+  const featureRows = dashboardRunCount(run, "fact_feature_state");
+  const orderRows = dashboardRunCount(run, "fact_order_forecast");
+  const orderSourceRows = dashboardRunCount(run, "fact_order_source");
+  const salesRows = dashboardRunCount(run, "fact_sales_snapshot");
+  const stockRows = dashboardRunCount(run, "fact_stock_snapshot");
+  const runType = String(run?.run_type || "").trim().toLowerCase();
+
+  let score = 0;
+  if (transferRows > 0) score += 1_000_000_000 + transferRows;
+  if (featureRows > 0) score += 100_000_000 + featureRows;
+  if (orderRows > 0 || orderSourceRows > 0) score += 10_000_000 + orderRows + (orderSourceRows / 1000);
+  if (salesRows > 0 || stockRows > 0) score += 1_000_000 + salesRows + (stockRows / 1000);
+  if (runType === "app_pipeline") score += 500_000;
+  else if (runType === "manual_sync") score += 250_000;
+  else if (runType === "raw_input_sync") score += 100_000;
+  return score;
+}
+
+function compareDashboardRunsForSelection(a, b) {
+  const scoreDiff = dashboardRunSelectionScore(b) - dashboardRunSelectionScore(a);
+  if (scoreDiff !== 0) return scoreDiff;
+  return dashboardRunTimestamp(b) - dashboardRunTimestamp(a);
+}
+
+function buildDashboardSeasonPairGroups(runs) {
+  const orderedRuns = Array.isArray(runs) ? runs : [];
+  const groups = [];
+  const byKey = new Map();
+  orderedRuns.forEach((run) => {
+    const pair = extractRunSeasonPair(run);
+    const key = pair?.key || DASHBOARD_NO_PAIR_KEY;
+    if (!byKey.has(key)) {
+      const group = {
+        key,
+        hasPair: !!pair,
+        label: pair?.label || "Altri aggiornamenti senza coppia stagioni",
+        family: pair?.family || "",
+        yearNum: pair?.yearNum || 0,
+        latestStartedAt: 0,
+        runs: [],
+      };
+      byKey.set(key, group);
+      groups.push(group);
+    }
+    const group = byKey.get(key);
+    group.runs.push(run);
+    group.latestStartedAt = Math.max(group.latestStartedAt || 0, dashboardRunTimestamp(run));
+  });
+  groups.forEach((group) => {
+    group.runs.sort(compareDashboardRunsForSelection);
+  });
+  return groups.sort((a, b) => {
+    if (a.hasPair !== b.hasPair) return a.hasPair ? -1 : 1;
+    if (a.hasPair && b.hasPair) {
+      if ((b.yearNum || 0) !== (a.yearNum || 0)) return (b.yearNum || 0) - (a.yearNum || 0);
+      if ((b.latestStartedAt || 0) !== (a.latestStartedAt || 0)) return (b.latestStartedAt || 0) - (a.latestStartedAt || 0);
+      return String(a.label || "").localeCompare(String(b.label || ""), "it", { sensitivity: "base" });
+    }
+    return (b.latestStartedAt || 0) - (a.latestStartedAt || 0);
+  });
+}
+
+function selectedDashboardSeasonPairGroup() {
+  return state.dashboardSeasonPairs.find((group) => group.key === state.dashboardSeasonPairKey) || null;
+}
+
+function dashboardRunsForSelectedPair() {
+  const group = selectedDashboardSeasonPairGroup();
+  return Array.isArray(group?.runs) ? group.runs : state.dashboardRuns;
+}
+
+function renderDashboardSeasonPairSelect() {
+  if (!el.dashboardSeasonPairSelect) return;
+  if (!Array.isArray(state.dashboardSeasonPairs) || state.dashboardSeasonPairs.length === 0) {
+    el.dashboardSeasonPairSelect.innerHTML = "<option value=''>Nessuna coppia stagioni disponibile</option>";
+    el.dashboardSeasonPairSelect.disabled = true;
+    return;
+  }
+  el.dashboardSeasonPairSelect.disabled = false;
+  el.dashboardSeasonPairSelect.innerHTML = state.dashboardSeasonPairs
+    .map((group) => {
+      const selected = group.key === state.dashboardSeasonPairKey ? "selected" : "";
+      const runCount = Array.isArray(group.runs) ? group.runs.length : 0;
+      const suffix = runCount > 1 ? ` · ${runCount} run` : "";
+      return `<option value="${escHtml(group.key)}" ${selected}>${escHtml(`${group.label}${suffix}`)}</option>`;
+    })
+    .join("");
+}
+
+function renderDashboardRunSelectForPair(runs) {
+  if (!el.dashboardRunSelect) return;
+  const visibleRuns = Array.isArray(runs) ? runs : [];
+  if (visibleRuns.length === 0) {
+    el.dashboardRunSelect.innerHTML = "<option value=''>Nessun aggiornamento disponibile</option>";
+    el.dashboardRunSelect.disabled = true;
+    return;
+  }
+  el.dashboardRunSelect.disabled = false;
+  el.dashboardRunSelect.innerHTML = visibleRuns
+    .map((run) => {
+      const selected = run.run_id === state.dashboardRunId ? "selected" : "";
+      return `<option value="${escHtml(run.run_id)}" ${selected}>${escHtml(dashboardRunLabel(run))}</option>`;
+    })
+    .join("");
+}
+
+function syncDashboardPairAndRunSelection(options = {}) {
+  const { forceLatestRun = false } = options;
+  const groups = Array.isArray(state.dashboardSeasonPairs) ? state.dashboardSeasonPairs : [];
+
+  if (groups.length === 0) {
+    state.dashboardSeasonPairKey = null;
+    state.dashboardRunId = state.dashboardRuns[0]?.run_id || null;
+    renderDashboardSeasonPairSelect();
+    renderDashboardRunSelectForPair(state.dashboardRuns);
+    return;
+  }
+
+  if (!groups.some((group) => group.key === state.dashboardSeasonPairKey)) {
+    const defaultGroup = groups.find((group) => group.hasPair) || groups[0];
+    state.dashboardSeasonPairKey = defaultGroup?.key || null;
+  }
+
+  const visibleRuns = dashboardRunsForSelectedPair();
+  if (forceLatestRun || !visibleRuns.some((run) => run.run_id === state.dashboardRunId)) {
+    state.dashboardRunId = visibleRuns[0]?.run_id || null;
+    state.dashboardSectionUserSelected = false;
+  }
+
+  renderDashboardSeasonPairSelect();
+  renderDashboardRunSelectForPair(visibleRuns);
 }
 
 function seasonLabelsForRun(ctx, moduleKey, fallbackCodesKey) {
@@ -2128,7 +2369,8 @@ function dashboardRunLabel(run) {
   if (!run || !run.run_id) return "aggiornamento non valido";
   const started = fmtDateCompact(run.started_at);
   const typeLabel = runTypeLabel(run);
-  const context = runContextSummary(run, { includeMethods: false, fallbackDefault: false });
+  const latestPairLabel = String(run?.business_context?.latest_pair_label || "").trim();
+  const context = latestPairLabel || runContextSummary(run, { includeMethods: false, fallbackDefault: false });
   const parts = [started];
   if (context) parts.push(context);
   parts.push(typeLabel, `#${shortRunCode(run.run_id)}`);
@@ -2241,6 +2483,28 @@ function setActiveDashSection(sectionName) {
     const show = section.dataset.dashSection === target;
     section.classList.toggle("active", show);
   });
+}
+
+function dashboardSectionHasData(payload, sectionName) {
+  const kpis = payload?.kpis || {};
+  const tables = payload?.tables || {};
+  switch (String(sectionName || "").toLowerCase()) {
+    case "transfers":
+      return Number(kpis.transfer_rows || 0) > 0 || (Array.isArray(tables.transfer_proposals) && tables.transfer_proposals.length > 0);
+    case "orders":
+      return Number(kpis.order_rows || 0) > 0 || (Array.isArray(tables.order_proposals) && tables.order_proposals.length > 0);
+    case "next":
+      return Number(kpis.next_current_candidates || 0) > 0 || (Array.isArray(tables.next_current_candidates) && tables.next_current_candidates.length > 0);
+    case "critical":
+      return Number(kpis.critical_rows_total || 0) > 0 || (Array.isArray(tables.critical_articles) && tables.critical_articles.length > 0);
+    default:
+      return false;
+  }
+}
+
+function pickBestDashboardSection(payload) {
+  const preferredOrder = ["transfers", "orders", "next", "critical"];
+  return preferredOrder.find((sectionName) => dashboardSectionHasData(payload, sectionName)) || "transfers";
 }
 
 function collectRunPayload() {
@@ -3119,30 +3383,34 @@ async function loadDashboardRuns() {
   try {
     const out = await api("/api/dashboard/runs?limit=200");
     state.dashboardRuns = out.runs || [];
+    state.dashboardSeasonPairs = buildDashboardSeasonPairGroups(state.dashboardRuns);
     if (state.dashboardRuns.length === 0) {
+      state.dashboardSeasonPairKey = null;
       if (el.dashboardRunSelect) {
         el.dashboardRunSelect.innerHTML = "<option value=''>Nessun aggiornamento disponibile</option>";
+        el.dashboardRunSelect.disabled = true;
+      }
+      if (el.dashboardSeasonPairSelect) {
+        el.dashboardSeasonPairSelect.innerHTML = "<option value=''>Nessuna coppia stagioni disponibile</option>";
+        el.dashboardSeasonPairSelect.disabled = true;
       }
       state.dashboardRunId = null;
       return;
     }
-    if (!state.dashboardRunId || !state.dashboardRuns.some((r) => r.run_id === state.dashboardRunId)) {
-      state.dashboardRunId = state.dashboardRuns[0].run_id;
-    }
+    syncDashboardPairAndRunSelection();
     renderActiveRunText();
-    if (el.dashboardRunSelect) {
-      el.dashboardRunSelect.innerHTML = state.dashboardRuns
-        .map((r) => {
-          const selected = r.run_id === state.dashboardRunId ? "selected" : "";
-          return `<option value="${escHtml(r.run_id)}" ${selected}>${escHtml(dashboardRunLabel(r))}</option>`;
-        })
-        .join("");
-    }
   } catch (err) {
     state.dashboardRuns = [];
+    state.dashboardSeasonPairs = [];
+    state.dashboardSeasonPairKey = null;
     state.dashboardRunId = null;
     if (el.dashboardRunSelect) {
       el.dashboardRunSelect.innerHTML = "<option value=''>Errore caricamento aggiornamenti dashboard</option>";
+      el.dashboardRunSelect.disabled = true;
+    }
+    if (el.dashboardSeasonPairSelect) {
+      el.dashboardSeasonPairSelect.innerHTML = "<option value=''>Errore caricamento coppie stagioni</option>";
+      el.dashboardSeasonPairSelect.disabled = true;
     }
     setDashboardWarn(`Errore elenco aggiornamenti dashboard: ${err.message}`);
   }
@@ -3220,6 +3488,9 @@ async function refreshDashboard() {
 
     setDashboardWarn("");
     state.dashboardData = out;
+    if (!state.dashboardSectionUserSelected) {
+      setActiveDashSection(pickBestDashboardSection(out));
+    }
     renderRunContextPills(out.run, out.baseline_run || null);
     if (el.dashboardSubtitle) {
       const runLabel = runTypeLabel(out.run);
@@ -3510,7 +3781,10 @@ function initEvents() {
     btn.addEventListener("click", () => setActiveView(btn.dataset.viewTarget));
   });
   el.dashSectionTabs.forEach((btn) => {
-    btn.addEventListener("click", () => setActiveDashSection(btn.dataset.dashTarget));
+    btn.addEventListener("click", () => {
+      state.dashboardSectionUserSelected = true;
+      setActiveDashSection(btn.dataset.dashTarget);
+    });
   });
   el.runsSearch?.addEventListener("input", handleRunsFilterChanged);
   el.runsSourceFilter?.addEventListener("change", handleRunsFilterChanged);
@@ -3544,8 +3818,15 @@ function initEvents() {
     refreshRuns();
     refreshSelectedRunDetails();
   });
+  el.dashboardSeasonPairSelect?.addEventListener("change", () => {
+    state.dashboardSeasonPairKey = el.dashboardSeasonPairSelect?.value || null;
+    state.dashboardSectionUserSelected = false;
+    syncDashboardPairAndRunSelection({ forceLatestRun: true });
+    refreshDashboard();
+  });
   el.dashboardRunSelect?.addEventListener("change", () => {
     state.dashboardRunId = el.dashboardRunSelect?.value || null;
+    state.dashboardSectionUserSelected = false;
     refreshDashboard();
   });
   el.transferArticleLoadBtn?.addEventListener("click", () => {
