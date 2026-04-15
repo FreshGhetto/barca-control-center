@@ -428,6 +428,7 @@ def _catalog_source_history_frames(
           s.color AS colore,
           a.materiale,
           COALESCE(NULLIF(s.description, ''), a.description) AS descrizione,
+          COALESCE(s.con, 0) AS consegnato_qty,
           COALESCE(s.ven, 0) AS venduto_qty,
           COALESCE(s.giac, 0) AS giacenza,
           p.price_listino,
@@ -470,6 +471,7 @@ def _catalog_source_history_frames(
             "colore",
             "materiale",
             "descrizione",
+            "consegnato_qty",
             "venduto_qty",
             "giacenza",
             "price_listino",
@@ -495,6 +497,7 @@ def _catalog_source_history_frames(
                 "Colore": season_df["colore"].map(_txt),
                 "Materiale": season_df["materiale"].map(_txt),
                 "Descrizione": season_df["descrizione"].map(_txt),
+                "Consegnato": pd.to_numeric(season_df["consegnato_qty"], errors="coerce").fillna(0.0),
                 # Il catalogo storico non separa venduto periodo/totale come i bundle ordini.
                 # Per il confronto stagionale usiamo il venduto accumulato del report per entrambi.
                 "Venduto_Totale": pd.to_numeric(season_df["venduto_qty"], errors="coerce").fillna(0.0),
@@ -708,6 +711,7 @@ def _parse_order_detail_report(path: Path) -> pd.DataFrame:
                         "Colore": re.sub(r"\s+", " ", current_colore).strip() if current_colore else None,
                         "Materiale": re.sub(r"\s+", " ", current_materiale).strip() if current_materiale else None,
                         "Descrizione": description,
+                        "Consegnato": _parse_csv_int(elements[idx + 1]) if idx + 1 < len(elements) else None,
                         "Venduto_Totale": _parse_csv_int(elements[idx + 2]) if idx + 2 < len(elements) else None,
                         "Venduto_Periodo": _parse_csv_int(elements[idx + 3]) if idx + 3 < len(elements) else None,
                         "Giacenza": _parse_csv_int(elements[idx + 4]) if idx + 4 < len(elements) else None,
@@ -729,6 +733,7 @@ def _parse_order_detail_report(path: Path) -> pd.DataFrame:
         "Colore",
         "Materiale",
         "Descrizione",
+        "Consegnato",
         "Venduto_Totale",
         "Venduto_Periodo",
         "Giacenza",
@@ -742,7 +747,7 @@ def _parse_order_detail_report(path: Path) -> pd.DataFrame:
         return pd.DataFrame(columns=columns)
 
     df = pd.DataFrame(rows)
-    for col in ("Venduto_Totale", "Venduto_Periodo", "Giacenza", "Venduto_Extra"):
+    for col in ("Consegnato", "Venduto_Totale", "Venduto_Periodo", "Giacenza", "Venduto_Extra"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     def _first_non_empty(series: pd.Series) -> Optional[str]:
@@ -760,6 +765,7 @@ def _parse_order_detail_report(path: Path) -> pd.DataFrame:
         "Colore": _first_non_empty,
         "Materiale": _first_non_empty,
         "Descrizione": _first_non_empty,
+        "Consegnato": "max",
         "Venduto_Totale": "max",
         "Venduto_Periodo": "max",
         "Giacenza": "max",
@@ -771,7 +777,7 @@ def _parse_order_detail_report(path: Path) -> pd.DataFrame:
     }
     out = df.groupby("Codice_Articolo", as_index=False).agg(agg)
     out["Reparto"] = out["Reparto"].map(lambda value: normalize_reparto(value) or inferred_reparto)
-    for col in ("Venduto_Totale", "Venduto_Periodo", "Giacenza", "Venduto_Extra"):
+    for col in ("Consegnato", "Venduto_Totale", "Venduto_Periodo", "Giacenza", "Venduto_Extra"):
         out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
     return out.reindex(columns=columns)
 
@@ -853,7 +859,7 @@ def _overlay_order_detail(
         )
         out[col] = preferred.where(preferred.notna(), fallback)
 
-    for col in ("Venduto_Totale", "Venduto_Periodo", "Giacenza"):
+    for col in ("Consegnato", "Venduto_Totale", "Venduto_Periodo", "Giacenza"):
         if col not in out.columns:
             out[col] = pd.NA
         if col not in det.columns:
@@ -1019,7 +1025,7 @@ def _load_order_facts_from_db(conn, source_run_id: str) -> Dict[str, pd.DataFram
             """
             SELECT
               module, season_code, article_code, categoria, tipologia, marchio, colore, materiale,
-              descrizione, venduto_totale, venduto_periodo, giacenza, venduto_extra, fascia_prezzo,
+              descrizione, consegnato, venduto_totale, venduto_periodo, giacenza, venduto_extra, fascia_prezzo,
               prezzo_listino, prezzo_acquisto, prezzo_vendita
             FROM fact_order_source
             WHERE run_id = %s::uuid
@@ -1320,6 +1326,7 @@ def run_db_sync(
                     _txt(r.get("colore")),
                     _txt(r.get("materiale")),
                     _txt(r.get("descrizione")),
+                    _clamp_num(r.get("consegnato"), low=0.0),
                     _clamp_num(r.get("venduto_totale"), low=0.0),
                     _clamp_num(r.get("venduto_periodo"), low=0.0),
                     _clamp_num(r.get("giacenza"), low=0.0),
@@ -1384,6 +1391,7 @@ def run_db_sync(
                     _txt(r.get("Colore")),
                     _txt(r.get("Materiale")),
                     _txt(r.get("Descrizione")),
+                    _clamp_num(r.get("Consegnato"), low=0.0),
                     _clamp_num(r.get("Venduto_Totale"), low=0.0),
                     _clamp_num(r.get("Venduto_Periodo"), low=0.0),
                     _clamp_num(r.get("Giacenza"), low=0.0),
@@ -1586,12 +1594,12 @@ def run_db_sync(
                 """
                 INSERT INTO fact_order_source (
                   run_id, module, season_code, article_code, categoria, tipologia, marchio, colore, materiale,
-                  descrizione, venduto_totale, venduto_periodo, giacenza, venduto_extra, fascia_prezzo, prezzo_listino, prezzo_acquisto, prezzo_vendita
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                  descrizione, consegnato, venduto_totale, venduto_periodo, giacenza, venduto_extra, fascia_prezzo, prezzo_listino, prezzo_acquisto, prezzo_vendita
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (run_id, module, season_code, article_code) DO UPDATE SET
                   categoria=EXCLUDED.categoria, tipologia=EXCLUDED.tipologia, marchio=EXCLUDED.marchio, colore=EXCLUDED.colore,
                   materiale=EXCLUDED.materiale, descrizione=EXCLUDED.descrizione, venduto_totale=EXCLUDED.venduto_totale,
-                  venduto_periodo=EXCLUDED.venduto_periodo, giacenza=EXCLUDED.giacenza, venduto_extra=EXCLUDED.venduto_extra,
+                  consegnato=EXCLUDED.consegnato, venduto_periodo=EXCLUDED.venduto_periodo, giacenza=EXCLUDED.giacenza, venduto_extra=EXCLUDED.venduto_extra,
                   fascia_prezzo=EXCLUDED.fascia_prezzo, prezzo_listino=EXCLUDED.prezzo_listino,
                   prezzo_acquisto=EXCLUDED.prezzo_acquisto, prezzo_vendita=EXCLUDED.prezzo_vendita
                 """,

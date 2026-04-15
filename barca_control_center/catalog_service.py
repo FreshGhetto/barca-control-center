@@ -209,6 +209,138 @@ def _merge_catalog_article_metadata(catalog_df: pd.DataFrame, metadata_df: pd.Da
     )
 
 
+def _normalize_catalog_store_metadata_from_total(catalog_df: pd.DataFrame) -> pd.DataFrame:
+    if catalog_df is None or catalog_df.empty:
+        return catalog_df.copy() if catalog_df is not None else pd.DataFrame()
+
+    required = {"season_code", "article_code", "store_code"}
+    if not required.issubset(set(catalog_df.columns)):
+        return catalog_df.copy()
+
+    meta_cols = ["description", "color", "supplier", "reparto", "categoria", "tipologia"]
+    out = catalog_df.copy()
+    for col in meta_cols:
+        if col not in out.columns:
+            out[col] = None
+
+    store_norm = out["store_code"].astype(str).str.strip().str.upper()
+    totals = out.loc[store_norm == "XX", ["season_code", "article_code", *meta_cols]].copy()
+    if totals.empty:
+        return out
+
+    totals = totals.drop_duplicates(subset=["season_code", "article_code"], keep="last")
+    totals = totals.rename(columns={col: f"__total_{col}" for col in meta_cols})
+    merged = out.merge(totals, on=["season_code", "article_code"], how="left")
+    store_mask = merged["store_code"].astype(str).str.strip().str.upper() != "XX"
+
+    for col in meta_cols:
+        total_col = f"__total_{col}"
+        total_values = merged[total_col]
+        valid_total = total_values.notna() & total_values.astype(str).str.strip().ne("")
+        merged.loc[store_mask & valid_total, col] = merged.loc[store_mask & valid_total, total_col]
+
+    return merged.drop(columns=[f"__total_{col}" for col in meta_cols])
+
+
+def _overlay_catalog_kpis_from_order_source(conn, catalog_df: pd.DataFrame) -> pd.DataFrame:
+    if catalog_df is None or catalog_df.empty:
+        return catalog_df.copy() if catalog_df is not None else pd.DataFrame()
+    required = {"season_code", "article_code", "store_code", "con", "ven", "giac", "perc_ven"}
+    if not required.issubset(set(catalog_df.columns)):
+        return catalog_df.copy()
+
+    out = catalog_df.copy()
+    total_mask = out["store_code"].astype(str).str.strip().str.upper() == "XX"
+    if not bool(total_mask.any()):
+        return out
+
+    key_frame = out.loc[total_mask, ["season_code", "article_code"]].copy()
+    key_frame["season_key"] = key_frame["season_code"].map(_season)
+    key_frame["article_key"] = key_frame["article_code"].map(_article)
+    key_frame = key_frame[key_frame["season_key"].notna() & key_frame["article_key"].notna()]
+    if key_frame.empty:
+        return out
+
+    seasons = sorted({str(value) for value in key_frame["season_key"].tolist() if str(value).strip()})
+    articles = sorted({str(value) for value in key_frame["article_key"].tolist() if str(value).strip()})
+    if not seasons or not articles:
+        return out
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT EXISTS (
+              SELECT 1
+              FROM information_schema.columns
+              WHERE table_schema = 'public'
+                AND table_name = 'fact_order_source'
+                AND column_name = 'consegnato'
+            )
+            """
+        )
+        has_consegnato = bool(cur.fetchone()[0])
+    if not has_consegnato:
+        return out
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT ON (
+              UPPER(TRIM(fos.season_code)),
+              UPPER(REPLACE(TRIM(fos.article_code), ' ', ''))
+            )
+              UPPER(TRIM(fos.season_code)) AS season_key,
+              UPPER(REPLACE(TRIM(fos.article_code), ' ', '')) AS article_key,
+              fos.consegnato,
+              COALESCE(fos.venduto_totale, fos.venduto_periodo),
+              fos.giacenza
+            FROM fact_order_source fos
+            JOIN etl_run r
+              ON r.run_id = fos.run_id
+            WHERE r.status = 'completed'
+              AND UPPER(TRIM(fos.season_code)) = ANY(%s)
+              AND UPPER(REPLACE(TRIM(fos.article_code), ' ', '')) = ANY(%s)
+              AND fos.consegnato IS NOT NULL
+              AND COALESCE(fos.venduto_totale, fos.venduto_periodo) IS NOT NULL
+              AND fos.giacenza IS NOT NULL
+            ORDER BY
+              UPPER(TRIM(fos.season_code)),
+              UPPER(REPLACE(TRIM(fos.article_code), ' ', '')),
+              COALESCE(r.finished_at, r.started_at) DESC,
+              fos.run_id DESC
+            """,
+            (seasons, articles),
+        )
+        rows = cur.fetchall()
+
+    if not rows:
+        return out
+
+    source_lookup = {
+        (str(season_key or "").strip().upper(), str(article_key or "").strip().upper()): (
+            _f(consegnato),
+            _f(venduto),
+            _f(giacenza),
+        )
+        for season_key, article_key, consegnato, venduto, giacenza in rows
+    }
+
+    for idx, rec in out.loc[total_mask].iterrows():
+        key = (_season(rec.get("season_code")), _article(rec.get("article_code")))
+        values = source_lookup.get(key)
+        if values is None:
+            continue
+        con, ven, giac = values
+        if con is None or ven is None or giac is None:
+            continue
+        out.at[idx, "con"] = con
+        out.at[idx, "ven"] = ven
+        out.at[idx, "giac"] = giac
+        out.at[idx, "perc_ven"] = (ven / con * 100.0) if con else 0.0
+
+    return out
+
+
 def _build_article_meta(catalog_df: pd.DataFrame, metadata_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
     article_cols = ["article_code", "description", "reparto", "categoria", "marchio", "tipologia", "color", "materiale"]
@@ -617,6 +749,8 @@ def import_catalog_to_db(
         if not metadata_df.empty:
             _emit_progress(progress_cb, stage="merging_article_meta", progress=72.0, message="Merge metadati articolo da CSV")
             catalog_df = _merge_catalog_article_metadata(catalog_df, metadata_df)
+        catalog_df = _normalize_catalog_store_metadata_from_total(catalog_df)
+        catalog_df = _overlay_catalog_kpis_from_order_source(conn, catalog_df)
         season_values = sorted(
             {
                 str(x)

@@ -249,6 +249,88 @@ def _catalog_source_tables(source_run_id: Optional[str]) -> Dict[str, Any]:
     }
 
 
+def _apply_catalog_article_snapshot_row(
+    articles: Dict[str, Article],
+    authoritative_totals: Dict[str, Tuple[float, float, float, float]],
+    *,
+    season_code: str,
+    article_code: str,
+    description: str,
+    color: str,
+    supplier: str,
+    reparto: str,
+    categoria: str,
+    tipologia: str,
+    marchio: str,
+    store_code: str,
+    giac: float,
+    con: float,
+    ven: float,
+    perc_ven: float,
+    source_file: str,
+) -> Article:
+    article_key = _catalog_key(season_code, article_code)
+    article = articles.get(article_key)
+    if article is None:
+        article = Article(code=article_code, season=season_code, season_code=season_code, season_label=season_code)
+        articles[article_key] = article
+
+    if source_file:
+        article.source_files.add(source_file)
+
+    if store_code == "XX":
+        article.description = description
+        article.color = color
+        article.supplier = supplier
+        article.reparto = reparto
+        article.categoria = categoria
+        article.tipologia = tipologia
+        article.marchio = marchio
+        article.giac = giac
+        article.con = con
+        article.ven = ven
+        article.perc_ven = perc_ven
+        authoritative_totals[article_key] = (giac, con, ven, perc_ven)
+        return article
+
+    if not str(article.description or "").strip():
+        article.description = description
+    if not str(article.color or "").strip():
+        article.color = color
+    if not str(article.supplier or "").strip():
+        article.supplier = supplier
+    if not str(article.reparto or "").strip():
+        article.reparto = reparto
+    if not str(article.categoria or "").strip():
+        article.categoria = categoria
+    if not str(article.tipologia or "").strip():
+        article.tipologia = tipologia
+    if not str(article.marchio or "").strip():
+        article.marchio = marchio
+
+    article.stores[store_code] = CatalogStoreRow(
+        store=store_code,
+        giac=giac,
+        con=con,
+        ven=ven,
+        perc_ven=perc_ven,
+    )
+    return article
+
+
+def _finalize_catalog_articles(
+    articles: Dict[str, Article],
+    authoritative_totals: Mapping[str, Tuple[float, float, float, float]],
+) -> None:
+    for article_key, article in articles.items():
+        if article.stores:
+            article.recompute_totals()
+        total = authoritative_totals.get(article_key)
+        if total is None:
+            continue
+        article.giac, article.con, article.ven, article.perc_ven = total
+
+
 def _pick_catalog_run_id(conn, explicit_run_id: Optional[str] = None) -> str:
     if explicit_run_id:
         with conn.cursor() as cur:
@@ -291,6 +373,7 @@ def _load_catalog_articles_from_db(*, source_run_id: Optional[str] = None) -> Tu
         effective_run_id = _pick_catalog_run_id(conn, source_run_id)
         source = _catalog_source_tables(source_run_id)
         articles: Dict[str, Article] = {}
+        authoritative_totals: Dict[str, Tuple[float, float, float, float]] = {}
 
         with conn.cursor() as cur:
             cur.execute(
@@ -315,47 +398,34 @@ def _load_catalog_articles_from_db(*, source_run_id: Optional[str] = None) -> Tu
                 LEFT JOIN dim_article da
                   ON da.article_code = s.article_code
                 WHERE {source['where_prefix']}s.season_code <> ''
-                ORDER BY s.season_code, s.article_code, s.store_code
+                ORDER BY s.season_code, s.article_code, CASE WHEN s.store_code = 'XX' THEN 0 ELSE 1 END, s.store_code
                 """,
                 tuple(source["params_prefix"]),
             )
             for row in cur.fetchall():
                 season_code = str(row[0] or "").strip().upper()
                 article_code = str(row[1] or "").strip().upper()
-                article_key = _catalog_key(season_code, article_code)
-                article = articles.get(article_key)
-                if article is None:
-                    article = Article(
-                        code=article_code,
-                        season=season_code,
-                        season_code=season_code,
-                        season_label=season_code,
-                        description=str(row[2] or ""),
-                        color=str(row[3] or ""),
-                        supplier=str(row[4] or ""),
-                        reparto=str(row[5] or ""),
-                        categoria=str(row[6] or ""),
-                        tipologia=str(row[7] or ""),
-                        marchio=str(row[8] or ""),
-                        giac=float(row[10] or 0.0),
-                        con=float(row[11] or 0.0),
-                        ven=float(row[12] or 0.0),
-                        perc_ven=float(row[13] or 0.0),
-                    )
-                    articles[article_key] = article
-                source_file = str(row[14] or "").strip()
-                if source_file:
-                    article.source_files.add(source_file)
-
                 store_code = str(row[9] or "").strip().upper()
-                if not store_code or store_code == "XX":
+                if not store_code:
                     continue
-                article.stores[store_code] = CatalogStoreRow(
-                    store=store_code,
+                _apply_catalog_article_snapshot_row(
+                    articles,
+                    authoritative_totals,
+                    season_code=season_code,
+                    article_code=article_code,
+                    description=str(row[2] or ""),
+                    color=str(row[3] or ""),
+                    supplier=str(row[4] or ""),
+                    reparto=str(row[5] or ""),
+                    categoria=str(row[6] or ""),
+                    tipologia=str(row[7] or ""),
+                    marchio=str(row[8] or ""),
+                    store_code=store_code,
                     giac=float(row[10] or 0.0),
                     con=float(row[11] or 0.0),
                     ven=float(row[12] or 0.0),
                     perc_ven=float(row[13] or 0.0),
+                    source_file=str(row[14] or "").strip(),
                 )
 
             cur.execute(
@@ -406,9 +476,7 @@ def _load_catalog_articles_from_db(*, source_run_id: Optional[str] = None) -> Tu
                     "prezzo_saldo": None if row[3] is None else float(row[3]),
                 }
 
-    for article in articles.values():
-        if article.stores:
-            article.recompute_totals()
+    _finalize_catalog_articles(articles, authoritative_totals)
 
     return effective_run_id, articles, price_lookup
 
@@ -743,6 +811,12 @@ def _resolve_local_season_dirs(root_dir: Path, requested_seasons: Sequence[str])
     return sorted(list(dict.fromkeys(selected)))
 
 
+def _resolve_all_local_season_dirs(root_dir: Path) -> List[str]:
+    if not root_dir.exists() or not root_dir.is_dir():
+        return []
+    return sorted([child.name for child in root_dir.iterdir() if child.is_dir()])
+
+
 def _build_local_image_index(
     *,
     root_dir: Path,
@@ -754,10 +828,13 @@ def _build_local_image_index(
     selected_dirs = _resolve_local_season_dirs(root_dir, requested_seasons)
     if not selected_dirs:
         return {}, {"seasons": 0, "codes_total_unique": 0}, ""
+    all_dirs = _resolve_all_local_season_dirs(root_dir)
+    fallback_dirs = [season for season in all_dirs if season not in selected_dirs]
+    scan_dirs = selected_dirs + fallback_dirs
 
     signature = _compute_local_index_signature(
         root_raw=str(root_dir),
-        selected_seasons=selected_dirs,
+        selected_seasons=scan_dirs,
         position_name=position_name,
         allow_position_variants=allow_position_variants,
     )
@@ -766,16 +843,21 @@ def _build_local_image_index(
         index_map, summary = cached
         summary = dict(summary)
         summary["cache_hit"] = 1
+        summary["primary_seasons"] = len(selected_dirs)
+        summary["fallback_seasons"] = len(fallback_dirs)
         return index_map, summary, signature
 
     season_index, summary = scan_local_images(
         root_dir=root_dir,
-        season_names=selected_dirs,
+        season_names=scan_dirs,
         position=(position_name or "xl").strip() or "xl",
         allow_position_variants=allow_position_variants,
     )
-    flat_index = flatten_index(season_index, season_priority=selected_dirs)
+    flat_index = flatten_index(season_index, season_priority=scan_dirs)
     index_map = {key: str(value) for key, value in flat_index.items()}
+    summary = dict(summary)
+    summary["primary_seasons"] = len(selected_dirs)
+    summary["fallback_seasons"] = len(fallback_dirs)
     _save_local_index_cache(cache_root=cache_root, signature=signature, index_map=index_map, summary=summary)
     return index_map, summary, signature
 

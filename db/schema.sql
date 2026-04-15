@@ -265,6 +265,7 @@ CREATE TABLE IF NOT EXISTS fact_order_source (
     colore TEXT,
     materiale TEXT,
     descrizione TEXT,
+    consegnato NUMERIC(14, 2),
     venduto_totale NUMERIC(14, 2),
     venduto_periodo NUMERIC(14, 2),
     giacenza NUMERIC(14, 2),
@@ -285,6 +286,9 @@ ALTER TABLE IF EXISTS fact_order_source
 
 ALTER TABLE IF EXISTS fact_order_source
     ADD COLUMN IF NOT EXISTS prezzo_vendita NUMERIC(14, 2);
+
+ALTER TABLE IF EXISTS fact_order_source
+    ADD COLUMN IF NOT EXISTS consegnato NUMERIC(14, 2);
 
 CREATE TABLE IF NOT EXISTS fact_order_source_size (
     run_id UUID NOT NULL REFERENCES etl_run(run_id) ON DELETE CASCADE,
