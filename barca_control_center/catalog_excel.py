@@ -205,8 +205,7 @@ def parse_situazione_articoli_excel(
             if idx >= len(row_values):
                 continue
             qty = _as_float(row_values[idx])
-            if qty != 0.0:
-                sizes[size] = qty
+            sizes[size] = qty
 
         out.append(
             {
@@ -228,9 +227,9 @@ def parse_situazione_articoli_excel(
                 "con": _as_float(con),
                 "ven": _as_float(ven),
                 "perc_ven": _as_float(perc),
-                "sizes_present": 1 if sizes else 0,
+                "sizes_present": 1 if size_cols else 0,
                 "sizes_json": json.dumps({str(k): v for k, v in sizes.items()}, ensure_ascii=False, sort_keys=True)
-                if sizes
+                if size_cols
                 else "",
                 "synthetic_total": "",
             }

@@ -16,6 +16,7 @@ from .catalog_local_images import flatten_index, scan_local_images
 from .catalog_models import Article, CatalogStoreRow
 from .catalog_showcase import export_showcase_catalog
 from .db_sync import get_db_dsn
+from .reparto_sizes import SUPPORTED_SIZES
 
 try:
     import psycopg
@@ -331,6 +332,40 @@ def _finalize_catalog_articles(
         article.giac, article.con, article.ven, article.perc_ven = total
 
 
+def _complete_catalog_article_grids(
+    articles: Mapping[str, Article],
+    *,
+    store_codes_by_season: Mapping[str, set[str]],
+    size_keys_by_season: Mapping[str, set[int]],
+) -> None:
+    def add_size_keys(target: set[int], values: Iterable[Any]) -> None:
+        for value in values:
+            try:
+                target.add(int(value))
+            except Exception:
+                continue
+
+    for article in articles.values():
+        season_key = str(article.season or article.season_code or "").strip().upper()
+        store_codes = sorted(
+            code
+            for code in (store_codes_by_season.get(season_key, set()) or set())
+            if str(code or "").strip() and str(code or "").strip().upper() != "XX"
+        )
+        for store_code in store_codes:
+            article.stores.setdefault(store_code, CatalogStoreRow(store=store_code))
+
+        size_keys = set(size_keys_by_season.get(season_key, set()) or set())
+        add_size_keys(size_keys, (article.size_totals or {}).keys())
+        for store_row in article.stores.values():
+            add_size_keys(size_keys, (store_row.sizes or {}).keys())
+        if article.stores and not size_keys:
+            size_keys.update(SUPPORTED_SIZES)
+        for store_row in article.stores.values():
+            for size in sorted(size_keys):
+                store_row.sizes.setdefault(size, 0.0)
+
+
 def _pick_catalog_run_id(conn, explicit_run_id: Optional[str] = None) -> str:
     if explicit_run_id:
         with conn.cursor() as cur:
@@ -374,6 +409,8 @@ def _load_catalog_articles_from_db(*, source_run_id: Optional[str] = None) -> Tu
         source = _catalog_source_tables(source_run_id)
         articles: Dict[str, Article] = {}
         authoritative_totals: Dict[str, Tuple[float, float, float, float]] = {}
+        store_codes_by_season: Dict[str, set[str]] = {}
+        size_keys_by_season: Dict[str, set[int]] = {}
 
         with conn.cursor() as cur:
             cur.execute(
@@ -408,6 +445,8 @@ def _load_catalog_articles_from_db(*, source_run_id: Optional[str] = None) -> Tu
                 store_code = str(row[9] or "").strip().upper()
                 if not store_code:
                     continue
+                if store_code != "XX":
+                    store_codes_by_season.setdefault(season_code, set()).add(store_code)
                 _apply_catalog_article_snapshot_row(
                     articles,
                     authoritative_totals,
@@ -445,17 +484,19 @@ def _load_catalog_articles_from_db(*, source_run_id: Optional[str] = None) -> Tu
                 if article is None:
                     continue
                 store_code = str(row[2] or "").strip().upper()
-                if not store_code or store_code == "XX":
-                    continue
-                store_row = article.stores.get(store_code)
-                if store_row is None:
-                    store_row = CatalogStoreRow(store=store_code)
-                    article.stores[store_code] = store_row
                 try:
                     size = int(row[3])
                     qty = float(row[4] or 0.0)
                 except Exception:
                     continue
+                size_keys_by_season.setdefault(season_code, set()).add(size)
+                if not store_code or store_code == "XX":
+                    continue
+                store_codes_by_season.setdefault(season_code, set()).add(store_code)
+                store_row = article.stores.get(store_code)
+                if store_row is None:
+                    store_row = CatalogStoreRow(store=store_code)
+                    article.stores[store_code] = store_row
                 store_row.sizes[size] = qty
 
             price_lookup: Dict[str, Dict[str, Optional[float]]] = {}
@@ -476,6 +517,11 @@ def _load_catalog_articles_from_db(*, source_run_id: Optional[str] = None) -> Tu
                     "prezzo_saldo": None if row[3] is None else float(row[3]),
                 }
 
+    _complete_catalog_article_grids(
+        articles,
+        store_codes_by_season=store_codes_by_season,
+        size_keys_by_season=size_keys_by_season,
+    )
     _finalize_catalog_articles(articles, authoritative_totals)
 
     return effective_run_id, articles, price_lookup

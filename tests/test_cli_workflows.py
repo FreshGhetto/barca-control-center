@@ -375,3 +375,181 @@ class DashboardSeasonContextTests(DatabaseIntegrationTestCase):
         self.assertIn("26E", ctx.get("available_current_seasons", []))
         self.assertIn("26G", ctx.get("available_continuativa_seasons", []))
         self.assertEqual(ctx.get("latest_pair_codes"), ["26E", "26G"])
+
+
+class DashboardRunSelectionTests(DatabaseIntegrationTestCase):
+    def test_dashboard_prefers_rich_app_run_over_newer_raw_snapshot(self) -> None:
+        apply_schema(self.db_env)
+        raw_run_id = str(uuid.uuid4())
+        app_run_id = str(uuid.uuid4())
+        conn_kwargs = {
+            "host": self.db_env.get("BARCA_DB_HOST", "localhost"),
+            "port": int(self.db_env.get("BARCA_DB_PORT", "5432")),
+            "dbname": self.db_env.get("BARCA_DB_NAME", "barca"),
+            "user": self.db_env.get("BARCA_DB_USER", "barca_user"),
+            "password": self.db_env.get("BARCA_DB_PASSWORD", ""),
+            "sslmode": self.db_env.get("BARCA_DB_SSLMODE", "prefer"),
+            "connect_timeout": int(self.db_env.get("BARCA_DB_CONNECT_TIMEOUT", "2")),
+        }
+        with psycopg.connect(**conn_kwargs) as conn:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    """
+                    INSERT INTO dim_shop (shop_code, shop_name, fascia)
+                    VALUES (%s, %s, %s)
+                    """,
+                    [
+                        ("AR", "AR", 1),
+                        ("BO", "BO", 2),
+                    ],
+                )
+                cur.execute(
+                    """
+                    INSERT INTO dim_article (article_code, description, reparto, categoria, tipologia, marchio, colore, materiale)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    ("59/RUNSEL", "ARTICOLO TEST RUN", "SCARPE DONNA", "BALLERINA", "TEST", "ACME", "NERO", "PELLE"),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO etl_run (run_id, run_type, status, started_at, finished_at, metadata)
+                    VALUES (%s::uuid, %s, %s, %s::timestamptz, %s::timestamptz, %s::jsonb)
+                    """,
+                    (
+                        app_run_id,
+                        "app_pipeline",
+                        "completed",
+                        "2026-04-08T10:00:00+02:00",
+                        "2026-04-08T10:00:10+02:00",
+                        json.dumps(
+                            {
+                                "counts": {
+                                    "fact_transfer_suggestion": 1,
+                                    "fact_feature_state": 1,
+                                    "fact_sales_snapshot": 1,
+                                    "fact_stock_snapshot": 1,
+                                }
+                            }
+                        ),
+                    ),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO etl_run (run_id, run_type, status, started_at, finished_at, metadata)
+                    VALUES (%s::uuid, %s, %s, %s::timestamptz, %s::timestamptz, %s::jsonb)
+                    """,
+                    (
+                        raw_run_id,
+                        "raw_input_sync",
+                        "completed",
+                        "2026-04-08T11:00:00+02:00",
+                        "2026-04-08T11:00:10+02:00",
+                        json.dumps(
+                            {
+                                "counts": {
+                                    "fact_transfer_suggestion": 0,
+                                    "fact_feature_state": 0,
+                                    "fact_sales_snapshot": 1,
+                                    "fact_stock_snapshot": 1,
+                                }
+                            }
+                        ),
+                    ),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO fact_sales_snapshot (
+                      run_id, snapshot_at, article_code, shop_code, consegnato_qty, venduto_qty, periodo_qty, altro_venduto_qty, sellout_percent, sellout_clamped
+                    ) VALUES
+                      (%s::uuid, %s::timestamptz, %s, %s, %s, %s, %s, %s, %s, %s),
+                      (%s::uuid, %s::timestamptz, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        app_run_id,
+                        "2026-04-08T10:00:00+02:00",
+                        "59/RUNSEL",
+                        "AR",
+                        5,
+                        2,
+                        2,
+                        0,
+                        40,
+                        40,
+                        raw_run_id,
+                        "2026-04-08T11:00:00+02:00",
+                        "59/RUNSEL",
+                        "AR",
+                        5,
+                        1,
+                        1,
+                        0,
+                        20,
+                        20,
+                    ),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO fact_stock_snapshot (
+                      run_id, snapshot_at, article_code, shop_code, ricevuto, giacenza, consegnato, venduto, sellout_percent, size_38, size_39, valore_giac
+                    ) VALUES
+                      (%s::uuid, %s::timestamptz, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s),
+                      (%s::uuid, %s::timestamptz, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        app_run_id,
+                        "2026-04-08T10:00:00+02:00",
+                        "59/RUNSEL",
+                        "AR",
+                        0,
+                        4,
+                        5,
+                        2,
+                        40,
+                        2,
+                        2,
+                        100,
+                        raw_run_id,
+                        "2026-04-08T11:00:00+02:00",
+                        "59/RUNSEL",
+                        "AR",
+                        0,
+                        4,
+                        5,
+                        1,
+                        20,
+                        2,
+                        2,
+                        100,
+                    ),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO fact_feature_state (
+                      run_id, article_code, shop_code, fascia, is_outlet, role, demand_hybrid, observed_sales_signal, stock_after,
+                      missing_core_sizes, destination_priority_score, source_priority_score, size_38, size_39
+                    ) VALUES (%s::uuid, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (app_run_id, "59/RUNSEL", "AR", 1, False, "STORE", 6, 2, 3, 1, 50, 10, 1, 2),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO fact_transfer_suggestion (
+                      run_id, article_code, size, from_shop_code, to_shop_code, reason, qty
+                    ) VALUES (%s::uuid, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (app_run_id, "59/RUNSEL", 38, "AR", "BO", "Top-up", 1),
+                )
+            conn.commit()
+
+        with self.ui_client() as client:
+            dashboard_runs = client.get("/api/dashboard/runs?limit=20")
+            dashboard = client.get("/api/dashboard?table_limit=5")
+
+        self.assertEqual(dashboard_runs.status_code, 200)
+        self.assertEqual(dashboard.status_code, 200)
+        runs = dashboard_runs.json()["runs"]
+        self.assertEqual(runs[0]["run_id"], app_run_id)
+        self.assertIn("metadata", runs[0])
+        payload = dashboard.json()
+        self.assertEqual(payload["run"]["run_id"], app_run_id)
+        self.assertGreater(payload["kpis"]["transfer_rows"], 0)

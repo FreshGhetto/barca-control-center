@@ -11,6 +11,7 @@ from barca_control_center.catalog_service import (
 from barca_control_center.catalog_showcase_service import (
     _apply_catalog_article_snapshot_row,
     _catalog_key,
+    _complete_catalog_article_grids,
     _finalize_catalog_articles,
 )
 
@@ -69,6 +70,43 @@ class CatalogShowcaseServiceTests(unittest.TestCase):
         self.assertEqual(article.ven, 2075.0)
         self.assertAlmostEqual(article.perc_ven, 91.0487)
         self.assertIn("AR", article.stores)
+
+    def test_catalog_grid_completion_keeps_empty_stores_and_sizes(self) -> None:
+        articles = {}
+        totals = {}
+
+        _apply_catalog_article_snapshot_row(
+            articles,
+            totals,
+            season_code="25Y",
+            article_code="49/GRIDTEST",
+            description="TEST",
+            color="NERO",
+            supplier="ACME",
+            reparto="SCARPE DONNA",
+            categoria="BALLERINA",
+            tipologia="CLASSIC",
+            marchio="ACME",
+            store_code="AR",
+            giac=1.0,
+            con=1.0,
+            ven=0.0,
+            perc_ven=0.0,
+            source_file="25y_donna.xlsx",
+        )
+        article = articles[_catalog_key("25Y", "49/GRIDTEST")]
+        article.stores["AR"].sizes[40] = 1.0
+
+        _complete_catalog_article_grids(
+            articles,
+            store_codes_by_season={"25Y": {"AR", "BO"}},
+            size_keys_by_season={"25Y": {40, 41}},
+        )
+
+        self.assertIn("BO", article.stores)
+        self.assertEqual(article.stores["BO"].sizes[40], 0.0)
+        self.assertEqual(article.stores["BO"].sizes[41], 0.0)
+        self.assertEqual(article.stores["AR"].sizes[41], 0.0)
 
     def test_import_normalization_copies_total_metadata_to_store_rows(self) -> None:
         raw = pd.DataFrame(

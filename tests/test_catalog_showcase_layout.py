@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import unittest
 
-from barca_control_center.catalog_models import Article
-from barca_control_center.catalog_showcase import render_showcase_jpg
+from barca_control_center.catalog_models import Article, CatalogStoreRow
+from barca_control_center.catalog_showcase import _build_article_detail_html, render_showcase_jpg
 
 
 class CatalogShowcaseLayoutTests(unittest.TestCase):
@@ -70,6 +70,19 @@ class CatalogShowcaseLayoutTests(unittest.TestCase):
         image = render_showcase_jpg(article, None, layout="detailed")
 
         self.assertEqual(image.size, (1748, 2480))
+
+    def test_html_detail_keeps_empty_store_and_size_columns(self) -> None:
+        article = Article(code="59/TESTPNE", season="25I", giac=1, con=1, ven=0)
+        article.stores = {
+            "AR": CatalogStoreRow(store="AR", giac=1, con=1, ven=0, sizes={40: 1, 41: 0}),
+            "BO": CatalogStoreRow(store="BO", giac=0, con=0, ven=0, sizes={40: 0, 41: 0}),
+        }
+        article.size_totals = {40: 1, 41: 0}
+
+        html = _build_article_detail_html(article, listino_price=None, saldo_price=None)
+
+        self.assertIn("<th>41</th>", html)
+        self.assertIn("<td>BO</td>", html)
 
 
 if __name__ == "__main__":

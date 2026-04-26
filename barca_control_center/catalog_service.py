@@ -11,6 +11,7 @@ import pandas as pd
 from .catalog_excel import ensure_xlsx, parse_situazione_articoli_excel
 from .catalog_price import build_article_metadata_from_files, build_price_snapshot_from_files
 from .db_sync import get_db_dsn
+from .reparto_sizes import SUPPORTED_SIZES
 
 try:
     import psycopg
@@ -480,8 +481,6 @@ def _build_size_rows(catalog_df: pd.DataFrame) -> list[Tuple[str, str, str, int,
                 size = int(key)
                 qty = float(value)
             except Exception:
-                continue
-            if abs(qty) <= 1e-12:
                 continue
             rows.append((str(rec.season_code), str(rec.article_code), str(rec.store_code), size, qty))
     return rows
@@ -1384,6 +1383,21 @@ def get_catalog_article_detail(
                   AND article_code = %s
                 ORDER BY store_code, size
             """
+            store_scope_sql = """
+                SELECT DISTINCT store_code
+                FROM fact_catalog_article_store_snapshot
+                WHERE run_id = %s::uuid
+                  AND season_code = %s
+                  AND store_code <> 'XX'
+                ORDER BY store_code
+            """
+            size_scope_sql = """
+                SELECT DISTINCT size
+                FROM fact_catalog_article_store_size_snapshot
+                WHERE run_id = %s::uuid
+                  AND season_code = %s
+                ORDER BY size
+            """
             params_prefix: Tuple[Any, ...] = (run_id, season_code)
         else:
             source_name = "vw_catalog_article_store_current"
@@ -1411,6 +1425,19 @@ def get_catalog_article_detail(
                 WHERE season_code = %s
                   AND article_code = %s
                 ORDER BY store_code, size
+            """
+            store_scope_sql = """
+                SELECT DISTINCT store_code
+                FROM vw_catalog_article_store_current
+                WHERE season_code = %s
+                  AND store_code <> 'XX'
+                ORDER BY store_code
+            """
+            size_scope_sql = """
+                SELECT DISTINCT size
+                FROM vw_catalog_article_store_size_current
+                WHERE season_code = %s
+                ORDER BY size
             """
             params_prefix = (season_code,)
 
@@ -1491,14 +1518,47 @@ def get_catalog_article_detail(
             ]
             store_map = {store["store_code"]: store for store in stores}
 
+            cur.execute(store_scope_sql, tuple(params_prefix))
+            for scope_row in cur.fetchall():
+                store_code = str(scope_row[0] or "").strip()
+                if not store_code or store_code == "XX" or store_code in store_map:
+                    continue
+                store_map[store_code] = {
+                    "store_code": store_code,
+                    "giac": 0.0,
+                    "con": 0.0,
+                    "ven": 0.0,
+                    "perc_ven": 0.0,
+                    "sizes": {},
+                }
+
             cur.execute(
                 sizes_sql,
                 tuple(params_prefix + (resolved_code,)),
             )
+            size_keys: set[int] = set()
             for size_row in cur.fetchall():
                 store_code = str(size_row[0] or "")
-                if store_code not in store_map:
+                try:
+                    size_key = int(size_row[1])
+                except Exception:
                     continue
-                store_map[store_code]["sizes"][str(int(size_row[1]))] = float(size_row[2] or 0)
+                size_keys.add(size_key)
+                if store_code in store_map:
+                    store_map[store_code]["sizes"][str(size_key)] = float(size_row[2] or 0)
 
-    return {"run_id": run_id, "summary": summary, "stores": stores}
+            cur.execute(size_scope_sql, tuple(params_prefix))
+            for size_row in cur.fetchall():
+                try:
+                    size_keys.add(int(size_row[0]))
+                except Exception:
+                    continue
+            if store_map and not size_keys:
+                size_keys.update(SUPPORTED_SIZES)
+
+            for store in store_map.values():
+                for size_key in sorted(size_keys):
+                    store["sizes"].setdefault(str(size_key), 0.0)
+            stores = sorted(store_map.values(), key=lambda item: str(item.get("store_code") or ""))
+
+    return {"run_id": run_id, "summary": summary, "stores": stores, "sizes": [str(size) for size in sorted(size_keys)]}

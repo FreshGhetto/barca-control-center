@@ -10,6 +10,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from .catalog_local_images import lookup_local_image_path, normalize_code
 from .catalog_models import Article
+from .reparto_sizes import SUPPORTED_SIZES
 
 _INVALID_FS_CHARS_RE = re.compile(r'[<>:"/\\|?*]')
 _MINIMAL_A6_CANVAS = (1240, 1748)
@@ -445,23 +446,19 @@ def _build_article_detail_html(
 
     size_keys: set[int] = set()
     for sr in stores:
-        for size, qty in (sr.sizes or {}).items():
+        for size in (sr.sizes or {}).keys():
             try:
-                qty_f = float(qty or 0.0)
                 size_i = int(size)
             except Exception:
                 continue
-            if abs(qty_f) > 1e-9:
-                size_keys.add(size_i)
-    if not size_keys:
-        for size, qty in (article.size_totals or {}).items():
-            try:
-                qty_f = float(qty or 0.0)
-                size_i = int(size)
-            except Exception:
-                continue
-            if abs(qty_f) > 1e-9:
-                size_keys.add(size_i)
+            size_keys.add(size_i)
+    for size in (article.size_totals or {}).keys():
+        try:
+            size_keys.add(int(size))
+        except Exception:
+            continue
+    if stores and not size_keys:
+        size_keys.update(SUPPORTED_SIZES)
     size_cols = sorted(size_keys)
 
     description = " • ".join([x for x in [article.description, article.color] if x]) or "-"
@@ -821,23 +818,19 @@ def _render_showcase_jpg_detailed(
 
     size_keys: set[int] = set()
     for sr in stores:
-        for size, qty in (sr.sizes or {}).items():
+        for size in (sr.sizes or {}).keys():
             try:
-                qty_f = float(qty or 0.0)
                 size_i = int(size)
             except Exception:
                 continue
-            if abs(qty_f) > 1e-9:
-                size_keys.add(size_i)
-    if not size_keys:
-        for size, qty in (article.size_totals or {}).items():
-            try:
-                qty_f = float(qty or 0.0)
-                size_i = int(size)
-            except Exception:
-                continue
-            if abs(qty_f) > 1e-9:
-                size_keys.add(size_i)
+            size_keys.add(size_i)
+    for size in (article.size_totals or {}).keys():
+        try:
+            size_keys.add(int(size))
+        except Exception:
+            continue
+    if stores and not size_keys:
+        size_keys.update(SUPPORTED_SIZES)
     visible_sizes = sorted(size_keys)
 
     draw.rectangle(content, outline=(25, 25, 25), width=max(2, int(3 * scale)))

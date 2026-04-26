@@ -87,7 +87,11 @@ def _ridge_oof_predict(x: np.ndarray, y: np.ndarray, fold_ids: np.ndarray, lam: 
 
 
 def compute_hybrid_demand(
-    sales: pd.DataFrame, articles: pd.DataFrame, meta: Dict[str, Dict[str, float]]
+    sales: pd.DataFrame,
+    articles: pd.DataFrame,
+    meta: Dict[str, Dict[str, float]],
+    *,
+    force_formula_only: bool = False,
 ) -> Tuple[Dict[Tuple[str, str], float], pd.DataFrame]:
     sales = sales.copy()
     articles = articles.copy()
@@ -171,37 +175,43 @@ def compute_hybrid_demand(
     df["DemandRule"] = df["DemandRuleBase"] * df["ScarcityBoost"] * df["ServiceFactor"]
     df["DemandRule"] = np.maximum(df["DemandRule"], 0.0)
 
-    # AI model: ridge regression with OOF predictions.
-    feature_cols = [
-        "SelloutUsed",
-        "StockNow",
-        "SizeDepth",
-        "ArticleMeanPeriodo",
-        "ShopMeanPeriodo",
-        "ArticleCoverageCount",
-        "ArticleSalesObs",
-        "ShopSalesObs",
-        "ShopVelocity",
-        "FasciaNum",
-        "ServiceFactor",
-        "ScarcityBoost",
-    ]
-    x = df[feature_cols].to_numpy(dtype=float)
-    y_base = np.maximum(df["Periodo_Qty"], df["Venduto_Qty"]).to_numpy(dtype=float)
-    y_base = np.nan_to_num(y_base, nan=0.0, posinf=1e6, neginf=0.0)
-    y = np.log1p(np.clip(y_base, 0.0, 1e6))
-    folds = _build_fold_ids(df, n_folds=5)
-    y_pred_log, quality_r2, model_mode = _ridge_oof_predict(x, y, folds, lam=RIDGE_LAMBDA)
-    df["DemandAI"] = np.maximum(np.expm1(y_pred_log), 0.0)
-
-    sample_factor = min(1.0, len(df) / 1200.0)
-    base_ai_weight = AI_BLEND_MAX * quality_r2 * sample_factor
-    article_obs_factor = np.minimum(1.0, np.log1p(df["ArticleSalesObs"]) / np.log(8.0))
-    shop_obs_factor = np.minimum(1.0, np.log1p(df["ShopSalesObs"]) / np.log(30.0))
-    coverage_factor = article_obs_factor * shop_obs_factor
-    df["DemandBlendWeight"] = base_ai_weight * coverage_factor
-    if model_mode == "formula_only":
+    if force_formula_only:
+        quality_r2 = 0.0
+        model_mode = "formula_only"
+        df["DemandAI"] = 0.0
         df["DemandBlendWeight"] = 0.0
+    else:
+        # AI model: ridge regression with OOF predictions.
+        feature_cols = [
+            "SelloutUsed",
+            "StockNow",
+            "SizeDepth",
+            "ArticleMeanPeriodo",
+            "ShopMeanPeriodo",
+            "ArticleCoverageCount",
+            "ArticleSalesObs",
+            "ShopSalesObs",
+            "ShopVelocity",
+            "FasciaNum",
+            "ServiceFactor",
+            "ScarcityBoost",
+        ]
+        x = df[feature_cols].to_numpy(dtype=float)
+        y_base = np.maximum(df["Periodo_Qty"], df["Venduto_Qty"]).to_numpy(dtype=float)
+        y_base = np.nan_to_num(y_base, nan=0.0, posinf=1e6, neginf=0.0)
+        y = np.log1p(np.clip(y_base, 0.0, 1e6))
+        folds = _build_fold_ids(df, n_folds=5)
+        y_pred_log, quality_r2, model_mode = _ridge_oof_predict(x, y, folds, lam=RIDGE_LAMBDA)
+        df["DemandAI"] = np.maximum(np.expm1(y_pred_log), 0.0)
+
+        sample_factor = min(1.0, len(df) / 1200.0)
+        base_ai_weight = AI_BLEND_MAX * quality_r2 * sample_factor
+        article_obs_factor = np.minimum(1.0, np.log1p(df["ArticleSalesObs"]) / np.log(8.0))
+        shop_obs_factor = np.minimum(1.0, np.log1p(df["ShopSalesObs"]) / np.log(30.0))
+        coverage_factor = article_obs_factor * shop_obs_factor
+        df["DemandBlendWeight"] = base_ai_weight * coverage_factor
+        if model_mode == "formula_only":
+            df["DemandBlendWeight"] = 0.0
 
     df["DemandHybrid"] = (1.0 - df["DemandBlendWeight"]) * df["DemandRule"] + df["DemandBlendWeight"] * df["DemandAI"]
     df["DemandHybrid"] = np.maximum(df["DemandHybrid"], 0.0)

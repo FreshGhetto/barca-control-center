@@ -27,6 +27,7 @@ class CatalogApiWorkflowTests(unittest.TestCase, TempPathMixin):
     catalog_run_id: str
     article_code: str
     season_code: str
+    supplier: str
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -96,6 +97,21 @@ class CatalogApiWorkflowTests(unittest.TestCase, TempPathMixin):
             )
             or ""
         )
+        cls.supplier = str(
+            fetch_scalar(
+                cls.db_env,
+                """
+                SELECT supplier
+                FROM fact_catalog_article_store_snapshot
+                WHERE run_id = %s::uuid
+                  AND store_code = 'XX'
+                ORDER BY supplier
+                LIMIT 1
+                """,
+                (cls.catalog_run_id,),
+            )
+            or ""
+        )
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -117,6 +133,7 @@ class CatalogApiWorkflowTests(unittest.TestCase, TempPathMixin):
         self.assertTrue(self.catalog_run_id)
         self.assertTrue(self.article_code)
         self.assertTrue(self.season_code)
+        self.assertTrue(self.supplier)
 
         with self.ui_client() as client:
             status = client.get(f"/api/catalog/status?run_id={self.catalog_run_id}")
@@ -128,6 +145,7 @@ class CatalogApiWorkflowTests(unittest.TestCase, TempPathMixin):
 
         self.assertEqual(status.status_code, 200)
         self.assertTrue(status.json()["available"])
+        self.assertIn(self.supplier, status.json()["facets"]["suppliers"])
         self.assertEqual(articles.status_code, 200)
         self.assertGreater(len(articles.json()["rows"]), 0)
         self.assertEqual(detail.status_code, 200)
@@ -146,7 +164,7 @@ class CatalogApiWorkflowTests(unittest.TestCase, TempPathMixin):
                     "allow_fallback": False,
                     "selected_seasons": [self.season_code],
                     "selected_reparti": [],
-                    "selected_suppliers": [],
+                    "selected_suppliers": [self.supplier],
                     "selected_categories": [],
                     "selected_brands": [],
                     "manual_codes_text": self.article_code,
@@ -165,6 +183,7 @@ class CatalogApiWorkflowTests(unittest.TestCase, TempPathMixin):
         self.assertEqual(download.headers.get("content-type"), "application/zip")
         self.assertEqual(html.status_code, 200)
         self.assertTrue(html.headers.get("content-type", "").startswith("text/html"))
+        self.assertEqual(body["summary"]["filters"]["selected_suppliers"], [self.supplier])
 
     def test_catalog_import_lock_rejects_parallel_jobs(self) -> None:
         with tempfile.TemporaryDirectory(prefix="barca_catalog_lock_") as tmp_dir:
@@ -216,7 +235,7 @@ class CatalogApiWorkflowTests(unittest.TestCase, TempPathMixin):
             "allow_fallback": False,
             "selected_seasons": [self.season_code],
             "selected_reparti": [],
-            "selected_suppliers": [],
+            "selected_suppliers": [self.supplier],
             "selected_categories": [],
             "selected_brands": [],
             "manual_codes_text": self.article_code,

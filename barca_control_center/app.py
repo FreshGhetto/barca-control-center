@@ -131,7 +131,14 @@ def main():
     align_report.to_csv(out / "alignment_report.csv", index=False)
 
     print("[STEP 1/3] Inputs DB armonizzati. Avvio allocazione con regole fascia/vendite...")
-    alloc_result = run_allocation_frames(sales_df, stock_df, shops_cfg, out, write_outputs=True)
+    alloc_result = run_allocation_frames(
+        sales_df,
+        stock_df,
+        shops_cfg,
+        out,
+        write_outputs=True,
+        demand_math_only=True,
+    )
 
     ord_summary = {"enabled": False, "source": "disabled"}
     orders_source_run_id = None
@@ -180,8 +187,12 @@ def main():
                 include_orders=orders_sync_enabled,
                 metadata_extra={
                     "operating_mode": "db_only",
+                    "transfer_demand_model": "formula_only",
+                    "ops_move_budget_enabled": False,
+                    "online_receiving_policy": "m4_then_lower_priority_lower_sales_duplicate_first",
                     "receiver_priority_rule": "fascia_then_local_sales_then_need",
                     "donor_priority_rule": "lower_priority_shop_then_lower_local_sales",
+                    "coverage_priority_rule": "maximize_store_presence_before_depth",
                 },
             )
             print(f"[STEP 3/3] DB sync completata. run_id={db_summary.get('run_id')}")

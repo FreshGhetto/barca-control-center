@@ -5,6 +5,8 @@ import sys
 import pandas as pd
 import numpy as np
 
+from .allocator_v1 import ENABLE_OPS_MOVE_BUDGET
+
 
 def _load_csv(path: Path):
     if not path.exists():
@@ -115,13 +117,14 @@ def main() -> int:
     over_in = int(((shop["in_used"] - shop["in_budget"]) > 1e-9).sum())
     over_out = int(((shop["out_used"] - shop["out_budget"]) > 1e-9).sum())
     report["metrics"]["shops_over_capacity"] = over_cap
+    report["metrics"]["ops_move_budget_enabled"] = bool(ENABLE_OPS_MOVE_BUDGET)
     report["metrics"]["shops_over_inbound_budget"] = over_in
     report["metrics"]["shops_over_outbound_budget"] = over_out
     if over_cap > 0:
         report["errors"].append(f"Shops over capacity target: {over_cap}")
-    if over_in > 0:
+    if ENABLE_OPS_MOVE_BUDGET and over_in > 0:
         report["errors"].append(f"Shops over inbound budget: {over_in}")
-    if over_out > 0:
+    if ENABLE_OPS_MOVE_BUDGET and over_out > 0:
         report["errors"].append(f"Shops over outbound budget: {over_out}")
 
     # 6) Shipment qty must match transfers qty.

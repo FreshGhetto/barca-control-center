@@ -58,7 +58,7 @@
             <button id="dashboardRefreshBtn" class="btn secondary" type="button">Aggiorna Dashboard</button>
           </div>
         </div>
-        <p id="dashboardSubtitle" class="muted">La dashboard carica di default l'ultima coppia di stagioni disponibile; puoi cambiare coppia o aggiornamento in alto.</p>
+        <p id="dashboardSubtitle" class="muted">La dashboard carica di default la coppia stagionale con il run DB piu informativo; puoi cambiare coppia o aggiornamento in alto.</p>
         <div id="dashboardRunContext" class="context-ribbon"></div>
         <p id="dashboardWarn" class="alert hidden">--</p>
         <div id="dashboardQuickFacts" class="quick-facts"></div>
@@ -518,7 +518,7 @@
           </div>
           <p class="muted">
             Genera cataloghi `HTML`, `JPG` o entrambi dai dati presenti nel database.
-            Se non selezioni stagioni, reparti, categorie o marchi, il sistema usa tutto il catalogo corrente.
+            Se non selezioni stagioni, reparti, fornitori, categorie o marchi, il sistema usa tutto il catalogo corrente.
           </p>
           <form id="catalogShowcaseForm" class="form-grid catalog-form">
             <label class="inline-field">Formato output
@@ -572,6 +572,20 @@
               </div>
               <input id="catalogShowcaseRepartoSearch" type="text" placeholder="Cerca reparto" />
               <div id="catalogShowcaseRepartoOptions" class="catalog-filter-options"></div>
+            </div>
+            <div class="catalog-filter-panel">
+              <div class="catalog-filter-head">
+                <div>
+                  <div class="catalog-filter-title">Filtra fornitori</div>
+                  <div id="catalogShowcaseSupplierStatus" class="catalog-filter-status">Tutti i fornitori</div>
+                </div>
+                <div class="catalog-filter-actions">
+                  <button id="catalogShowcaseSupplierAll" type="button" class="btn secondary compact">Tutti</button>
+                  <button id="catalogShowcaseSupplierClear" type="button" class="btn secondary compact">Reset</button>
+                </div>
+              </div>
+              <input id="catalogShowcaseSupplierSearch" type="text" placeholder="Cerca fornitore" />
+              <div id="catalogShowcaseSupplierOptions" class="catalog-filter-options"></div>
             </div>
             <div class="catalog-filter-panel catalog-filter-panel-wide">
               <div class="catalog-filter-head">
@@ -713,6 +727,6 @@
     </main>
   </div>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=20260424-dashboard-latest-run-force"></script>
 </body>
 </html>

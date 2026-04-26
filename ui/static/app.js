@@ -33,10 +33,12 @@ const state = {
   catalogShowcaseFilters: {
     seasons: [],
     reparti: [],
+    suppliers: [],
     categories: [],
     brands: [],
     seasonSearch: "",
     repartoSearch: "",
+    supplierSearch: "",
     categoriaSearch: "",
     brandSearch: "",
   },
@@ -204,22 +206,27 @@ const el = {
   catalogShowcaseFallback: document.getElementById("catalogShowcaseFallback"),
   catalogShowcaseSeasonStatus: document.getElementById("catalogShowcaseSeasonStatus"),
   catalogShowcaseRepartoStatus: document.getElementById("catalogShowcaseRepartoStatus"),
+  catalogShowcaseSupplierStatus: document.getElementById("catalogShowcaseSupplierStatus"),
   catalogShowcaseCategoriaStatus: document.getElementById("catalogShowcaseCategoriaStatus"),
   catalogShowcaseBrandStatus: document.getElementById("catalogShowcaseBrandStatus"),
   catalogShowcaseSeasonSearch: document.getElementById("catalogShowcaseSeasonSearch"),
   catalogShowcaseRepartoSearch: document.getElementById("catalogShowcaseRepartoSearch"),
+  catalogShowcaseSupplierSearch: document.getElementById("catalogShowcaseSupplierSearch"),
   catalogShowcaseCategoriaSearch: document.getElementById("catalogShowcaseCategoriaSearch"),
   catalogShowcaseBrandSearch: document.getElementById("catalogShowcaseBrandSearch"),
   catalogShowcaseSeasonAll: document.getElementById("catalogShowcaseSeasonAll"),
   catalogShowcaseRepartoAll: document.getElementById("catalogShowcaseRepartoAll"),
+  catalogShowcaseSupplierAll: document.getElementById("catalogShowcaseSupplierAll"),
   catalogShowcaseCategoriaAll: document.getElementById("catalogShowcaseCategoriaAll"),
   catalogShowcaseBrandAll: document.getElementById("catalogShowcaseBrandAll"),
   catalogShowcaseSeasonClear: document.getElementById("catalogShowcaseSeasonClear"),
   catalogShowcaseRepartoClear: document.getElementById("catalogShowcaseRepartoClear"),
+  catalogShowcaseSupplierClear: document.getElementById("catalogShowcaseSupplierClear"),
   catalogShowcaseCategoriaClear: document.getElementById("catalogShowcaseCategoriaClear"),
   catalogShowcaseBrandClear: document.getElementById("catalogShowcaseBrandClear"),
   catalogShowcaseSeasonOptions: document.getElementById("catalogShowcaseSeasonOptions"),
   catalogShowcaseRepartoOptions: document.getElementById("catalogShowcaseRepartoOptions"),
+  catalogShowcaseSupplierOptions: document.getElementById("catalogShowcaseSupplierOptions"),
   catalogShowcaseCategoriaOptions: document.getElementById("catalogShowcaseCategoriaOptions"),
   catalogShowcaseBrandOptions: document.getElementById("catalogShowcaseBrandOptions"),
   catalogShowcaseManualCodes: document.getElementById("catalogShowcaseManualCodes"),
@@ -1091,6 +1098,8 @@ function buildDashboardSeasonPairGroups(runs) {
         family: pair?.family || "",
         yearNum: pair?.yearNum || 0,
         latestStartedAt: 0,
+        selectionScore: 0,
+        bestRunStartedAt: 0,
         runs: [],
       };
       byKey.set(key, group);
@@ -1102,15 +1111,17 @@ function buildDashboardSeasonPairGroups(runs) {
   });
   groups.forEach((group) => {
     group.runs.sort(compareDashboardRunsForSelection);
+    const bestRun = Array.isArray(group.runs) && group.runs.length > 0 ? group.runs[0] : null;
+    group.selectionScore = dashboardRunSelectionScore(bestRun);
+    group.bestRunStartedAt = dashboardRunTimestamp(bestRun);
   });
   return groups.sort((a, b) => {
     if (a.hasPair !== b.hasPair) return a.hasPair ? -1 : 1;
-    if (a.hasPair && b.hasPair) {
-      if ((b.yearNum || 0) !== (a.yearNum || 0)) return (b.yearNum || 0) - (a.yearNum || 0);
-      if ((b.latestStartedAt || 0) !== (a.latestStartedAt || 0)) return (b.latestStartedAt || 0) - (a.latestStartedAt || 0);
-      return String(a.label || "").localeCompare(String(b.label || ""), "it", { sensitivity: "base" });
-    }
-    return (b.latestStartedAt || 0) - (a.latestStartedAt || 0);
+    if ((b.selectionScore || 0) !== (a.selectionScore || 0)) return (b.selectionScore || 0) - (a.selectionScore || 0);
+    if ((b.bestRunStartedAt || 0) !== (a.bestRunStartedAt || 0)) return (b.bestRunStartedAt || 0) - (a.bestRunStartedAt || 0);
+    if (a.hasPair && b.hasPair && (b.yearNum || 0) !== (a.yearNum || 0)) return (b.yearNum || 0) - (a.yearNum || 0);
+    if ((b.latestStartedAt || 0) !== (a.latestStartedAt || 0)) return (b.latestStartedAt || 0) - (a.latestStartedAt || 0);
+    return String(a.label || "").localeCompare(String(b.label || ""), "it", { sensitivity: "base" });
   });
 }
 
@@ -2670,6 +2681,13 @@ function catalogShowcaseFilterMeta(group) {
         allLabel: "Tutti i reparti inclusi",
         emptySearchLabel: "Nessun reparto trovato con questo filtro.",
       },
+      suppliers: {
+        searchKey: "supplierSearch",
+        optionsEl: el.catalogShowcaseSupplierOptions,
+        statusEl: el.catalogShowcaseSupplierStatus,
+        allLabel: "Tutti i fornitori inclusi",
+        emptySearchLabel: "Nessun fornitore trovato con questo filtro.",
+      },
       categories: {
         searchKey: "categoriaSearch",
         optionsEl: el.catalogShowcaseCategoriaOptions,
@@ -2697,13 +2715,14 @@ function normalizeCatalogShowcaseItems(items) {
 function getCatalogShowcaseAvailableItems(group, facets = state.catalogStatus?.facets || {}) {
   if (group === "seasons") return normalizeCatalogShowcaseItems(facets?.seasons);
   if (group === "reparti") return normalizeCatalogShowcaseItems(facets?.reparti);
+  if (group === "suppliers") return normalizeCatalogShowcaseItems(facets?.suppliers);
   if (group === "categories") return normalizeCatalogShowcaseItems(facets?.categorie);
   if (group === "brands") return normalizeCatalogShowcaseItems(facets?.marchi);
   return [];
 }
 
 function pruneCatalogShowcaseSelections(facets) {
-  ["seasons", "reparti", "categories", "brands"].forEach((group) => {
+  ["seasons", "reparti", "suppliers", "categories", "brands"].forEach((group) => {
     const available = new Set(getCatalogShowcaseAvailableItems(group, facets));
     state.catalogShowcaseFilters[group] = (state.catalogShowcaseFilters[group] || []).filter((item) => available.has(item));
   });
@@ -2770,6 +2789,7 @@ function renderCatalogShowcaseFilters(facets) {
   pruneCatalogShowcaseSelections(facets);
   renderCatalogShowcaseFilterGroup("seasons", getCatalogShowcaseAvailableItems("seasons", facets));
   renderCatalogShowcaseFilterGroup("reparti", getCatalogShowcaseAvailableItems("reparti", facets));
+  renderCatalogShowcaseFilterGroup("suppliers", getCatalogShowcaseAvailableItems("suppliers", facets));
   renderCatalogShowcaseFilterGroup("categories", getCatalogShowcaseAvailableItems("categories", facets));
   renderCatalogShowcaseFilterGroup("brands", getCatalogShowcaseAvailableItems("brands", facets));
 }
@@ -2803,6 +2823,7 @@ function resetCatalogShowcaseFilter(group) {
   state.catalogShowcaseFilters[meta.searchKey] = "";
   if (group === "seasons" && el.catalogShowcaseSeasonSearch) el.catalogShowcaseSeasonSearch.value = "";
   if (group === "reparti" && el.catalogShowcaseRepartoSearch) el.catalogShowcaseRepartoSearch.value = "";
+  if (group === "suppliers" && el.catalogShowcaseSupplierSearch) el.catalogShowcaseSupplierSearch.value = "";
   if (group === "categories" && el.catalogShowcaseCategoriaSearch) el.catalogShowcaseCategoriaSearch.value = "";
   if (group === "brands" && el.catalogShowcaseBrandSearch) el.catalogShowcaseBrandSearch.value = "";
   renderCatalogShowcaseFilters(state.catalogStatus?.facets || {});
@@ -3007,13 +3028,20 @@ function renderCatalogDetail(detail) {
   }
   const summary = detail.summary || {};
   const stores = Array.isArray(detail.stores) ? detail.stores : [];
-  const sizeKeys = [];
-  stores.forEach((store) => {
-    Object.keys(store.sizes || {}).forEach((size) => {
-      if (!sizeKeys.includes(size)) sizeKeys.push(size);
+  const sizeKeys = Array.isArray(detail.sizes) ? detail.sizes.map((size) => String(size || "")).filter(Boolean) : [];
+  if (sizeKeys.length === 0) {
+    stores.forEach((store) => {
+      Object.keys(store.sizes || {}).forEach((size) => {
+        if (!sizeKeys.includes(size)) sizeKeys.push(size);
+      });
     });
-  });
+  }
   sizeKeys.sort((a, b) => Number(a) - Number(b));
+  const catalogSizeCell = (value) => {
+    const n = Number(value || 0);
+    if (!Number.isFinite(n) || Math.abs(n) < 1e-9) return "";
+    return fmtNum(n, 0);
+  };
 
   const metaHtml = `
     <div class="catalog-detail-head">
@@ -3049,7 +3077,7 @@ function renderCatalogDetail(detail) {
     const rowsHtml = stores
       .map((store) => {
         const sizeCells = sizeKeys
-          .map((size) => `<td>${escHtml(fmtNum((store.sizes || {})[size] || 0, 0))}</td>`)
+          .map((size) => `<td>${escHtml(catalogSizeCell((store.sizes || {})[size]))}</td>`)
           .join("");
         return `
           <tr>
@@ -3325,6 +3353,7 @@ async function startCatalogShowcaseExport(evt) {
     allow_fallback: !!el.catalogShowcaseFallback?.checked,
     selected_seasons: state.catalogShowcaseFilters.seasons || [],
     selected_reparti: state.catalogShowcaseFilters.reparti || [],
+    selected_suppliers: state.catalogShowcaseFilters.suppliers || [],
     selected_categories: state.catalogShowcaseFilters.categories || [],
     selected_brands: state.catalogShowcaseFilters.brands || [],
     manual_codes_text: el.catalogShowcaseManualCodes?.value || "",
@@ -3336,6 +3365,7 @@ async function startCatalogShowcaseExport(evt) {
   const filtersSummary = [
     payload.selected_seasons.length ? `${payload.selected_seasons.length} stagioni` : "tutte le stagioni",
     payload.selected_reparti.length ? `${payload.selected_reparti.length} reparti` : "tutti i reparti",
+    payload.selected_suppliers.length ? `${payload.selected_suppliers.length} fornitori` : "tutti i fornitori",
     payload.selected_categories.length ? `${payload.selected_categories.length} categorie` : "tutte le categorie",
     payload.selected_brands.length ? `${payload.selected_brands.length} marchi` : "tutti i marchi",
   ].join(" • ");
@@ -3379,7 +3409,8 @@ async function startCatalogShowcaseExport(evt) {
   }
 }
 
-async function loadDashboardRuns() {
+async function loadDashboardRuns(options = {}) {
+  const { forceLatestRun = false } = options;
   try {
     const out = await api("/api/dashboard/runs?limit=200");
     state.dashboardRuns = out.runs || [];
@@ -3397,7 +3428,7 @@ async function loadDashboardRuns() {
       state.dashboardRunId = null;
       return;
     }
-    syncDashboardPairAndRunSelection();
+    syncDashboardPairAndRunSelection({ forceLatestRun });
     renderActiveRunText();
   } catch (err) {
     state.dashboardRuns = [];
@@ -3640,10 +3671,10 @@ async function refreshSelectedRunDetails() {
 }
 
 async function refreshAll(includeDashboard = false) {
-  await Promise.all([
-    refreshHealth(),
-    refreshDb(),
-    refreshOutputs(),
+    await Promise.all([
+      refreshHealth(),
+      refreshDb(),
+      refreshOutputs(),
     refreshRuns(),
     refreshCatalog(),
     refreshActiveCatalogImportJob(),
@@ -3651,7 +3682,7 @@ async function refreshAll(includeDashboard = false) {
   ]);
   await refreshSelectedRunDetails();
   if (includeDashboard) {
-    await loadDashboardRuns();
+    await loadDashboardRuns({ forceLatestRun: true });
     refreshDashboard();
   }
 }
@@ -3737,6 +3768,9 @@ function initEvents() {
   el.catalogShowcaseRepartoSearch?.addEventListener("input", () =>
     setCatalogShowcaseFilterSearch("reparti", el.catalogShowcaseRepartoSearch.value || ""),
   );
+  el.catalogShowcaseSupplierSearch?.addEventListener("input", () =>
+    setCatalogShowcaseFilterSearch("suppliers", el.catalogShowcaseSupplierSearch.value || ""),
+  );
   el.catalogShowcaseCategoriaSearch?.addEventListener("input", () =>
     setCatalogShowcaseFilterSearch("categories", el.catalogShowcaseCategoriaSearch.value || ""),
   );
@@ -3749,6 +3783,9 @@ function initEvents() {
   el.catalogShowcaseRepartoAll?.addEventListener("click", () =>
     setCatalogShowcaseFilterSelection("reparti", getCatalogShowcaseAvailableItems("reparti")),
   );
+  el.catalogShowcaseSupplierAll?.addEventListener("click", () =>
+    setCatalogShowcaseFilterSelection("suppliers", getCatalogShowcaseAvailableItems("suppliers")),
+  );
   el.catalogShowcaseCategoriaAll?.addEventListener("click", () =>
     setCatalogShowcaseFilterSelection("categories", getCatalogShowcaseAvailableItems("categories")),
   );
@@ -3757,11 +3794,13 @@ function initEvents() {
   );
   el.catalogShowcaseSeasonClear?.addEventListener("click", () => resetCatalogShowcaseFilter("seasons"));
   el.catalogShowcaseRepartoClear?.addEventListener("click", () => resetCatalogShowcaseFilter("reparti"));
+  el.catalogShowcaseSupplierClear?.addEventListener("click", () => resetCatalogShowcaseFilter("suppliers"));
   el.catalogShowcaseCategoriaClear?.addEventListener("click", () => resetCatalogShowcaseFilter("categories"));
   el.catalogShowcaseBrandClear?.addEventListener("click", () => resetCatalogShowcaseFilter("brands"));
   [
     el.catalogShowcaseSeasonOptions,
     el.catalogShowcaseRepartoOptions,
+    el.catalogShowcaseSupplierOptions,
     el.catalogShowcaseCategoriaOptions,
     el.catalogShowcaseBrandOptions,
   ].forEach(
@@ -3845,7 +3884,7 @@ function initEvents() {
     }
   });
   el.dashboardRefreshBtn?.addEventListener("click", async () => {
-    await loadDashboardRuns();
+    await loadDashboardRuns({ forceLatestRun: true });
     await refreshDashboard();
   });
   el.catalogRefreshBtn?.addEventListener("click", refreshCatalog);

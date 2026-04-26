@@ -1327,8 +1327,19 @@ catalog_import_manager = CatalogImportManager()
 catalog_showcase_manager = CatalogShowcaseManager()
 
 app = FastAPI(title="BARCA Control Center", version="1.0.0")
+
+
+class NoCacheStaticFiles(StaticFiles):
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
+
+
 if STATIC_DIR.exists():
-    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    app.mount("/static", NoCacheStaticFiles(directory=STATIC_DIR), name="static")
 
 
 def _developer_mode() -> bool:
@@ -1587,7 +1598,7 @@ def _db_recent_dashboard_runs(limit: int = 50) -> List[Dict[str, Any]]:
                     SELECT r.run_id, r.run_type, r.status, r.started_at, r.finished_at, r.metadata
                     FROM public.etl_run r
                     WHERE {_dashboard_run_where_sql('r')}
-                    ORDER BY COALESCE(r.finished_at, r.started_at) DESC
+                    ORDER BY {_dashboard_run_order_sql('r')}
                     LIMIT %s
                     """,
                     (limit,),
@@ -2294,6 +2305,28 @@ def _dashboard_run_where_sql(alias: str = "etl_run") -> str:
     """
 
 
+def _dashboard_run_order_sql(alias: str = "etl_run") -> str:
+    return f"""
+        CASE
+          WHEN EXISTS (SELECT 1 FROM public.fact_transfer_suggestion t WHERE t.run_id = {alias}.run_id LIMIT 1) THEN 0
+          WHEN EXISTS (SELECT 1 FROM public.fact_feature_state f WHERE f.run_id = {alias}.run_id LIMIT 1) THEN 1
+          WHEN EXISTS (SELECT 1 FROM public.fact_order_forecast o WHERE o.run_id = {alias}.run_id LIMIT 1) THEN 2
+          WHEN EXISTS (SELECT 1 FROM public.fact_order_source os WHERE os.run_id = {alias}.run_id LIMIT 1) THEN 3
+          WHEN EXISTS (SELECT 1 FROM public.fact_sales_snapshot s WHERE s.run_id = {alias}.run_id LIMIT 1)
+            OR EXISTS (SELECT 1 FROM public.fact_stock_snapshot st WHERE st.run_id = {alias}.run_id LIMIT 1) THEN 4
+          ELSE 9
+        END,
+        CASE lower(COALESCE({alias}.run_type, ''))
+          WHEN 'app_pipeline' THEN 0
+          WHEN 'app_pipeline_ui' THEN 1
+          WHEN 'manual_sync' THEN 2
+          WHEN 'raw_input_sync' THEN 3
+          ELSE 9
+        END,
+        COALESCE({alias}.finished_at, {alias}.started_at) DESC
+    """
+
+
 def _dashboard_export_rows(payload: Dict[str, Any], table_key: str) -> List[Dict[str, Any]]:
     rows = payload.get("tables", {}).get(table_key)
     if not isinstance(rows, list):
@@ -2332,7 +2365,7 @@ def _resolve_dashboard_run(cur, run_id: Optional[str]) -> Optional[Dict[str, Any
             SELECT run_id, run_type, status, started_at, finished_at, metadata
             FROM public.etl_run
             WHERE {_dashboard_run_where_sql('etl_run')}
-            ORDER BY COALESCE(finished_at, started_at) DESC
+            ORDER BY {_dashboard_run_order_sql('etl_run')}
             LIMIT 1
             """
         )
@@ -3100,7 +3133,14 @@ def index():
     page = STATIC_DIR / "index.html"
     if not page.exists():
         raise HTTPException(status_code=404, detail="UI non trovata")
-    return FileResponse(page)
+    return FileResponse(
+        page,
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 
 @app.get("/api/health")
@@ -3500,6 +3540,7 @@ def api_dashboard_runs(limit: int = Query(default=100, ge=1, le=500)):
                 "status_label": row.get("status_label"),
                 "started_at": row.get("started_at"),
                 "ended_at": row.get("ended_at"),
+                "metadata": row.get("metadata"),
                 "business_context": row.get("business_context"),
             }
         )
