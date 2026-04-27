@@ -921,20 +921,22 @@ def run_allocation_frames(
         # Nessun limite sul numero di taglie mancanti (copertura massima).
         receivers = []
         for s in shops_for_article:
-            if s in EXCLUDE_SHOPS or s == WAREHOUSE:
+            # WEB (canale online) escluso dalla logica di spostamento:
+            # non riceve né cede merce fisica. Rimane visibile nel report.
+            if s in EXCLUDE_SHOPS or s == WAREHOUSE or s == ONLINE:
                 continue
             fascia = meta.get(s, {}).get("Fascia", np.nan)
             if is_outlet(fascia):
                 continue
             role = role_for_shop(s)
-            if role not in ("ONLINE", "STORE"):
+            if role != "STORE":
                 continue
             sig = signal_lookup.get((article, s), {})
             local_sales_signal = local_sales_signal_for_shop(sales_signal, signal_lookup, article, s)
             receiver_candidate = bool(
                 sig.get("NotebookDestinationCandidate", sig.get("ReceiverEligibleBySales", local_sales_signal > 0.0))
             )
-            if role != "ONLINE" and not receiver_candidate:
+            if not receiver_candidate:
                 continue  # nessun segnale vendite → salta
             missing_core_sizes = int(sig.get("MissingCoreSizes", 0) or 0)
             current_total = float(total.get((article, s), 0.0) or 0.0)
