@@ -13,6 +13,7 @@ const state = {
   dashboardSeasonPairs: [],
   dashboardSeasonPairKey: null,
   dashboardRunId: null,
+  dashboardSeasonFilterActive: false,
   dashboardData: null,
   dashboardRefreshing: false,
   dashboardSectionUserSelected: false,
@@ -95,6 +96,7 @@ const el = {
   viewTabs: Array.from(document.querySelectorAll(".view-tab[data-view-target]")),
   dashboardSeasonPairSelect: document.getElementById("dashboardSeasonPairSelect"),
   dashboardRunSelect: document.getElementById("dashboardRunSelect"),
+  dashboardSeasonFilterBtn: document.getElementById("dashboardSeasonFilterBtn"),
   dashboardRefreshBtn: document.getElementById("dashboardRefreshBtn"),
   dashboardSubtitle: document.getElementById("dashboardSubtitle"),
   dashboardRunContext: document.getElementById("dashboardRunContext"),
@@ -1100,10 +1102,12 @@ function buildDashboardSeasonPairGroups(runs) {
         label: pair?.label || "Altri aggiornamenti senza coppia stagioni",
         family: pair?.family || "",
         yearNum: pair?.yearNum || 0,
+        filterCodes: pair ? pair.codes.slice() : [],
         latestStartedAt: 0,
         selectionScore: 0,
         bestRunStartedAt: 0,
         runs: [],
+        virtual: false,
       };
       byKey.set(key, group);
       groups.push(group);
@@ -1118,6 +1122,54 @@ function buildDashboardSeasonPairGroups(runs) {
     group.selectionScore = dashboardRunSelectionScore(bestRun);
     group.bestRunStartedAt = dashboardRunTimestamp(bestRun);
   });
+
+  // Aggiungi coppie storiche virtuali da available_current_seasons / available_continuativa_seasons
+  const allRunsSorted = [...orderedRuns].sort(compareDashboardRunsForSelection);
+  const bestRun = allRunsSorted[0] || null;
+  if (bestRun) {
+    const ctx = bestRun?.business_context || {};
+    const availCurrent = Array.isArray(ctx.available_current_seasons) ? ctx.available_current_seasons : [];
+    const availCont = Array.isArray(ctx.available_continuativa_seasons) ? ctx.available_continuativa_seasons : [];
+    const allAvail = [...availCurrent, ...availCont];
+    const availBuckets = new Map();
+    allAvail.forEach((code) => {
+      const rawCode = String(code || "").trim().toUpperCase();
+      const family = seasonPairFamilyKey(rawCode);
+      const yearNum = seasonYearNumber(rawCode);
+      if (!rawCode || !family || !yearNum) return;
+      const key = `${family}:${yearNum}`;
+      if (!availBuckets.has(key)) availBuckets.set(key, { family, yearNum, codes: [] });
+      const bucket = availBuckets.get(key);
+      if (!bucket.codes.includes(rawCode)) bucket.codes.push(rawCode);
+    });
+    availBuckets.forEach((bucket, key) => {
+      if (bucket.codes.length < 2) return;
+      bucket.codes.sort(compareSeasonPairCodes);
+      if (byKey.has(key)) {
+        // Aggiorna filterCodes per il gruppo esistente (sovrascrive con codici completi disponibili)
+        byKey.get(key).filterCodes = bucket.codes.slice();
+      } else {
+        // Crea gruppo virtuale (coppia storica senza run dedicato)
+        const label = seasonPairDisplayLabel(bucket.family, bucket.yearNum, bucket.codes);
+        const group = {
+          key,
+          hasPair: true,
+          label,
+          family: bucket.family,
+          yearNum: bucket.yearNum,
+          filterCodes: bucket.codes.slice(),
+          latestStartedAt: dashboardRunTimestamp(bestRun),
+          selectionScore: 0,
+          bestRunStartedAt: dashboardRunTimestamp(bestRun),
+          runs: [bestRun],
+          virtual: true,
+        };
+        byKey.set(key, group);
+        groups.push(group);
+      }
+    });
+  }
+
   return groups.sort((a, b) => {
     if (a.hasPair !== b.hasPair) return a.hasPair ? -1 : 1;
     if ((b.selectionScore || 0) !== (a.selectionScore || 0)) return (b.selectionScore || 0) - (a.selectionScore || 0);
@@ -1195,8 +1247,39 @@ function syncDashboardPairAndRunSelection(options = {}) {
     state.dashboardSectionUserSelected = false;
   }
 
+  // Se la coppia è virtuale (storica), abilita il filtro automaticamente
+  const selectedGroup = selectedDashboardSeasonPairGroup();
+  if (selectedGroup?.virtual) {
+    state.dashboardSeasonFilterActive = true;
+  }
+
   renderDashboardSeasonPairSelect();
   renderDashboardRunSelectForPair(visibleRuns);
+  renderDashboardSeasonFilterBtn();
+}
+
+function renderDashboardSeasonFilterBtn() {
+  if (!el.dashboardSeasonFilterBtn) return;
+  const group = selectedDashboardSeasonPairGroup();
+  const hasFilterCodes = Array.isArray(group?.filterCodes) && group.filterCodes.length > 0;
+  if (!hasFilterCodes) {
+    el.dashboardSeasonFilterBtn.disabled = true;
+    el.dashboardSeasonFilterBtn.classList.remove("active");
+    el.dashboardSeasonFilterBtn.title = "Nessuna coppia stagionale disponibile per filtrare";
+    el.dashboardSeasonFilterBtn.textContent = "📊 Tutte le stagioni";
+    return;
+  }
+  el.dashboardSeasonFilterBtn.disabled = false;
+  if (state.dashboardSeasonFilterActive) {
+    const codes = group.filterCodes.join("+");
+    el.dashboardSeasonFilterBtn.textContent = `🎯 Solo ${codes}`;
+    el.dashboardSeasonFilterBtn.classList.add("active");
+    el.dashboardSeasonFilterBtn.title = `Filtro attivo: mostra solo dati per ${codes}`;
+  } else {
+    el.dashboardSeasonFilterBtn.textContent = "📊 Tutte le stagioni";
+    el.dashboardSeasonFilterBtn.classList.remove("active");
+    el.dashboardSeasonFilterBtn.title = "Clicca per filtrare i dati alla coppia stagionale selezionata";
+  }
 }
 
 function seasonLabelsForRun(ctx, moduleKey, fallbackCodesKey) {
@@ -3460,7 +3543,15 @@ async function refreshDashboard() {
       await loadDashboardRuns();
     }
     const runId = state.dashboardRunId || "";
-    const qs = runId ? `?run_id=${encodeURIComponent(runId)}&table_limit=200` : "?table_limit=200";
+    const selectedGroup = selectedDashboardSeasonPairGroup();
+    const filterCodes =
+      state.dashboardSeasonFilterActive && Array.isArray(selectedGroup?.filterCodes) && selectedGroup.filterCodes.length > 0
+        ? selectedGroup.filterCodes
+        : null;
+    const qs =
+      (runId ? `?run_id=${encodeURIComponent(runId)}` : "?") +
+      `${runId ? "&" : ""}table_limit=200` +
+      (filterCodes ? `&season_codes=${encodeURIComponent(filterCodes.join(","))}` : "");
     if (!state.dashboardData) {
       setDashboardWarn("Caricamento dashboard in corso...");
     }
@@ -3866,6 +3957,11 @@ function initEvents() {
     state.dashboardSeasonPairKey = el.dashboardSeasonPairSelect?.value || null;
     state.dashboardSectionUserSelected = false;
     syncDashboardPairAndRunSelection({ forceLatestRun: true });
+    refreshDashboard();
+  });
+  el.dashboardSeasonFilterBtn?.addEventListener("click", () => {
+    state.dashboardSeasonFilterActive = !state.dashboardSeasonFilterActive;
+    renderDashboardSeasonFilterBtn();
     refreshDashboard();
   });
   el.dashboardRunSelect?.addEventListener("change", () => {
