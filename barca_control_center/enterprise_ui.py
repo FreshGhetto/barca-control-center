@@ -2175,8 +2175,9 @@ def _to_float(value: Any) -> float:
 
 
 def _fetch_kpi_core(cur, run_id: str, season_codes: Optional[List[str]] = None) -> Dict[str, Any]:
-    sc_filter = "AND season_code = ANY(%s::text[])" if season_codes else ""
-    sc_param = (season_codes,) if season_codes else ()
+    # Usa LOWER per confronto case-insensitive (i season_code nel DB possono essere misti)
+    sc_filter = "AND LOWER(season_code) = ANY(%s::text[])" if season_codes else ""
+    sc_param = ([c.lower() for c in season_codes],) if season_codes else ()
     cur.execute(
         f"""
         SELECT
@@ -2687,8 +2688,9 @@ def _dashboard_summary_payload(dsn: str, run_id: Optional[str], table_limit: int
                     }
 
                 rid = run["run_id"]
-                sc_filter = "AND season_code = ANY(%s::text[])" if season_codes else ""
-                sc_param: tuple = (season_codes,) if season_codes else ()
+                # Usa LOWER per confronto case-insensitive (i season_code nel DB possono essere misti)
+                sc_filter = "AND LOWER(season_code) = ANY(%s::text[])" if season_codes else ""
+                sc_param: tuple = ([c.lower() for c in season_codes],) if season_codes else ()
                 kpis = _fetch_kpi_core(cur, rid, season_codes=season_codes)
 
                 baseline_run = None
@@ -3562,7 +3564,8 @@ def api_dashboard(
 ):
     sc_list: Optional[List[str]] = None
     if season_codes:
-        sc_list = [c.strip().upper() for c in season_codes.split(",") if c.strip()]
+        # Normalizza in minuscolo: i season_code nel DB sono lowercase (es. '25i', '25y')
+        sc_list = [c.strip().lower() for c in season_codes.split(",") if c.strip()]
         if not sc_list:
             sc_list = None
     return _dashboard_payload(run_id=run_id, table_limit=table_limit, season_codes=sc_list)
