@@ -28,7 +28,11 @@ OPS_MOVE_MIN = 40.0
 OPS_MOVE_MAX = 700.0
 ENABLE_OPS_MOVE_BUDGET = False
 ENABLE_TOP_UP_TO_TARGET = False
-MAX_REQUIRED_REPAIR_GAPS = 2
+
+# Coverage-first mode: distribute to as many shops as possible (fascia-priority).
+# When True the main loop iterates SIZE first then RECEIVERS (fascia order),
+# maximising the number of shops covered before concentrating in one.
+COVERAGE_FIRST_MODE = True
 
 # Logistics schedule (current organization).
 ROUTE_WEEKDAY_BY_SHOP = {
@@ -601,8 +605,6 @@ def prioritized_receivers_for_broken_line(
         ]
         if not missing_sizes:
             continue
-        if len(missing_sizes) > MAX_REQUIRED_REPAIR_GAPS:
-            continue
         if shop_total_stock is not None and shop_capacity_target is not None:
             free = free_capacity(recv, shop_total_stock, shop_capacity_target)
             if not np.isinf(free) and free < 1.0:
@@ -914,7 +916,9 @@ def run_allocation_frames(
         article_shops = [(article, s) for s in shops_for_article]
         targets, _presence = compute_targets(meta, demand, article_shops)
 
-        # receivers: notebook logic + business priority by fascia and local sales.
+        # ── COVERAGE-FIRST RECEIVER BUILD ──────────────────────────────────────
+        # Tutti i negozi con segnale vendite sono candidati ricevitori.
+        # Nessun limite sul numero di taglie mancanti (copertura massima).
         receivers = []
         for s in shops_for_article:
             if s in EXCLUDE_SHOPS or s == WAREHOUSE:
@@ -923,159 +927,171 @@ def run_allocation_frames(
             if is_outlet(fascia):
                 continue
             role = role_for_shop(s)
-            if role in ("ONLINE", "STORE"):
-                sig = signal_lookup.get((article, s), {})
-                local_sales_signal = local_sales_signal_for_shop(sales_signal, signal_lookup, article, s)
-                receiver_candidate = bool(sig.get("NotebookDestinationCandidate", sig.get("ReceiverEligibleBySales", local_sales_signal > 0.0)))
-                if role != "ONLINE" and not receiver_candidate:
-                    continue
-                missing_core_sizes = int(sig.get("MissingCoreSizes", 0) or 0)
-                current_total = float(total.get((article, s), 0.0) or 0.0)
-                if role == "STORE" and missing_core_sizes > MAX_REQUIRED_REPAIR_GAPS:
-                    continue
-                if not ENABLE_TOP_UP_TO_TARGET and role in ("STORE", "ONLINE") and missing_core_sizes <= 0:
-                    continue
-                need = max(0.0, targets[(article, s)] - total.get((article, s), 0.0))
-                if need <= 0:
-                    continue
-                free = free_capacity(s, shop_total_stock, shop_capacity_target)
-                if not np.isinf(free):
-                    need = min(need, float(max(0, int(np.floor(free)))))
-                if need <= 0:
-                    capacity_blocks += 1
-                    continue
-                receivers.append(
-                    {
-                        "shop": s,
-                        "fascia_rank": int(float(fascia)) if not pd.isna(fascia) else 99,
-                        "sales_signal": local_sales_signal,
-                        "need": need,
-                        "has_presence": current_total > 0.0,
-                        "current_total": current_total,
-                        "low_stock_active": bool(sig.get("LowStockActiveCandidate", False)),
-                        "notebook_destination": receiver_candidate,
-                        "missing_core_sizes": missing_core_sizes,
-                        "destination_priority_score": float(sig.get("DestinationPriorityScore", local_sales_signal)),
-                    }
-                )
+            if role not in ("ONLINE", "STORE"):
+                continue
+            sig = signal_lookup.get((article, s), {})
+            local_sales_signal = local_sales_signal_for_shop(sales_signal, signal_lookup, article, s)
+            receiver_candidate = bool(
+                sig.get("NotebookDestinationCandidate", sig.get("ReceiverEligibleBySales", local_sales_signal > 0.0))
+            )
+            if role != "ONLINE" and not receiver_candidate:
+                continue  # nessun segnale vendite → salta
+            missing_core_sizes = int(sig.get("MissingCoreSizes", 0) or 0)
+            current_total = float(total.get((article, s), 0.0) or 0.0)
+            fascia_rank_s = int(float(fascia)) if not pd.isna(fascia) else 99
+            receivers.append(
+                {
+                    "shop": s,
+                    "fascia_rank": fascia_rank_s,
+                    "sales_signal": local_sales_signal,
+                    "has_presence": current_total > 0.0,
+                    "current_total": current_total,
+                    "low_stock_active": bool(sig.get("LowStockActiveCandidate", False)),
+                    "notebook_destination": receiver_candidate,
+                    "missing_core_sizes": missing_core_sizes,
+                    "destination_priority_score": float(sig.get("DestinationPriorityScore", local_sales_signal)),
+                }
+            )
+
+        # Ordina per fascia crescente (1 = più importante) poi per venduto decrescente.
+        # I negozi più importanti ricevono per primi, poi si scende di fascia.
         receivers.sort(
             key=lambda item: (
-                0 if item["has_presence"] else 1,
-                item["missing_core_sizes"],
-                item["fascia_rank"],
-                0 if item["notebook_destination"] else 1,
-                0 if item["low_stock_active"] else 1,
+                item["fascia_rank"],               # fascia 1 prima
+                -item["sales_signal"],             # a parità di fascia: chi vende di più
                 -item["destination_priority_score"],
-                -item["sales_signal"],
-                -item["current_total"],
-                -item["need"],
+                -item["missing_core_sizes"],       # più taglie mancanti = più bisogno
                 item["shop"],
             )
         )
 
         outlet = pick_outlet(meta, shops_for_article, demand, sales_signal, article)
 
-        for recv_meta in receivers:
-            recv = recv_meta["shop"]
-            if free_capacity(recv, shop_total_stock, shop_capacity_target) < 1.0:
-                capacity_blocks += 1
-                continue
+        if COVERAGE_FIRST_MODE:
+            # ── LOGICA COVERAGE-FIRST ──────────────────────────────────────────
+            # Itera PRIMA per taglia, POI per negozio in ordine di fascia.
+            # Ogni taglia viene distribuita a TUTTI i negozi (in fascia order)
+            # prima di passare alla taglia successiva.
+            # Questo massimizza il numero di negozi coperti.
 
-            fascia_recv = meta.get(recv, {}).get("Fascia", np.nan)
-            req_sizes = required_run_sizes(
-                fascia_recv,
-                reparto=article_reparto_value,
-                available_sizes=article_sizes,
-            )
-
-            # fill required sizes first if missing
-            for sz in req_sizes:
-                if free_capacity(recv, shop_total_stock, shop_capacity_target) < 1.0:
-                    capacity_blocks += 1
-                    break
-                if stock[(article, recv)].get(sz, 0.0) >= 1.0:
-                    continue
-
-                moved = False
-                donors_for_recv = prioritized_donors_for_size(
-                    meta,
-                    stock,
-                    total,
-                    demand,
-                    sales_signal,
-                    signal_lookup,
-                    article,
-                    recv,
-                    sz,
-                    shops_for_article,
+            # Precalcola le core sizes per ogni ricevitore
+            req_sizes_by_recv: Dict[str, List[int]] = {}
+            for rm in receivers:
+                req_sizes_by_recv[rm["shop"]] = required_run_sizes(
+                    meta.get(rm["shop"], {}).get("Fascia", np.nan),
                     reparto=article_reparto_value,
                     available_sizes=article_sizes,
                 )
-                for donor_meta in donors_for_recv:
-                    donor = donor_meta["shop"]
-                    if donor == recv:
+
+            # Priorità taglie: core sizes prima (unione di tutti i negozi), poi le altre
+            all_core_sizes: set = set()
+            for sl in req_sizes_by_recv.values():
+                all_core_sizes.update(sl)
+            size_priority = sorted(all_core_sizes) + [sz for sz in article_sizes if sz not in all_core_sizes]
+
+            # Pass 1 – distribuisci 1 pezzo per taglia per negozio in ordine fascia
+            for sz in size_priority:
+                for recv_meta in receivers:
+                    recv = recv_meta["shop"]
+                    if stock[(article, recv)].get(sz, 0.0) >= 1.0:
+                        continue  # già coperta
+                    if free_capacity(recv, shop_total_stock, shop_capacity_target) < 1.0:
+                        capacity_blocks += 1
                         continue
                     if not ops_budget_allows_move(recv, ops_in_used, ops_in_budget):
                         ops_blocks += 1
-                        break
-                    if not ops_budget_allows_move(donor, ops_out_used, ops_out_budget):
                         continue
-                    reason = {
-                        "warehouse": "Fill required run from M4",
-                        "duplicate": "Fill required run from duplicate stock",
-                        "single": "Fill required run from low-fascia single",
-                    }.get(donor_meta.get("stage"), "Fill required run")
-                    if stock[(article, donor)].get(sz, 0.0) >= 1.0:
-                        apply_transfer_move(
-                            stock,
-                            total,
-                            shop_total_stock,
-                            ops_out_used,
-                            ops_in_used,
-                            transfers,
-                            article,
-                            sz,
-                            donor,
-                            recv,
-                            reason,
-                        )
-                        moved = True
-                        break
-                if not moved:
-                    # cannot fill this size for this receiver -> stop filling run on this receiver
-                    break
+                    donors_for_recv = prioritized_donors_for_size(
+                        meta, stock, total, demand, sales_signal, signal_lookup,
+                        article, recv, sz, shops_for_article,
+                        reparto=article_reparto_value, available_sizes=article_sizes,
+                    )
+                    for donor_meta in donors_for_recv:
+                        donor = donor_meta["shop"]
+                        if donor == recv:
+                            continue
+                        if not ops_budget_allows_move(donor, ops_out_used, ops_out_budget):
+                            continue
+                        if stock[(article, donor)].get(sz, 0.0) >= 1.0:
+                            reason = {
+                                "warehouse": "Coverage-first: taglia da M4",
+                                "duplicate": "Coverage-first: taglia da stock doppio",
+                                "single": "Coverage-first: taglia da negozio bassa fascia",
+                            }.get(donor_meta.get("stage"), "Coverage-first: fill taglia")
+                            apply_transfer_move(
+                                stock, total, shop_total_stock,
+                                ops_out_used, ops_in_used, transfers,
+                                article, sz, donor, recv, reason,
+                            )
+                            break  # passa al prossimo negozio per questa taglia
 
+            # Pass 2 – top-up opzionale (solo se abilitato)
             if ENABLE_TOP_UP_TO_TARGET:
-                # after required fill, top-up towards target (micro)
-                need_left = int(max(0.0, targets[(article, recv)] - total.get((article, recv), 0.0)))
-                free = free_capacity(recv, shop_total_stock, shop_capacity_target)
-                if not np.isinf(free):
-                    need_left = min(need_left, max(0, int(np.floor(free))))
-                if need_left <= 0:
-                    continue
-
-                # fill central core then rest
-                pri = req_sizes + [s for s in article_sizes if s not in req_sizes]
-                for sz in pri:
+                for recv_meta in receivers:
+                    recv = recv_meta["shop"]
+                    need_left = int(max(0.0, targets[(article, recv)] - total.get((article, recv), 0.0)))
+                    free = free_capacity(recv, shop_total_stock, shop_capacity_target)
+                    if not np.isinf(free):
+                        need_left = min(need_left, max(0, int(np.floor(free))))
                     if need_left <= 0:
-                        break
+                        continue
+                    for sz in size_priority:
+                        if need_left <= 0:
+                            break
+                        if free_capacity(recv, shop_total_stock, shop_capacity_target) < 1.0:
+                            capacity_blocks += 1
+                            break
+                        donors_for_recv = prioritized_donors_for_size(
+                            meta, stock, total, demand, sales_signal, signal_lookup,
+                            article, recv, sz, shops_for_article,
+                            reparto=article_reparto_value, available_sizes=article_sizes,
+                        )
+                        for donor_meta in donors_for_recv:
+                            donor = donor_meta["shop"]
+                            if donor == recv:
+                                continue
+                            if not ops_budget_allows_move(recv, ops_in_used, ops_in_budget):
+                                ops_blocks += 1
+                                break
+                            if not ops_budget_allows_move(donor, ops_out_used, ops_out_budget):
+                                continue
+                            if stock[(article, donor)].get(sz, 0.0) >= 1.0:
+                                reason = {
+                                    "warehouse": "Top-up da M4",
+                                    "duplicate": "Top-up da stock doppio",
+                                    "single": "Top-up da negozio bassa fascia",
+                                }.get(donor_meta.get("stage"), "Top-up")
+                                apply_transfer_move(
+                                    stock, total, shop_total_stock,
+                                    ops_out_used, ops_in_used, transfers,
+                                    article, sz, donor, recv, reason,
+                                )
+                                need_left -= 1
+                                break
+
+        else:
+            # ── LOGICA LEGACY (receiver-first) ────────────────────────────────
+            for recv_meta in receivers:
+                recv = recv_meta["shop"]
+                if free_capacity(recv, shop_total_stock, shop_capacity_target) < 1.0:
+                    capacity_blocks += 1
+                    continue
+                fascia_recv = meta.get(recv, {}).get("Fascia", np.nan)
+                req_sizes = required_run_sizes(
+                    fascia_recv, reparto=article_reparto_value, available_sizes=article_sizes,
+                )
+                for sz in req_sizes:
                     if free_capacity(recv, shop_total_stock, shop_capacity_target) < 1.0:
                         capacity_blocks += 1
                         break
+                    if stock[(article, recv)].get(sz, 0.0) >= 1.0:
+                        continue
                     donors_for_recv = prioritized_donors_for_size(
-                        meta,
-                        stock,
-                        total,
-                        demand,
-                        sales_signal,
-                        signal_lookup,
-                        article,
-                        recv,
-                        sz,
-                        shops_for_article,
-                        reparto=article_reparto_value,
-                        available_sizes=article_sizes,
+                        meta, stock, total, demand, sales_signal, signal_lookup,
+                        article, recv, sz, shops_for_article,
+                        reparto=article_reparto_value, available_sizes=article_sizes,
                     )
+                    moved = False
                     for donor_meta in donors_for_recv:
                         donor = donor_meta["shop"]
                         if donor == recv:
@@ -1085,29 +1101,21 @@ def run_allocation_frames(
                             break
                         if not ops_budget_allows_move(donor, ops_out_used, ops_out_budget):
                             continue
-                        reason = {
-                            "warehouse": "Top-up to target from M4",
-                            "duplicate": "Top-up to target from duplicate stock",
-                            "single": "Top-up to target from low-fascia single",
-                        }.get(donor_meta.get("stage"), "Top-up to target")
                         if stock[(article, donor)].get(sz, 0.0) >= 1.0:
                             apply_transfer_move(
-                                stock,
-                                total,
-                                shop_total_stock,
-                                ops_out_used,
-                                ops_in_used,
-                                transfers,
-                                article,
-                                sz,
-                                donor,
-                                recv,
-                                reason,
+                                stock, total, shop_total_stock,
+                                ops_out_used, ops_in_used, transfers,
+                                article, sz, donor, recv,
+                                "Fill required run (legacy)",
                             )
-                            need_left -= 1
+                            moved = True
                             break
+                    if not moved:
+                        break
 
-        # Outlet fallback: if a line still has core size gaps, move the full remaining line to last-fascia outlet.
+        # ── OUTLET FALLBACK (solo duplicati non-core) ──────────────────────────
+        # Spostamento soft: solo pezzi in eccesso (qty > 1) di taglie NON core.
+        # NON si sposta l'intera linea in un solo negozio.
         if outlet:
             for s in list(shops_for_article):
                 if s in EXCLUDE_SHOPS or s in (WAREHOUSE, ONLINE):
@@ -1115,97 +1123,29 @@ def run_allocation_frames(
                 fascia_s = meta.get(s, {}).get("Fascia", np.nan)
                 if is_outlet(fascia_s):
                     continue
-                if (article, s) not in total:
-                    continue
-                if total[(article, s)] <= 0:
-                    continue
-                if can_make_run(
-                    meta,
-                    stock,
-                    article,
-                    s,
-                    reparto=article_reparto_value,
-                    available_sizes=article_sizes,
-                ):
-                    continue
                 if not should_reallocate_broken_line(meta, sales_signal, signal_lookup, article, s):
                     continue
-
-                required_sizes = required_run_sizes(
-                    fascia_s,
-                    reparto=article_reparto_value,
-                    available_sizes=article_sizes,
+                req_sizes_s = required_run_sizes(
+                    fascia_s, reparto=article_reparto_value, available_sizes=article_sizes,
                 )
-                priority_receivers = prioritized_receivers_for_broken_line(
-                    meta,
-                    stock,
-                    total,
-                    demand,
-                    sales_signal,
-                    signal_lookup,
-                    article,
-                    s,
-                    shops_for_article,
-                    reparto=article_reparto_value,
-                    available_sizes=article_sizes,
-                    shop_total_stock=shop_total_stock,
-                    shop_capacity_target=shop_capacity_target,
-                )
-                for recv_meta in priority_receivers:
-                    recv = recv_meta["shop"]
-                    for sz in recv_meta["missing_sizes"]:
-                        if stock[(article, s)].get(sz, 0.0) < 1.0:
-                            continue
-                        if stock[(article, recv)].get(sz, 0.0) >= 1.0:
-                            continue
-                        if free_capacity(recv, shop_total_stock, shop_capacity_target) < 1.0:
-                            capacity_blocks += 1
-                            break
-                        if not ops_budget_allows_move(s, ops_out_used, ops_out_budget):
-                            ops_blocks += 1
-                            break
-                        if not ops_budget_allows_move(recv, ops_in_used, ops_in_budget):
-                            ops_blocks += 1
-                            break
-                        apply_transfer_move(
-                            stock,
-                            total,
-                            shop_total_stock,
-                            ops_out_used,
-                            ops_in_used,
-                            transfers,
-                            article,
-                            sz,
-                            s,
-                            recv,
-                            "Fill required run from broken line",
-                        )
-                    if total.get((article, s), 0.0) <= 0:
-                        break
-
-                order = [x for x in article_sizes if x not in required_sizes] + required_sizes
-                for sz in order:
+                # Sposta solo i veri duplicati di taglie non-core verso l'outlet
+                for sz in article_sizes:
+                    if sz in req_sizes_s:
+                        continue  # proteggi le taglie core
                     while (
-                        stock[(article, s)].get(sz, 0.0) >= 1.0
+                        stock[(article, s)].get(sz, 0.0) >= 2.0  # solo se coppia doppia
                         and free_capacity(outlet, shop_total_stock, shop_capacity_target) >= 1.0
                         and ops_budget_allows_move(s, ops_out_used, ops_out_budget)
                         and ops_budget_allows_move(outlet, ops_in_used, ops_in_budget)
                     ):
                         apply_transfer_move(
-                            stock,
-                            total,
-                            shop_total_stock,
-                            ops_out_used,
-                            ops_in_used,
-                            transfers,
-                            article,
-                            sz,
-                            s,
-                            outlet,
-                            "Move full line to outlet (size gaps)",
+                            stock, total, shop_total_stock,
+                            ops_out_used, ops_in_used, transfers,
+                            article, sz, s, outlet,
+                            "Outlet: duplicato non-core",
                         )
-                    if not ops_budget_allows_move(s, ops_out_used, ops_out_budget) or not ops_budget_allows_move(outlet, ops_in_used, ops_in_budget):
-                        ops_blocks += 1
+                if not ops_budget_allows_move(s, ops_out_used, ops_out_budget):
+                    ops_blocks += 1
 
     detailed_df = pd.DataFrame(transfers)
 
