@@ -3670,7 +3670,7 @@ async function refreshSelectedRunDetails() {
   }
 }
 
-async function refreshAll(includeDashboard = false) {
+async function refreshAll(includeDashboard = false, { forceLatestRun = false } = {}) {
     await Promise.all([
       refreshHealth(),
       refreshDb(),
@@ -3682,7 +3682,9 @@ async function refreshAll(includeDashboard = false) {
   ]);
   await refreshSelectedRunDetails();
   if (includeDashboard) {
-    await loadDashboardRuns({ forceLatestRun: true });
+    // forceLatestRun=false durante auto-refresh: preserva la selezione manuale dell'utente.
+    // forceLatestRun=true solo su azioni esplicite (pulsante "Aggiorna Dashboard").
+    await loadDashboardRuns({ forceLatestRun });
     refreshDashboard();
   }
 }
