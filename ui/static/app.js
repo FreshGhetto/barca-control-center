@@ -1078,9 +1078,12 @@ function dashboardRunSelectionScore(run) {
 }
 
 function compareDashboardRunsForSelection(a, b) {
+  // Preferisce sempre il run più recente (timestamp desc).
+  // Lo score entra solo come tiebreaker a parità di timestamp.
+  const tsDiff = dashboardRunTimestamp(b) - dashboardRunTimestamp(a);
+  if (tsDiff !== 0) return tsDiff;
   const scoreDiff = dashboardRunSelectionScore(b) - dashboardRunSelectionScore(a);
-  if (scoreDiff !== 0) return scoreDiff;
-  return dashboardRunTimestamp(b) - dashboardRunTimestamp(a);
+  return scoreDiff;
 }
 
 function buildDashboardSeasonPairGroups(runs) {
@@ -3953,7 +3956,8 @@ async function init() {
   setActiveDashSection(state.activeDashSection);
   setActiveView(state.activeView);
   await loadSettings();
-  await refreshAll(true);
+  // Prima apertura: forceLatestRun=true → seleziona il run più recente (non quello con score massimo).
+  await refreshAll(true, { forceLatestRun: true });
   setInterval(() => refreshAll(state.activeView === "dashboard"), 5000);
 }
 
