@@ -2689,7 +2689,8 @@ def _dashboard_summary_payload(dsn: str, run_id: Optional[str], table_limit: int
 
                 rid = run["run_id"]
                 # Usa LOWER per confronto case-insensitive (i season_code nel DB possono essere misti)
-                sc_filter = "AND LOWER(season_code) = ANY(%s::text[])" if season_codes else ""
+                # Qualifica con fo. per evitare ambiguità nei JOIN con fact_order_source
+                sc_filter = "AND LOWER(fo.season_code) = ANY(%s::text[])" if season_codes else ""
                 sc_param: tuple = ([c.lower() for c in season_codes],) if season_codes else ()
                 kpis = _fetch_kpi_core(cur, rid, season_codes=season_codes)
 
