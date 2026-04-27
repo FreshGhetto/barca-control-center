@@ -313,212 +313,96 @@ def suggest_transfers_for_article(
     shop_meta: Optional[Any] = None,
     low_stock_threshold: float = 6.0,
 ) -> pd.DataFrame:
+    """Suggerisce trasferimenti taglia per taglia per un articolo.
+
+    Logica (dal notebook di analisi):
+    - Destinazioni: negozi che hanno venduto (Venduto > 0), non WEB, con giacenza bassa (<=soglia)
+    - Sorgenti: negozi con giacenza > 0 ma Venduto == 0, non WEB
+    - Per ogni destinazione, cerca le taglie mancanti (stock == 0) e le preleva dalle sorgenti.
+    """
     article_code = str(article_name or "").strip()
     if not article_code:
         return pd.DataFrame(columns=["Article", "From", "To", "Size", "Qty", "Reason"])
 
-    signals = build_article_shop_transfer_signals(
-        articles_df,
-        sales_df,
-        shop_meta=shop_meta,
-        low_stock_threshold=low_stock_threshold,
-    )
+    # Prepara il dataframe articoli
     stock = articles_df.copy()
     stock["Article"] = stock["Article"].astype(str).str.strip()
     stock["Shop"] = _normalize_shop_series(stock["Shop"])
-    if "Reparto" not in stock.columns:
-        stock["Reparto"] = ""
-    stock["Reparto"] = stock["Reparto"].map(lambda value: normalize_reparto(value) or "")
     size_cols = infer_size_columns(stock)
-    stock = _coerce_numeric(stock, ["Giacenza", *size_cols])
-    available_sizes = [int(col.split("_", 1)[1]) for col in size_cols]
+    stock = _coerce_numeric(stock, ["Giacenza", "Venduto", *size_cols])
 
-    signal_art = signals[signals["Article"] == article_code].copy()
-    stock_art = stock[stock["Article"] == article_code].copy()
-    if signal_art.empty:
+    # Merge Periodo_Qty dalle vendite (per il campo Reason)
+    sales = sales_df.copy()
+    sales["Article"] = sales["Article"].astype(str).str.strip()
+    sales["Shop"] = _normalize_shop_series(sales["Shop"])
+    sales = _coerce_numeric(sales, ["Periodo_Qty"])
+    sales_rollup = (
+        sales.groupby(["Article", "Shop"], as_index=False)["Periodo_Qty"].max()
+    )
+
+    # Filtra per l'articolo selezionato
+    df_art = stock[stock["Article"] == article_code].copy()
+    if df_art.empty:
         return pd.DataFrame(columns=["Article", "From", "To", "Size", "Qty", "Reason"])
 
-    article_reparto = ""
-    if "Reparto" in stock_art.columns:
-        for value in stock_art["Reparto"].tolist():
-            normalized = normalize_reparto(value)
-            if normalized:
-                article_reparto = normalized
-                break
-
-    working = signal_art.merge(
-        stock_art[["Article", "Shop", *size_cols]],
+    df_art = df_art.merge(
+        sales_rollup[sales_rollup["Article"] == article_code][["Article", "Shop", "Periodo_Qty"]],
         on=["Article", "Shop"],
         how="left",
     )
-    working = _coerce_numeric(working, [*size_cols])
-    signal_by_shop: dict[str, dict[str, Any]] = {
-        str(row["Shop"]): row.to_dict()
-        for _, row in working.iterrows()
-    }
-    stock_by_shop: dict[str, dict[int, float]] = {}
-    for _, row in working.iterrows():
-        shop = str(row["Shop"])
-        stock_by_shop[shop] = {
-            int(col.split("_", 1)[1]): float(row.get(col, 0.0) or 0.0)
-            for col in size_cols
-        }
+    df_art = _coerce_numeric(df_art, ["Periodo_Qty"])
 
-    def total_stock(shop_code: str) -> float:
-        return float(sum(stock_by_shop.get(shop_code, {}).values()))
+    # 1. Identifica negozi destinazione: hanno venduto, non sono WEB, hanno giacenza bassa
+    destinazioni = df_art[
+        (df_art["Venduto"] > 0)
+        & (df_art["Shop"] != ONLINE)
+        & (df_art["Giacenza"] <= float(low_stock_threshold))
+    ].copy().sort_values(by="Venduto", ascending=False)
 
-    def shop_signal(shop_code: str, field: str, default: float = 0.0) -> float:
-        row = signal_by_shop.get(shop_code, {})
-        try:
-            value = row.get(field, default)
-            if pd.isna(value):
-                return float(default)
-            return float(value)
-        except Exception:
-            return float(default)
+    # 2. Identifica negozi sorgente: hanno giacenza ma non hanno venduto nulla (incluso M4)
+    sorgenti = df_art[
+        (df_art["Venduto"] == 0)
+        & (df_art["Shop"] != ONLINE)
+        & (df_art["Giacenza"] > 0)
+    ].copy().sort_values(by="Giacenza", ascending=False)
 
-    def shop_rank(shop_code: str) -> int:
-        row = signal_by_shop.get(shop_code, {})
-        return _safe_fascia_rank(row.get("Fascia", np.nan))
+    trasferimenti: list[dict[str, Any]] = []
 
-    def is_outlet_shop(shop_code: str) -> bool:
-        row = signal_by_shop.get(shop_code, {})
-        return bool(row.get("IsOutlet", False))
-
-    def donor_candidates(size: int, recv_shop: str) -> list[dict[str, Any]]:
-        candidates: list[dict[str, Any]] = []
-        warehouse_qty = float(stock_by_shop.get(WAREHOUSE, {}).get(size, 0.0) or 0.0)
-        if recv_shop != ONLINE and warehouse_qty >= 1.0:
-            candidates.append({"shop": WAREHOUSE, "stage": "warehouse"})
-
-        duplicate_rows: list[dict[str, Any]] = []
-        single_rows: list[dict[str, Any]] = []
-        for shop in sorted(stock_by_shop.keys()):
-            if shop in ("", ONLINE, WAREHOUSE, recv_shop):
-                continue
-            if is_outlet_shop(shop):
-                continue
-            qty = float(stock_by_shop.get(shop, {}).get(size, 0.0) or 0.0)
-            if qty < 1.0:
-                continue
-            candidate = {
-                "shop": shop,
-                "fascia_rank": shop_rank(shop),
-                "sales_signal": shop_signal(shop, "NotebookVendutoSignal", 0.0),
-                "source_priority_score": shop_signal(shop, "SourcePriorityScore", 0.0),
-                "stock_total": total_stock(shop),
-            }
-            if qty >= 2.0:
-                candidate["stage"] = "duplicate"
-                candidate["duplicate_units"] = qty - 1.0
-                candidate["duplicate_total"] = sum(max(0.0, pair_qty - 1.0) for pair_qty in stock_by_shop.get(shop, {}).values())
-                duplicate_rows.append(candidate)
-            else:
-                candidate["stage"] = "single"
-                single_rows.append(candidate)
-
-        duplicate_rows.sort(
-            key=lambda item: (
-                -item["fascia_rank"],
-                -item["duplicate_units"],
-                -item["duplicate_total"],
-                item["sales_signal"],
-                -item["source_priority_score"],
-                item["shop"],
-            )
-        )
-        single_rows.sort(
-            key=lambda item: (
-                -item["fascia_rank"],
-                item["sales_signal"],
-                -item["source_priority_score"],
-                -item["stock_total"],
-                item["shop"],
-            )
-        )
-        return candidates + duplicate_rows + single_rows
-
-    def apply_move(donor: str, recv: str, size: int, reason: str, moves: list[dict[str, Any]]) -> None:
-        stock_by_shop.setdefault(donor, {}).setdefault(size, 0.0)
-        stock_by_shop.setdefault(recv, {}).setdefault(size, 0.0)
-        if stock_by_shop[donor][size] < 1.0:
-            return
-        stock_by_shop[donor][size] -= 1.0
-        stock_by_shop[recv][size] += 1.0
-        moves.append(
-            {
-                "Article": article_code,
-                "From": donor,
-                "To": recv,
-                "Size": size,
-                "Qty": 1.0,
-                "Reason": reason,
-            }
-        )
-
-    destinations = working[
-        working["NotebookDestinationCandidate"]
-        & (working["Shop"] != ONLINE)
-        & (working["Shop"] != WAREHOUSE)
-        & (~working["IsOutlet"])
-    ].copy()
-    destinations = destinations.sort_values(
-        ["ShopPriorityRank", "DestinationPriorityScore", "NotebookVendutoSignal", "MissingCoreSizes", "Shop"],
-        ascending=[True, False, False, False, True],
-    )
-
-    outlet_candidates = working[working["IsOutlet"]].copy()
-    outlet_candidates = outlet_candidates.sort_values(
-        ["ShopPriorityRank", "NotebookVendutoSignal", "DestinationPriorityScore", "Shop"],
-        ascending=[False, False, False, True],
-    )
-    outlet_shop = None if outlet_candidates.empty else str(outlet_candidates.iloc[0]["Shop"])
-
-    moves: list[dict[str, Any]] = []
-    for _, dest in destinations.iterrows():
+    # 3. Logica di matching per taglia
+    for _, dest in destinazioni.iterrows():
         dest_shop = str(dest["Shop"])
-        core_sizes = _required_core_sizes(
-            dest.get("Fascia"),
-            reparto=article_reparto or dest.get("Reparto"),
-            available_sizes=available_sizes,
-        )
-        for size in core_sizes:
-            if float(stock_by_shop.get(dest_shop, {}).get(size, 0.0) or 0.0) > 0.0:
-                continue
-            for donor in donor_candidates(size, dest_shop):
-                donor_shop = str(donor["shop"])
-                if donor_shop == dest_shop:
-                    continue
-                if float(stock_by_shop.get(donor_shop, {}).get(size, 0.0) or 0.0) < 1.0:
-                    continue
-                reason = {
-                    "warehouse": "Fill required run from M4",
-                    "duplicate": "Fill required run from duplicate stock",
-                    "single": "Fill required run from low-fascia single",
-                }.get(donor.get("stage"), "Fill required run")
-                apply_move(donor_shop, dest_shop, size, reason, moves)
-                break
+        # Taglie con stock zero nella destinazione
+        taglie_mancanti = [s for s in size_cols if float(dest.get(s, 0.0) or 0.0) == 0.0]
 
-    if outlet_shop:
-        for shop in sorted(stock_by_shop.keys()):
-            if shop in ("", ONLINE, WAREHOUSE, outlet_shop):
-                continue
-            if is_outlet_shop(shop):
-                continue
-            if total_stock(shop) <= 0.0:
-                continue
-            required_sizes = _required_core_sizes(
-                signal_by_shop.get(shop, {}).get("Fascia"),
-                reparto=article_reparto or signal_by_shop.get(shop, {}).get("Reparto"),
-                available_sizes=available_sizes,
-            )
-            if all(float(stock_by_shop.get(shop, {}).get(size, 0.0) or 0.0) >= 1.0 for size in required_sizes):
-                continue
-            for size in SIZES:
-                while float(stock_by_shop.get(shop, {}).get(size, 0.0) or 0.0) >= 1.0:
-                    apply_move(shop, outlet_shop, size, "Move full line to outlet (size gaps)", moves)
+        for taglia in taglie_mancanti:
+            for idx_sorg, sorg in sorgenti.iterrows():
+                if float(sorg.get(taglia, 0.0) or 0.0) > 0.0:
+                    size_num: Any = taglia
+                    try:
+                        size_num = int(taglia.split("_", 1)[1])
+                    except Exception:
+                        pass
+                    periodo_qty = dest.get("Periodo_Qty", dest.get("Venduto", ""))
+                    trasferimenti.append(
+                        {
+                            "Article": article_code,
+                            "From": sorg["Shop"],
+                            "To": dest_shop,
+                            "Size": size_num,
+                            "Qty": 1.0,
+                            "Reason": (
+                                f"Vendite Recenti: {periodo_qty} | Stock Fermo a {sorg['Shop']}"
+                            ),
+                        }
+                    )
+                    # Aggiorna il conteggio per evitare doppi trasferimenti
+                    sorgenti.at[idx_sorg, taglia] -= 1.0
+                    sorgenti.at[idx_sorg, "Giacenza"] -= 1.0
+                    break  # Passa alla prossima taglia mancante
 
-    return pd.DataFrame(moves)
+    if not trasferimenti:
+        return pd.DataFrame(columns=["Article", "From", "To", "Size", "Qty", "Reason"])
+    return pd.DataFrame(trasferimenti)
 
 
 def _default_shops_cfg(root: Path) -> Path:
