@@ -2174,9 +2174,11 @@ def _to_float(value: Any) -> float:
         return 0.0
 
 
-def _fetch_kpi_core(cur, run_id: str) -> Dict[str, Any]:
+def _fetch_kpi_core(cur, run_id: str, season_codes: Optional[List[str]] = None) -> Dict[str, Any]:
+    sc_filter = "AND season_code = ANY(%s::text[])" if season_codes else ""
+    sc_param = (season_codes,) if season_codes else ()
     cur.execute(
-        """
+        f"""
         SELECT
           (SELECT count(*) FROM public.dim_shop) AS shop_count,
           (SELECT count(*) FROM public.dim_article) AS article_count,
@@ -2185,9 +2187,9 @@ def _fetch_kpi_core(cur, run_id: str) -> Dict[str, Any]:
           (SELECT count(*) FROM public.fact_transfer_suggestion WHERE run_id = %s::uuid) AS transfer_rows,
           (SELECT COALESCE(sum(qty), 0) FROM public.fact_transfer_suggestion WHERE run_id = %s::uuid) AS transfer_qty_total,
           (SELECT count(*) FROM public.fact_feature_state WHERE run_id = %s::uuid) AS feature_rows,
-          (SELECT count(*) FROM public.fact_order_forecast WHERE run_id = %s::uuid) AS order_rows,
-          (SELECT COALESCE(sum(totale_qty), 0) FROM public.fact_order_forecast WHERE run_id = %s::uuid) AS order_qty_total,
-          (SELECT COALESCE(sum(budget_acquisto), 0) FROM public.fact_order_forecast WHERE run_id = %s::uuid) AS order_budget_total,
+          (SELECT count(*) FROM public.fact_order_forecast WHERE run_id = %s::uuid {sc_filter}) AS order_rows,
+          (SELECT COALESCE(sum(totale_qty), 0) FROM public.fact_order_forecast WHERE run_id = %s::uuid {sc_filter}) AS order_qty_total,
+          (SELECT COALESCE(sum(budget_acquisto), 0) FROM public.fact_order_forecast WHERE run_id = %s::uuid {sc_filter}) AS order_budget_total,
           (SELECT COALESCE(avg(sellout_clamped), 0) FROM public.fact_sales_snapshot WHERE run_id = %s::uuid) AS avg_sellout_clamped,
           (
             SELECT count(*)
@@ -2208,7 +2210,11 @@ def _fetch_kpi_core(cur, run_id: str) -> Dict[str, Any]:
           (SELECT count(DISTINCT to_shop_code) FROM public.fact_transfer_suggestion WHERE run_id = %s::uuid) AS target_shops,
           (SELECT count(DISTINCT from_shop_code) FROM public.fact_transfer_suggestion WHERE run_id = %s::uuid) AS source_shops
         """,
-        (run_id, run_id, run_id, run_id, run_id, run_id, run_id, run_id, run_id, run_id, run_id, run_id, run_id),
+        (run_id, run_id, run_id, run_id, run_id,
+         run_id, *sc_param,
+         run_id, *sc_param,
+         run_id, *sc_param,
+         run_id, run_id, run_id, run_id, run_id),
     )
     row = cur.fetchone() or [0] * 15
     out = {
@@ -2394,7 +2400,7 @@ def _resolve_dashboard_run(cur, run_id: Optional[str]) -> Optional[Dict[str, Any
     }
 
 
-def _dashboard_payload(run_id: Optional[str], table_limit: int = 30) -> Dict[str, Any]:
+def _dashboard_payload(run_id: Optional[str], table_limit: int = 30, season_codes: Optional[List[str]] = None) -> Dict[str, Any]:
     if psycopg is None:
         return {"connected": False, "reason": "psycopg non installato"}
 
@@ -2403,7 +2409,7 @@ def _dashboard_payload(run_id: Optional[str], table_limit: int = 30) -> Dict[str
     except Exception as exc:
         return {"connected": False, "reason": str(exc)}
 
-    return _dashboard_summary_payload(dsn=dsn, run_id=run_id, table_limit=table_limit)
+    return _dashboard_summary_payload(dsn=dsn, run_id=run_id, table_limit=table_limit, season_codes=season_codes)
 
 
 def _dashboard_article_detail_payload(run_id: Optional[str], article_code: Optional[str]) -> Dict[str, Any]:
@@ -2665,7 +2671,7 @@ def _dashboard_article_detail_payload_from_db(
         return {"connected": False, "reason": str(exc)}
 
 
-def _dashboard_summary_payload(dsn: str, run_id: Optional[str], table_limit: int) -> Dict[str, Any]:
+def _dashboard_summary_payload(dsn: str, run_id: Optional[str], table_limit: int, season_codes: Optional[List[str]] = None) -> Dict[str, Any]:
     try:
         with psycopg.connect(dsn) as conn:
             with conn.cursor() as cur:
@@ -2681,7 +2687,9 @@ def _dashboard_summary_payload(dsn: str, run_id: Optional[str], table_limit: int
                     }
 
                 rid = run["run_id"]
-                kpis = _fetch_kpi_core(cur, rid)
+                sc_filter = "AND season_code = ANY(%s::text[])" if season_codes else ""
+                sc_param: tuple = (season_codes,) if season_codes else ()
+                kpis = _fetch_kpi_core(cur, rid, season_codes=season_codes)
 
                 baseline_run = None
                 baseline_kpis = None
@@ -2793,52 +2801,52 @@ def _dashboard_summary_payload(dsn: str, run_id: Optional[str], table_limit: int
                 transfer_reason = _fetch_chart_rows(cur)
 
                 cur.execute(
-                    """
+                    f"""
                     SELECT
                       CONCAT(COALESCE(season_code, 'n/a'), ' · ', COALESCE(mode, 'n/a')) AS label,
                       SUM(COALESCE(totale_qty, 0)) AS value
                     FROM public.fact_order_forecast
-                    WHERE run_id = %s::uuid
+                    WHERE run_id = %s::uuid {sc_filter}
                     GROUP BY season_code, mode
                     ORDER BY value DESC
                     LIMIT 12
                     """,
-                    (rid,),
+                    (rid, *sc_param),
                 )
                 orders_by_season_mode = _fetch_chart_rows(cur)
 
                 cur.execute(
-                    """
+                    f"""
                     SELECT
                       module AS label,
                       SUM(COALESCE(totale_qty, 0)) AS value
                     FROM public.fact_order_forecast
-                    WHERE run_id = %s::uuid
+                    WHERE run_id = %s::uuid {sc_filter}
                     GROUP BY module
                     ORDER BY value DESC
                     LIMIT 10
                     """,
-                    (rid,),
+                    (rid, *sc_param),
                 )
                 orders_by_module = _fetch_chart_rows(cur)
 
                 cur.execute(
-                    """
+                    f"""
                     SELECT
                       COALESCE(mode, 'n/a') AS label,
                       SUM(COALESCE(totale_qty, 0)) AS value
                     FROM public.fact_order_forecast
-                    WHERE run_id = %s::uuid
+                    WHERE run_id = %s::uuid {sc_filter}
                     GROUP BY COALESCE(mode, 'n/a')
                     ORDER BY value DESC
                     LIMIT 10
                     """,
-                    (rid,),
+                    (rid, *sc_param),
                 )
                 orders_by_mode = _fetch_chart_rows(cur)
 
                 cur.execute(
-                    """
+                    f"""
                     SELECT
                       COALESCE(NULLIF(os.fascia_prezzo, ''), 'n/a') AS label,
                       SUM(COALESCE(fo.totale_qty, 0)) AS value
@@ -2848,11 +2856,10 @@ def _dashboard_summary_payload(dsn: str, run_id: Optional[str], table_limit: int
                      AND os.module = fo.module
                      AND os.article_code = fo.article_code
                      AND os.season_code IS NOT DISTINCT FROM fo.season_code
-                    WHERE fo.run_id = %s::uuid
+                    WHERE fo.run_id = %s::uuid {sc_filter}
                     GROUP BY COALESCE(NULLIF(os.fascia_prezzo, ''), 'n/a')
-                    """
-                    ,
-                    (rid,),
+                    """,
+                    (rid, *sc_param),
                 )
                 orders_by_price_band = sorted(_fetch_chart_rows(cur), key=lambda row: _price_band_sort_key(row.get("label")))
 
@@ -2906,7 +2913,7 @@ def _dashboard_summary_payload(dsn: str, run_id: Optional[str], table_limit: int
                 transfer_rows = _fetch_dict_rows(cur)
 
                 cur.execute(
-                    """
+                    f"""
                     SELECT
                       fo.module,
                       fo.season_code,
@@ -2924,11 +2931,11 @@ def _dashboard_summary_payload(dsn: str, run_id: Optional[str], table_limit: int
                      AND os.module = fo.module
                      AND os.article_code = fo.article_code
                      AND os.season_code IS NOT DISTINCT FROM fo.season_code
-                    WHERE fo.run_id = %s::uuid
+                    WHERE fo.run_id = %s::uuid {sc_filter}
                     ORDER BY totale_qty DESC NULLS LAST, article_code ASC
                     LIMIT %s
                     """,
-                    (rid, table_limit),
+                    (rid, *sc_param, table_limit),
                 )
                 order_rows = _fetch_dict_rows(cur)
 
@@ -3551,8 +3558,14 @@ def api_dashboard_runs(limit: int = Query(default=100, ge=1, le=500)):
 def api_dashboard(
     run_id: Optional[str] = Query(default=None),
     table_limit: int = Query(default=30, ge=5, le=200),
+    season_codes: Optional[str] = Query(default=None),
 ):
-    return _dashboard_payload(run_id=run_id, table_limit=table_limit)
+    sc_list: Optional[List[str]] = None
+    if season_codes:
+        sc_list = [c.strip().upper() for c in season_codes.split(",") if c.strip()]
+        if not sc_list:
+            sc_list = None
+    return _dashboard_payload(run_id=run_id, table_limit=table_limit, season_codes=sc_list)
 
 
 @app.get("/api/dashboard/article-detail")
