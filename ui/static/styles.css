@@ -261,6 +261,20 @@ body {
   align-self: flex-end;
 }
 
+.season-filter-btn {
+  background: #e9f2ed;
+  color: #214138;
+  border: 1.5px solid #bfd0c7;
+  font-size: 12px;
+  padding: 8px 12px;
+}
+
+.season-filter-btn.active {
+  background: var(--brand);
+  color: #fff;
+  border-color: var(--brand);
+}
+
 .alert {
   margin: 8px 0 0;
   padding: 10px 12px;

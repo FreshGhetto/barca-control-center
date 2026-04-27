@@ -2178,11 +2178,19 @@ def _fetch_kpi_core(cur, run_id: str, season_codes: Optional[List[str]] = None) 
     # Usa LOWER per confronto case-insensitive (i season_code nel DB possono essere misti)
     sc_filter = "AND LOWER(season_code) = ANY(%s::text[])" if season_codes else ""
     sc_param = ([c.lower() for c in season_codes],) if season_codes else ()
+    # Quando c'è un filtro stagione: conta articoli distinti nel forecast filtrato
+    # Quando non c'è filtro: conta tutti gli articoli del catalogo
+    if season_codes:
+        article_count_sql = f"(SELECT count(DISTINCT article_code) FROM public.fact_order_forecast WHERE run_id = %s::uuid {sc_filter}) AS article_count"
+        article_count_params = (run_id, *sc_param)
+    else:
+        article_count_sql = "(SELECT count(*) FROM public.dim_article) AS article_count"
+        article_count_params = ()
     cur.execute(
         f"""
         SELECT
           (SELECT count(*) FROM public.dim_shop) AS shop_count,
-          (SELECT count(*) FROM public.dim_article) AS article_count,
+          {article_count_sql},
           (SELECT count(*) FROM public.fact_sales_snapshot WHERE run_id = %s::uuid) AS sales_rows,
           (SELECT count(*) FROM public.fact_stock_snapshot WHERE run_id = %s::uuid) AS stock_rows,
           (SELECT count(*) FROM public.fact_transfer_suggestion WHERE run_id = %s::uuid) AS transfer_rows,
@@ -2211,7 +2219,8 @@ def _fetch_kpi_core(cur, run_id: str, season_codes: Optional[List[str]] = None) 
           (SELECT count(DISTINCT to_shop_code) FROM public.fact_transfer_suggestion WHERE run_id = %s::uuid) AS target_shops,
           (SELECT count(DISTINCT from_shop_code) FROM public.fact_transfer_suggestion WHERE run_id = %s::uuid) AS source_shops
         """,
-        (run_id, run_id, run_id, run_id, run_id,
+        (*article_count_params,
+         run_id, run_id, run_id, run_id, run_id,
          run_id, *sc_param,
          run_id, *sc_param,
          run_id, *sc_param,
