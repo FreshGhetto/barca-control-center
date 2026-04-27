@@ -2689,9 +2689,11 @@ def _dashboard_summary_payload(dsn: str, run_id: Optional[str], table_limit: int
 
                 rid = run["run_id"]
                 # Usa LOWER per confronto case-insensitive (i season_code nel DB possono essere misti)
-                # Qualifica con fo. per evitare ambiguità nei JOIN con fact_order_source
-                sc_filter = "AND LOWER(fo.season_code) = ANY(%s::text[])" if season_codes else ""
+                # sc_filter: per query senza alias (FROM fact_order_forecast direttamente)
+                # sc_filter_fo: per query con alias fo (FROM fact_order_forecast fo LEFT JOIN ...)
                 sc_param: tuple = ([c.lower() for c in season_codes],) if season_codes else ()
+                sc_filter = "AND LOWER(season_code) = ANY(%s::text[])" if season_codes else ""
+                sc_filter_fo = "AND LOWER(fo.season_code) = ANY(%s::text[])" if season_codes else ""
                 kpis = _fetch_kpi_core(cur, rid, season_codes=season_codes)
 
                 baseline_run = None
@@ -2859,8 +2861,8 @@ def _dashboard_summary_payload(dsn: str, run_id: Optional[str], table_limit: int
                      AND os.module = fo.module
                      AND os.article_code = fo.article_code
                      AND os.season_code IS NOT DISTINCT FROM fo.season_code
-                    WHERE fo.run_id = %s::uuid {sc_filter}
-                    GROUP BY COALESCE(NULLIF(os.fascia_prezzo, ''), 'n/a')
+                     WHERE fo.run_id = %s::uuid {sc_filter_fo}
+                     GROUP BY COALESCE(NULLIF(os.fascia_prezzo, ''), 'n/a')
                     """,
                     (rid, *sc_param),
                 )
@@ -2934,8 +2936,8 @@ def _dashboard_summary_payload(dsn: str, run_id: Optional[str], table_limit: int
                      AND os.module = fo.module
                      AND os.article_code = fo.article_code
                      AND os.season_code IS NOT DISTINCT FROM fo.season_code
-                    WHERE fo.run_id = %s::uuid {sc_filter}
-                    ORDER BY totale_qty DESC NULLS LAST, article_code ASC
+                     WHERE fo.run_id = %s::uuid {sc_filter_fo}
+                     ORDER BY totale_qty DESC NULLS LAST, article_code ASC
                     LIMIT %s
                     """,
                     (rid, *sc_param, table_limit),
