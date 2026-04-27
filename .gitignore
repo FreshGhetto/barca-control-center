@@ -7,3 +7,6 @@ input/orders/
 output/
 config/backup/
 config/ui_settings.json
+
+# Variabili d'ambiente locali (non committare)
+.env

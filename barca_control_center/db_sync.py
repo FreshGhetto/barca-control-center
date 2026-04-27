@@ -19,6 +19,25 @@ try:
 except Exception:  # pragma: no cover
     psycopg = None
 
+# Carica variabili d'ambiente da .env se presenti (utile quando il server viene avviato
+# senza le variabili già nel contesto, es. avvio diretto da IDE o script)
+def _load_dotenv() -> None:
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    if not env_path.exists():
+        return
+    with open(env_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip()
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+_load_dotenv()
+
 
 def _require_psycopg():
     if psycopg is None:
