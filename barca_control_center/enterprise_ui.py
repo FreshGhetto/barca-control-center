@@ -2177,75 +2177,131 @@ def _to_float(value: Any) -> float:
         return 0.0
 
 
-def _fetch_kpi_core(cur, run_id: str, season_codes: Optional[List[str]] = None) -> Dict[str, Any]:
-    # Usa LOWER per confronto case-insensitive (i season_code nel DB possono essere misti)
+def _season_article_codes(cur, run_id: str, season_codes: Optional[List[str]]) -> List[str]:
+    if not season_codes:
+        return []
+    cur.execute(
+        """
+        SELECT DISTINCT article_code
+        FROM public.fact_order_source
+        WHERE run_id = %s::uuid
+          AND LOWER(season_code) = ANY(%s::text[])
+        ORDER BY article_code
+        """,
+        (run_id, [c.lower() for c in season_codes]),
+    )
+    return [str(row[0]).strip() for row in cur.fetchall() if str(row[0]).strip()]
+
+
+def _fetch_kpi_core(
+    cur,
+    run_id: str,
+    season_codes: Optional[List[str]] = None,
+    season_article_codes: Optional[List[str]] = None,
+) -> Dict[str, Any]:
     sc_filter = "AND LOWER(season_code) = ANY(%s::text[])" if season_codes else ""
     sc_param = ([c.lower() for c in season_codes],) if season_codes else ()
-    # Quando c'è un filtro stagione: conta articoli distinti nel forecast filtrato
-    # Quando non c'è filtro: conta tutti gli articoli del catalogo
-    if season_codes:
-        article_count_sql = f"(SELECT count(DISTINCT article_code) FROM public.fact_order_forecast WHERE run_id = %s::uuid {sc_filter}) AS article_count"
-        article_count_params = (run_id, *sc_param)
-    else:
-        article_count_sql = "(SELECT count(*) FROM public.dim_article) AS article_count"
-        article_count_params = ()
-    cur.execute(
-        f"""
-        SELECT
-          (SELECT count(*) FROM public.dim_shop) AS shop_count,
-          {article_count_sql},
-          (SELECT count(*) FROM public.fact_sales_snapshot WHERE run_id = %s::uuid) AS sales_rows,
-          (SELECT count(*) FROM public.fact_stock_snapshot WHERE run_id = %s::uuid) AS stock_rows,
-          (SELECT count(*) FROM public.fact_transfer_suggestion WHERE run_id = %s::uuid) AS transfer_rows,
-          (SELECT COALESCE(sum(qty), 0) FROM public.fact_transfer_suggestion WHERE run_id = %s::uuid) AS transfer_qty_total,
-          (SELECT count(*) FROM public.fact_feature_state WHERE run_id = %s::uuid) AS feature_rows,
-          (SELECT count(*) FROM public.fact_order_forecast WHERE run_id = %s::uuid {sc_filter}) AS order_rows,
-          (SELECT COALESCE(sum(totale_qty), 0) FROM public.fact_order_forecast WHERE run_id = %s::uuid {sc_filter}) AS order_qty_total,
-          (SELECT COALESCE(sum(budget_acquisto), 0) FROM public.fact_order_forecast WHERE run_id = %s::uuid {sc_filter}) AS order_budget_total,
-          (SELECT COALESCE(avg(sellout_clamped), 0) FROM public.fact_sales_snapshot WHERE run_id = %s::uuid) AS avg_sellout_clamped,
-          (
-            SELECT count(*)
-            FROM public.fact_feature_state
-            WHERE run_id = %s::uuid
-              AND demand_hybrid IS NOT NULL
-              AND stock_after IS NOT NULL
-              AND (demand_hybrid - stock_after) > 0
-          ) AS critical_rows_total,
-          (
-            SELECT COALESCE(sum(demand_hybrid - stock_after), 0)
-            FROM public.fact_feature_state
-            WHERE run_id = %s::uuid
-              AND demand_hybrid IS NOT NULL
-              AND stock_after IS NOT NULL
-              AND (demand_hybrid - stock_after) > 0
-          ) AS critical_deficit_total,
-          (SELECT count(DISTINCT to_shop_code) FROM public.fact_transfer_suggestion WHERE run_id = %s::uuid) AS target_shops,
-          (SELECT count(DISTINCT from_shop_code) FROM public.fact_transfer_suggestion WHERE run_id = %s::uuid) AS source_shops
-        """,
-        (*article_count_params,
-         run_id, run_id, run_id, run_id, run_id,
-         run_id, *sc_param,
-         run_id, *sc_param,
-         run_id, *sc_param,
-         run_id, run_id, run_id, run_id, run_id),
-    )
-    row = cur.fetchone() or [0] * 15
+    article_codes = season_article_codes if season_article_codes is not None else _season_article_codes(cur, run_id, season_codes)
+    article_param = (article_codes,) if article_codes else ()
+    transfer_filter_sql = "AND article_code = ANY(%s::text[])" if season_codes else ""
+    feature_filter_sql = "AND article_code = ANY(%s::text[])" if season_codes else ""
+
+    def _scalar(sql: str, params: tuple[Any, ...]) -> Any:
+        cur.execute(sql, params)
+        row = cur.fetchone()
+        return row[0] if row else 0
+
     out = {
-        "shop_count": int(row[0] or 0),
-        "article_count": int(row[1] or 0),
-        "sales_rows": int(row[2] or 0),
-        "stock_rows": int(row[3] or 0),
-        "transfer_rows": int(row[4] or 0),
-        "transfer_qty_total": _to_float(row[5]),
-        "feature_rows": int(row[6] or 0),
-        "order_rows": int(row[7] or 0),
-        "order_qty_total": _to_float(row[8]),
-        "order_budget_total": _to_float(row[9]),
-        "avg_sellout_clamped": _to_float(row[10]),
-        "critical_rows_total": int(row[11] or 0),
-        "critical_deficit_total": _to_float(row[12]),
-        "target_shops": int(row[13] or 0),
-        "source_shops": int(row[14] or 0),
+        "shop_count": int(_scalar("SELECT count(*) FROM public.dim_shop", ())),
+        "article_count": int(
+            _scalar(
+                f"SELECT count(DISTINCT article_code) FROM public.fact_order_forecast WHERE run_id = %s::uuid {sc_filter}",
+                (run_id, *sc_param),
+            )
+            if season_codes
+            else _scalar("SELECT count(*) FROM public.dim_article", ())
+        ),
+        "sales_rows": int(_scalar("SELECT count(*) FROM public.fact_sales_snapshot WHERE run_id = %s::uuid", (run_id,))),
+        "stock_rows": int(_scalar("SELECT count(*) FROM public.fact_stock_snapshot WHERE run_id = %s::uuid", (run_id,))),
+        "transfer_rows": int(
+            _scalar(
+                f"SELECT count(*) FROM public.fact_transfer_suggestion WHERE run_id = %s::uuid {transfer_filter_sql}",
+                (run_id, *article_param) if season_codes else (run_id,),
+            )
+        ),
+        "transfer_qty_total": _to_float(
+            _scalar(
+                f"SELECT COALESCE(sum(qty), 0) FROM public.fact_transfer_suggestion WHERE run_id = %s::uuid {transfer_filter_sql}",
+                (run_id, *article_param) if season_codes else (run_id,),
+            )
+        ),
+        "feature_rows": int(
+            _scalar(
+                f"SELECT count(*) FROM public.fact_feature_state WHERE run_id = %s::uuid {feature_filter_sql}",
+                (run_id, *article_param) if season_codes else (run_id,),
+            )
+        ),
+        "order_rows": int(
+            _scalar(
+                f"SELECT count(*) FROM public.fact_order_forecast WHERE run_id = %s::uuid {sc_filter}",
+                (run_id, *sc_param),
+            )
+        ),
+        "order_qty_total": _to_float(
+            _scalar(
+                f"SELECT COALESCE(sum(totale_qty), 0) FROM public.fact_order_forecast WHERE run_id = %s::uuid {sc_filter}",
+                (run_id, *sc_param),
+            )
+        ),
+        "order_budget_total": _to_float(
+            _scalar(
+                f"SELECT COALESCE(sum(budget_acquisto), 0) FROM public.fact_order_forecast WHERE run_id = %s::uuid {sc_filter}",
+                (run_id, *sc_param),
+            )
+        ),
+        "avg_sellout_clamped": _to_float(
+            _scalar("SELECT COALESCE(avg(sellout_clamped), 0) FROM public.fact_sales_snapshot WHERE run_id = %s::uuid", (run_id,))
+        ),
+        "critical_rows_total": int(
+            _scalar(
+                f"""
+                SELECT count(*)
+                FROM public.fact_feature_state
+                WHERE run_id = %s::uuid
+                  {feature_filter_sql}
+                  AND demand_hybrid IS NOT NULL
+                  AND stock_after IS NOT NULL
+                  AND (demand_hybrid - stock_after) > 0
+                """,
+                (run_id, *article_param) if season_codes else (run_id,),
+            )
+        ),
+        "critical_deficit_total": _to_float(
+            _scalar(
+                f"""
+                SELECT COALESCE(sum(demand_hybrid - stock_after), 0)
+                FROM public.fact_feature_state
+                WHERE run_id = %s::uuid
+                  {feature_filter_sql}
+                  AND demand_hybrid IS NOT NULL
+                  AND stock_after IS NOT NULL
+                  AND (demand_hybrid - stock_after) > 0
+                """,
+                (run_id, *article_param) if season_codes else (run_id,),
+            )
+        ),
+        "target_shops": int(
+            _scalar(
+                f"SELECT count(DISTINCT to_shop_code) FROM public.fact_transfer_suggestion WHERE run_id = %s::uuid {transfer_filter_sql}",
+                (run_id, *article_param) if season_codes else (run_id,),
+            )
+        ),
+        "source_shops": int(
+            _scalar(
+                f"SELECT count(DISTINCT from_shop_code) FROM public.fact_transfer_suggestion WHERE run_id = %s::uuid {transfer_filter_sql}",
+                (run_id, *article_param) if season_codes else (run_id,),
+            )
+        ),
     }
     transfer_rows_count = max(out["transfer_rows"], 1)
     out["transfer_avg_qty"] = _to_float(out["transfer_qty_total"] / transfer_rows_count)
@@ -2326,23 +2382,14 @@ def _dashboard_run_where_sql(alias: str = "etl_run") -> str:
 
 def _dashboard_run_order_sql(alias: str = "etl_run") -> str:
     return f"""
-        CASE
-          WHEN EXISTS (SELECT 1 FROM public.fact_transfer_suggestion t WHERE t.run_id = {alias}.run_id LIMIT 1) THEN 0
-          WHEN EXISTS (SELECT 1 FROM public.fact_feature_state f WHERE f.run_id = {alias}.run_id LIMIT 1) THEN 1
-          WHEN EXISTS (SELECT 1 FROM public.fact_order_forecast o WHERE o.run_id = {alias}.run_id LIMIT 1) THEN 2
-          WHEN EXISTS (SELECT 1 FROM public.fact_order_source os WHERE os.run_id = {alias}.run_id LIMIT 1) THEN 3
-          WHEN EXISTS (SELECT 1 FROM public.fact_sales_snapshot s WHERE s.run_id = {alias}.run_id LIMIT 1)
-            OR EXISTS (SELECT 1 FROM public.fact_stock_snapshot st WHERE st.run_id = {alias}.run_id LIMIT 1) THEN 4
-          ELSE 9
-        END,
+        COALESCE({alias}.finished_at, {alias}.started_at) DESC,
         CASE lower(COALESCE({alias}.run_type, ''))
           WHEN 'app_pipeline' THEN 0
           WHEN 'app_pipeline_ui' THEN 1
           WHEN 'manual_sync' THEN 2
           WHEN 'raw_input_sync' THEN 3
           ELSE 9
-        END,
-        COALESCE({alias}.finished_at, {alias}.started_at) DESC
+        END
     """
 
 
@@ -2811,7 +2858,11 @@ def _dashboard_summary_payload(dsn: str, run_id: Optional[str], table_limit: int
                 sc_param: tuple = ([c.lower() for c in season_codes],) if season_codes else ()
                 sc_filter = "AND LOWER(season_code) = ANY(%s::text[])" if season_codes else ""
                 sc_filter_fo = "AND LOWER(fo.season_code) = ANY(%s::text[])" if season_codes else ""
-                kpis = _fetch_kpi_core(cur, rid, season_codes=season_codes)
+                season_article_codes = _season_article_codes(cur, rid, season_codes) if season_codes else []
+                article_param = (season_article_codes,) if season_codes else ()
+                transfer_filter_clause = "AND t.article_code = ANY(%s::text[])" if season_codes else ""
+                feature_filter_clause = "AND article_code = ANY(%s::text[])" if season_codes else ""
+                kpis = _fetch_kpi_core(cur, rid, season_codes=season_codes, season_article_codes=season_article_codes)
 
                 baseline_run = None
                 baseline_kpis = None
@@ -2884,41 +2935,44 @@ def _dashboard_summary_payload(dsn: str, run_id: Optional[str], table_limit: int
                         baseline_kpis = None
 
                 cur.execute(
-                    """
+                    f"""
                     SELECT to_shop_code AS label, SUM(qty) AS value
-                    FROM public.fact_transfer_suggestion
+                    FROM public.fact_transfer_suggestion t
                     WHERE run_id = %s::uuid
+                      {transfer_filter_clause}
                     GROUP BY to_shop_code
                     ORDER BY value DESC
                     LIMIT 12
                     """,
-                    (rid,),
+                    (rid, *article_param) if season_codes else (rid,),
                 )
                 transfer_to = _fetch_chart_rows(cur)
 
                 cur.execute(
-                    """
+                    f"""
                     SELECT from_shop_code AS label, SUM(qty) AS value
-                    FROM public.fact_transfer_suggestion
+                    FROM public.fact_transfer_suggestion t
                     WHERE run_id = %s::uuid
+                      {transfer_filter_clause}
                     GROUP BY from_shop_code
                     ORDER BY value DESC
                     LIMIT 12
                     """,
-                    (rid,),
+                    (rid, *article_param) if season_codes else (rid,),
                 )
                 transfer_from = _fetch_chart_rows(cur)
 
                 cur.execute(
-                    """
+                    f"""
                     SELECT COALESCE(reason, 'n/a') AS label, SUM(qty) AS value
-                    FROM public.fact_transfer_suggestion
+                    FROM public.fact_transfer_suggestion t
                     WHERE run_id = %s::uuid
+                      {transfer_filter_clause}
                     GROUP BY COALESCE(reason, 'n/a')
                     ORDER BY value DESC
                     LIMIT 12
                     """,
-                    (rid,),
+                    (rid, *article_param) if season_codes else (rid,),
                 )
                 transfer_reason = _fetch_chart_rows(cur)
 
@@ -2990,12 +3044,13 @@ def _dashboard_summary_payload(dsn: str, run_id: Optional[str], table_limit: int
                 orders_by_price_band = sorted(_fetch_chart_rows(cur), key=lambda row: _price_band_sort_key(row.get("label")))
 
                 cur.execute(
-                    """
+                    f"""
                     SELECT
                       shop_code AS label,
                       SUM(demand_hybrid - stock_after) AS value
                     FROM public.fact_feature_state
                     WHERE run_id = %s::uuid
+                      {feature_filter_clause}
                       AND demand_hybrid IS NOT NULL
                       AND stock_after IS NOT NULL
                       AND (demand_hybrid - stock_after) > 0
@@ -3003,7 +3058,7 @@ def _dashboard_summary_payload(dsn: str, run_id: Optional[str], table_limit: int
                     ORDER BY value DESC
                     LIMIT 12
                     """,
-                    (rid,),
+                    (rid, *article_param) if season_codes else (rid,),
                 )
                 critical_by_shop = _fetch_chart_rows(cur)
 
@@ -3013,12 +3068,13 @@ def _dashboard_summary_payload(dsn: str, run_id: Optional[str], table_limit: int
                 # altre tabelle). Ridurre questo valore taglierebbe articoli con qty bassa.
                 _TRANSFER_ROW_LIMIT = 50000
                 cur.execute(
-                    """
+                    f"""
                     WITH top_t AS (
                       SELECT article_code, size, from_shop_code, to_shop_code,
                              COALESCE(reason, '') AS reason, qty
-                      FROM public.fact_transfer_suggestion
+                      FROM public.fact_transfer_suggestion t
                       WHERE run_id = %s::uuid
+                        {transfer_filter_clause}
                       ORDER BY qty DESC, article_code ASC
                       LIMIT %s
                     )
@@ -3050,7 +3106,7 @@ def _dashboard_summary_payload(dsn: str, run_id: Optional[str], table_limit: int
                      AND tf.shop_code = t.to_shop_code
                     ORDER BY t.qty DESC, t.article_code ASC
                     """,
-                    (rid, _TRANSFER_ROW_LIMIT, rid, rid),
+                    (rid, *article_param, _TRANSFER_ROW_LIMIT, rid, rid) if season_codes else (rid, _TRANSFER_ROW_LIMIT, rid, rid),
                 )
                 transfer_rows = _fetch_dict_rows(cur)
 
@@ -3086,7 +3142,7 @@ def _dashboard_summary_payload(dsn: str, run_id: Optional[str], table_limit: int
                 order_rows = _fetch_dict_rows(cur)
 
                 cur.execute(
-                    """
+                    f"""
                     SELECT
                       article_code,
                       shop_code,
@@ -3095,163 +3151,26 @@ def _dashboard_summary_payload(dsn: str, run_id: Optional[str], table_limit: int
                       (demand_hybrid - stock_after) AS deficit
                     FROM public.fact_feature_state
                     WHERE run_id = %s::uuid
+                      {feature_filter_clause}
                       AND demand_hybrid IS NOT NULL
                       AND stock_after IS NOT NULL
                       AND (demand_hybrid - stock_after) > 0
                     ORDER BY deficit DESC
                     LIMIT %s
                     """,
-                    (rid, table_limit),
+                    (rid, *article_param, table_limit) if season_codes else (rid, table_limit),
                 )
                 critical_rows = _fetch_dict_rows(cur)
 
-                cur.execute(
-                    """
-                    WITH latest_cont AS (
-                        SELECT season_code
-                        FROM public.fact_order_source
-                        WHERE run_id = %s::uuid
-                          AND module = 'continuativa'
-                          AND season_code IS NOT NULL
-                        GROUP BY season_code
-                        ORDER BY season_code DESC
-                        LIMIT 1
-                    ),
-                    fos_current AS MATERIALIZED (
-                        SELECT article_code, season_code, venduto_periodo
-                        FROM public.fact_order_source
-                        WHERE run_id = %s::uuid AND module = 'current'
-                    ),
-                    global_factor AS (
-                        SELECT COALESCE(
-                            AVG(
-                                CASE
-                                    WHEN COALESCE(os.venduto_periodo, 0) > 0
-                                    THEN fo.totale_qty / NULLIF(os.venduto_periodo, 0)
-                                    ELSE NULL
-                                END
-                            ),
-                            1.0
-                        ) AS factor
-                        FROM public.fact_order_forecast fo
-                        JOIN fos_current os
-                          ON os.article_code = fo.article_code
-                         AND os.season_code = fo.season_code
-                        WHERE fo.run_id = %s::uuid
-                          AND fo.module = 'current'
-                          AND fo.mode = 'math'
-                    ),
-                    fos_current_cat AS MATERIALIZED (
-                        SELECT fo.article_code, fo.season_code, fo.totale_qty,
-                               os.venduto_periodo, os2.categoria, os2.tipologia
-                        FROM public.fact_order_forecast fo
-                        JOIN fos_current os
-                          ON os.article_code = fo.article_code
-                         AND os.season_code = fo.season_code
-                        LEFT JOIN public.fact_order_source os2
-                          ON os2.run_id = fo.run_id
-                         AND os2.module = fo.module
-                         AND os2.article_code = fo.article_code
-                         AND os2.season_code = fo.season_code
-                        WHERE fo.run_id = %s::uuid
-                          AND fo.module = 'current'
-                          AND fo.mode = 'math'
-                    ),
-                    factor_by_attr AS (
-                        SELECT
-                          categoria,
-                          tipologia,
-                          AVG(
-                              CASE
-                                  WHEN COALESCE(venduto_periodo, 0) > 0
-                                  THEN totale_qty / NULLIF(venduto_periodo, 0)
-                                  ELSE NULL
-                              END
-                          ) AS factor
-                        FROM fos_current_cat
-                        GROUP BY categoria, tipologia
-                    )
-                    SELECT
-                      c.season_code AS from_cont_season,
-                      c.article_code,
-                      c.fascia_prezzo,
-                      c.categoria,
-                      c.tipologia,
-                      c.marchio,
-                      c.colore,
-                      c.materiale,
-                      COALESCE(c.prezzo_vendita, c.prezzo_listino, 0) AS prezzo_vendita,
-                      COALESCE(c.venduto_periodo, 0) AS venduto_periodo,
-                      COALESCE(c.giacenza, 0) AS giacenza,
-                      COALESCE(c.prezzo_acquisto, 0) AS prezzo_acquisto,
-                      COALESCE(fa.factor, gf.factor, 1.0) AS applied_factor,
-                      GREATEST(0, ROUND(COALESCE(c.venduto_periodo, 0) * COALESCE(fa.factor, gf.factor, 1.0))) AS predicted_current_qty,
-                      ROUND(
-                          GREATEST(0, ROUND(COALESCE(c.venduto_periodo, 0) * COALESCE(fa.factor, gf.factor, 1.0)))
-                          - COALESCE(c.giacenza, 0),
-                          2
-                      ) AS delta_vs_stock,
-                      ROUND(
-                          GREATEST(0, ROUND(COALESCE(c.venduto_periodo, 0) * COALESCE(fa.factor, gf.factor, 1.0)))
-                          * COALESCE(c.prezzo_acquisto, 0),
-                          2
-                      ) AS predicted_budget,
-                      ROUND(COALESCE(c.venduto_periodo, 0) / NULLIF(COALESCE(c.giacenza, 0) + 1, 0), 4) AS transition_score
-                    FROM public.fact_order_source c
-                    JOIN latest_cont lc ON lc.season_code = c.season_code
-                    LEFT JOIN factor_by_attr fa
-                      ON fa.categoria IS NOT DISTINCT FROM c.categoria
-                     AND fa.tipologia IS NOT DISTINCT FROM c.tipologia
-                    CROSS JOIN global_factor gf
-                    WHERE c.run_id = %s::uuid
-                      AND c.module = 'continuativa'
-                    ORDER BY transition_score DESC, predicted_current_qty DESC, c.article_code ASC
-                    """,
-                    (rid, rid, rid, rid, rid),
-                )
-                next_current_all = _fetch_dict_rows(cur)
-                next_current_rows = next_current_all[:table_limit]
-
-                next_current_by_category_map: Dict[str, float] = {}
-                next_current_by_price_band_map: Dict[str, float] = {}
-                next_current_delta_positive_map: Dict[str, float] = {}
-                next_current_qty_total = 0.0
-                next_current_budget_total = 0.0
-                next_current_positive_count = 0
-                next_current_delta_positive_total = 0.0
-                for row in next_current_all:
-                    cat = str(row.get("categoria") or "n/a")
-                    price_band = str(row.get("fascia_prezzo") or "n/a")
-                    qty = float(row.get("predicted_current_qty") or 0.0)
-                    budget = float(row.get("predicted_budget") or 0.0)
-                    delta = float(row.get("delta_vs_stock") or 0.0)
-                    next_current_by_category_map[cat] = next_current_by_category_map.get(cat, 0.0) + qty
-                    next_current_by_price_band_map[price_band] = next_current_by_price_band_map.get(price_band, 0.0) + qty
-                    next_current_qty_total += qty
-                    next_current_budget_total += budget
-                    if delta > 0:
-                        next_current_positive_count += 1
-                        next_current_delta_positive_total += delta
-                        next_current_delta_positive_map[cat] = next_current_delta_positive_map.get(cat, 0.0) + delta
-
-                next_current_by_category = [
-                    {"label": k, "value": v}
-                    for k, v in sorted(next_current_by_category_map.items(), key=lambda kv: kv[1], reverse=True)[:12]
-                ]
-                next_current_by_price_band = [
-                    {"label": k, "value": v}
-                    for k, v in sorted(next_current_by_price_band_map.items(), key=lambda kv: _price_band_sort_key(kv[0]))
-                ]
-                next_current_delta_positive_by_category = [
-                    {"label": k, "value": v}
-                    for k, v in sorted(next_current_delta_positive_map.items(), key=lambda kv: kv[1], reverse=True)[:12]
-                ]
-
-                kpis["next_current_candidates"] = int(len(next_current_all))
-                kpis["next_current_qty_total"] = float(next_current_qty_total)
-                kpis["next_current_budget_total"] = float(next_current_budget_total)
-                kpis["next_current_positive_delta_count"] = int(next_current_positive_count)
-                kpis["next_current_delta_positive_total"] = float(next_current_delta_positive_total)
+                next_current_rows: List[Dict[str, Any]] = []
+                next_current_by_category: List[Dict[str, Any]] = []
+                next_current_by_price_band: List[Dict[str, Any]] = []
+                next_current_delta_positive_by_category: List[Dict[str, Any]] = []
+                kpis["next_current_candidates"] = 0
+                kpis["next_current_qty_total"] = 0.0
+                kpis["next_current_budget_total"] = 0.0
+                kpis["next_current_positive_delta_count"] = 0
+                kpis["next_current_delta_positive_total"] = 0.0
                 kpi_deltas = _build_kpi_deltas(kpis, baseline_kpis)
 
                 season_pair_trend = _compute_season_pair_trend(cur, run)

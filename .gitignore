@@ -5,10 +5,14 @@ __pycache__/
 incoming/
 input/orders/
 output/
+backups/
 config/backup/
 config/ui_settings.json
 
 postgres_data/
+db/*.backup
+db/*.dump
+db/*.sql.gz
 
 # Variabili d'ambiente locali (non committare)
 .env

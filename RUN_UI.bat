@@ -3,12 +3,12 @@ setlocal EnableExtensions DisableDelayedExpansion
 chcp 65001 >nul
 cd /d "%~dp0"
 
-set "DOCKER_CONTAINER=barca-control-center-db-1"
+set "DOCKER_CONTAINER=barca-postgres"
 set "BARCA_DB_HOST=127.0.0.1"
 set "BARCA_DB_PORT=5432"
 set "BARCA_DB_NAME=barca"
-set "BARCA_DB_USER=postgres"
-set "BARCA_DB_PASSWORD=postgres"
+set "BARCA_DB_USER=barca_user"
+set "BARCA_DB_PASSWORD=BARCA_Strong_Pass_2026"
 set "DOCKER_POSTGRES_DB="
 set "DOCKER_POSTGRES_USER="
 set "DOCKER_POSTGRES_PASSWORD="

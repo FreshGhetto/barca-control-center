@@ -1,7 +1,7 @@
 param(
     [string]$TaskName = "BARCA_DB_DailyBackup",
     [string]$RunAt = "02:30",
-    [string]$BackupRoot = "C:\BARCA\backups",
+    [string]$BackupRoot = "",
     [string]$DockerContainer = "barca-postgres",
     [string]$DbName = "barca",
     [string]$DbUser = "barca_user",
@@ -13,6 +13,10 @@ $ErrorActionPreference = "Stop"
 $scriptPath = Join-Path $PSScriptRoot "backup_barca.ps1"
 if (-not (Test-Path -Path $scriptPath -PathType Leaf)) {
     throw "Script backup non trovato: $scriptPath"
+}
+
+if (-not $BackupRoot) {
+    $BackupRoot = Join-Path (Split-Path -Parent $PSScriptRoot) "backups\db"
 }
 
 $taskCmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -BackupRoot `"$BackupRoot`" -DockerContainer `"$DockerContainer`" -DbName `"$DbName`" -DbUser `"$DbUser`" -RetentionDays $RetentionDays"

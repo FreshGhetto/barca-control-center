@@ -55,11 +55,12 @@
               <span class="dashboard-select-label">Aggiornamento</span>
               <select id="dashboardRunSelect"></select>
             </label>
+            <button id="dashboardRunActionBtn" class="btn secondary" type="button">Nessuna azione</button>
             <button id="dashboardSeasonFilterBtn" class="btn season-filter-btn" type="button" title="Filtra i dati per la coppia stagionale selezionata">📊 Tutte le stagioni</button>
             <button id="dashboardRefreshBtn" class="btn secondary" type="button">Aggiorna Dashboard</button>
           </div>
         </div>
-        <p id="dashboardSubtitle" class="muted">La dashboard carica di default la coppia stagionale con il run DB piu informativo; puoi cambiare coppia o aggiornamento in alto.</p>
+        <p id="dashboardSubtitle" class="muted">La dashboard carica di default la coppia stagionale piu recente e l'ultimo aggiornamento disponibile; puoi cambiare coppia o aggiornamento in alto.</p>
         <div id="dashboardRunContext" class="context-ribbon"></div>
         <p id="dashboardWarn" class="alert hidden">--</p>
         <div id="dashboardQuickFacts" class="quick-facts"></div>
@@ -358,35 +359,43 @@
       </section>
 
       <section class="panel view-panel" data-view="operations">
-        <h2>Nuovo Aggiornamento</h2>
-        <form id="runForm" class="form-grid">
-          <label><input type="checkbox" id="sourceDb" checked disabled /> Sorgente operativa DB-only</label>
-          <label><input type="checkbox" id="skipIngest" checked disabled /> Input file legacy disabilitati</label>
-          <label><input type="checkbox" id="ordersSourceDb" checked disabled /> Ordini letti dal database</label>
-          <label><input type="checkbox" id="skipOrders" /> Aggiorna solo giacenze e trasferimenti</label>
-          <label><input type="checkbox" id="syncDb" checked /> Aggiorna il database finale</label>
-          <label><input type="checkbox" id="createSchema" /> Applica o aggiorna la struttura tabelle</label>
-          <label><input type="checkbox" id="ordersMathOnly" /> Usa solo il metodo base per gli ordini</label>
-          <label class="inline-field">Copertura ordini
-            <input type="number" id="ordersCoverage" step="0.01" value="1.20" />
-          </label>
-          <label class="inline-field">Codice run dati vendita/stock
-            <input type="text" id="sourceDbRunId" placeholder="UUID opzionale" />
-          </label>
-          <label class="inline-field">Codice run ordini
-            <input type="text" id="ordersSourceDbRunId" placeholder="UUID opzionale" />
-          </label>
-          <label class="inline-field">Cartella file ingresso
-            <input type="text" id="incomingRoot" placeholder="non usata in modalita' DB-only" disabled />
-          </label>
-          <label class="inline-field">Cartella file ordini
-            <input type="text" id="ordersRoot" placeholder="non usata in modalita' DB-only" disabled />
-          </label>
-          <div class="form-actions">
-            <button type="submit" class="btn primary">Avvia aggiornamento</button>
-            <p id="runFormMsg" class="muted"></p>
-          </div>
-        </form>
+        <h2>Aggiorna Dati</h2>
+        <p class="muted">
+          Per uso normale non servono impostazioni tecniche. Scegli il tipo di aggiornamento e avvia.
+          Le opzioni avanzate restano in <strong>Modalita sviluppatore</strong>.
+        </p>
+        <div class="catalog-import-layout">
+          <article class="panel subpanel">
+            <div class="panel-head">
+              <h3>Aggiornamento completo</h3>
+            </div>
+            <p class="muted">
+              Ricalcola trasferimenti e ordini partendo dai dati piu recenti gia presenti nel database.
+              E' il flusso standard consigliato.
+            </p>
+            <div class="form-actions">
+              <button id="startFullRunBtn" type="button" class="btn primary">Avvia aggiornamento completo</button>
+            </div>
+          </article>
+          <article class="panel subpanel">
+            <div class="panel-head">
+              <h3>Solo trasferimenti</h3>
+            </div>
+            <p class="muted">
+              Aggiorna solo giacenze, criticita' e trasferimenti. Gli ordini restano invariati.
+            </p>
+            <div class="form-actions">
+              <button id="startTransfersOnlyRunBtn" type="button" class="btn secondary">Avvia solo trasferimenti</button>
+            </div>
+          </article>
+        </div>
+        <div class="reading-guide">
+          <strong>Ordine operativo consigliato:</strong>
+          <span>1. importa i dati nuovi nel database</span>
+          <span>2. avvia <code>Aggiornamento completo</code></span>
+          <span>3. controlla la stagione piu recente in dashboard</span>
+        </div>
+        <p id="runFormMsg" class="muted"></p>
       </section>
 
       <section class="panel view-panel" data-view="operations">
@@ -722,7 +731,39 @@
 
       <section id="developerPanel" class="panel developer-only hidden span-2 view-panel" data-view="dev">
         <h2>Debug Sviluppatore</h2>
-        <p class="muted">Visibile solo con modalita sviluppatore ON. Include comando di avvio e log raw.</p>
+        <p class="muted">Visibile solo con modalita sviluppatore ON. Include impostazioni avanzate, comando di avvio e log raw.</p>
+        <article class="panel subpanel">
+          <div class="panel-head">
+            <h3>Avvio Avanzato</h3>
+          </div>
+          <form id="runForm" class="form-grid">
+            <label><input type="checkbox" id="sourceDb" checked disabled /> Sorgente operativa DB-only</label>
+            <label><input type="checkbox" id="skipIngest" checked disabled /> Input file legacy disabilitati</label>
+            <label><input type="checkbox" id="ordersSourceDb" checked disabled /> Ordini letti dal database</label>
+            <label><input type="checkbox" id="skipOrders" /> Aggiorna solo giacenze e trasferimenti</label>
+            <label><input type="checkbox" id="syncDb" checked /> Aggiorna il database finale</label>
+            <label><input type="checkbox" id="createSchema" /> Applica o aggiorna la struttura tabelle</label>
+            <label><input type="checkbox" id="ordersMathOnly" /> Usa solo il metodo base per gli ordini</label>
+            <label class="inline-field">Copertura ordini
+              <input type="number" id="ordersCoverage" step="0.01" value="1.20" />
+            </label>
+            <label class="inline-field">Codice run dati vendita/stock
+              <input type="text" id="sourceDbRunId" placeholder="UUID opzionale" />
+            </label>
+            <label class="inline-field">Codice run ordini
+              <input type="text" id="ordersSourceDbRunId" placeholder="UUID opzionale" />
+            </label>
+            <label class="inline-field">Cartella file ingresso
+              <input type="text" id="incomingRoot" placeholder="non usata in modalita' DB-only" disabled />
+            </label>
+            <label class="inline-field">Cartella file ordini
+              <input type="text" id="ordersRoot" placeholder="non usata in modalita' DB-only" disabled />
+            </label>
+            <div class="form-actions">
+              <button type="submit" class="btn primary">Avvia aggiornamento avanzato</button>
+            </div>
+          </form>
+        </article>
         <div class="dev-grid">
           <div>
             <h3>Dettaglio Aggiornamento Selezionato</h3>

@@ -70,6 +70,8 @@ const el = {
   dbText: document.getElementById("dbText"),
   runForm: document.getElementById("runForm"),
   runFormMsg: document.getElementById("runFormMsg"),
+  startFullRunBtn: document.getElementById("startFullRunBtn"),
+  startTransfersOnlyRunBtn: document.getElementById("startTransfersOnlyRunBtn"),
   runsTableBody: document.getElementById("runsTableBody"),
   outputsTableBody: document.getElementById("outputsTableBody"),
   dbStatusBox: document.getElementById("dbStatusBox"),
@@ -96,6 +98,7 @@ const el = {
   viewTabs: Array.from(document.querySelectorAll(".view-tab[data-view-target]")),
   dashboardSeasonPairSelect: document.getElementById("dashboardSeasonPairSelect"),
   dashboardRunSelect: document.getElementById("dashboardRunSelect"),
+  dashboardRunActionBtn: document.getElementById("dashboardRunActionBtn"),
   dashboardSeasonFilterBtn: document.getElementById("dashboardSeasonFilterBtn"),
   dashboardRefreshBtn: document.getElementById("dashboardRefreshBtn"),
   dashboardSubtitle: document.getElementById("dashboardSubtitle"),
@@ -1083,12 +1086,11 @@ function dashboardRunSelectionScore(run) {
 }
 
 function compareDashboardRunsForSelection(a, b) {
-  // Preferisce sempre il run più recente (timestamp desc).
-  // Lo score entra solo come tiebreaker a parità di timestamp.
+  // La selezione deve riflettere il dato più recente.
+  // Lo score serve solo come tie-break quando i timestamp coincidono.
   const tsDiff = dashboardRunTimestamp(b) - dashboardRunTimestamp(a);
   if (tsDiff !== 0) return tsDiff;
-  const scoreDiff = dashboardRunSelectionScore(b) - dashboardRunSelectionScore(a);
-  return scoreDiff;
+  return dashboardRunSelectionScore(b) - dashboardRunSelectionScore(a);
 }
 
 function buildDashboardSeasonPairGroups(runs) {
@@ -1175,9 +1177,9 @@ function buildDashboardSeasonPairGroups(runs) {
 
   return groups.sort((a, b) => {
     if (a.hasPair !== b.hasPair) return a.hasPair ? -1 : 1;
-    if ((b.selectionScore || 0) !== (a.selectionScore || 0)) return (b.selectionScore || 0) - (a.selectionScore || 0);
-    if ((b.bestRunStartedAt || 0) !== (a.bestRunStartedAt || 0)) return (b.bestRunStartedAt || 0) - (a.bestRunStartedAt || 0);
     if (a.hasPair && b.hasPair && (b.yearNum || 0) !== (a.yearNum || 0)) return (b.yearNum || 0) - (a.yearNum || 0);
+    if ((b.bestRunStartedAt || 0) !== (a.bestRunStartedAt || 0)) return (b.bestRunStartedAt || 0) - (a.bestRunStartedAt || 0);
+    if ((b.selectionScore || 0) !== (a.selectionScore || 0)) return (b.selectionScore || 0) - (a.selectionScore || 0);
     if ((b.latestStartedAt || 0) !== (a.latestStartedAt || 0)) return (b.latestStartedAt || 0) - (a.latestStartedAt || 0);
     return String(a.label || "").localeCompare(String(b.label || ""), "it", { sensitivity: "base" });
   });
@@ -1236,6 +1238,7 @@ function syncDashboardPairAndRunSelection(options = {}) {
     state.dashboardRunId = state.dashboardRuns[0]?.run_id || null;
     renderDashboardSeasonPairSelect();
     renderDashboardRunSelectForPair(state.dashboardRuns);
+    renderDashboardRunActionButton();
     return;
   }
 
@@ -1259,6 +1262,7 @@ function syncDashboardPairAndRunSelection(options = {}) {
   renderDashboardSeasonPairSelect();
   renderDashboardRunSelectForPair(visibleRuns);
   renderDashboardSeasonFilterBtn();
+  renderDashboardRunActionButton();
 }
 
 function renderDashboardSeasonFilterBtn() {
@@ -2095,11 +2099,39 @@ function setDashboardTableSortIndicators(tableKey) {
   });
 }
 
+function latestTransferRunForSelectedPair(excludeRunId = null) {
+  const runs = dashboardRunsForSelectedPair();
+  return runs.find((run) => {
+    if (!run?.run_id || run.run_id === excludeRunId) return false;
+    return dashboardRunCount(run, "fact_transfer_suggestion") > 0;
+  }) || null;
+}
+
+function dashboardEmptyMessage(tableKey, data) {
+  if (tableKey === "transfer_proposals") {
+    if (data.total > 0) return "Nessun trasferimento per i filtri selezionati.";
+    const selectedRun = state.dashboardRuns.find((run) => run.run_id === state.dashboardRunId) || null;
+    const latestUsefulRun = latestTransferRunForSelectedPair(state.dashboardRunId);
+    if (latestUsefulRun) {
+      const when = fmtDateCompact(latestUsefulRun.started_at || latestUsefulRun.finished_at || latestUsefulRun.created_at);
+      const qty = dashboardRunCount(latestUsefulRun, "fact_transfer_suggestion");
+      return `Nessun trasferimento da fare nella run piu recente. Ultima run con trasferimenti: ${when} · ${fmtNum(qty, 0)} righe.`;
+    }
+    if (selectedRun) {
+      return "Nessun trasferimento da fare nella run piu recente selezionata.";
+    }
+  }
+  return "Nessun dato disponibile";
+}
+
 function renderDashboardTableByKey(tableKey) {
   const cfg = DASHBOARD_TABLE_CONFIG[tableKey];
   if (!cfg) return;
   const data = getDashboardTableRows(tableKey);
   renderDashboardTable(cfg.tbodyEl, data.rows, cfg.columns, cfg.numericColumns, tableKey);
+  if (cfg.tbodyEl && data.rows.length === 0) {
+    cfg.tbodyEl.innerHTML = `<tr class='empty-row'><td colspan='${cfg.columns.length}'>${escHtml(dashboardEmptyMessage(tableKey, data))}</td></tr>`;
+  }
   if (tableKey === "transfer_proposals" && cfg.tbodyEl) {
     cfg.tbodyEl.querySelectorAll("tr[data-article-code]").forEach((rowEl) => {
       rowEl.addEventListener("click", () => {
@@ -2521,6 +2553,126 @@ function dashboardRunLabel(run) {
   return parts.join(" · ");
 }
 
+function isRawDashboardRun(run) {
+  return String(run?.run_type || "").trim().toLowerCase() === "raw_input_sync";
+}
+
+function selectedDashboardRun() {
+  return state.dashboardRuns.find((run) => run.run_id === state.dashboardRunId) || null;
+}
+
+function linkedPipelineRun(rawRun) {
+  if (!rawRun?.run_id) return null;
+  const rawRunId = String(rawRun.run_id).trim();
+  return state.dashboardRuns.find((run) => {
+    const runType = String(run?.run_type || "").trim().toLowerCase();
+    if (runType !== "app_pipeline" && runType !== "app_pipeline_ui") return false;
+    const meta = run?.metadata || {};
+    return (
+      String(meta.source_sales_stock_run_id || "").trim() === rawRunId ||
+      String(meta.source_orders_run_id || "").trim() === rawRunId
+    );
+  }) || null;
+}
+
+function pipelinePayloadFromRawRun(rawRun) {
+  const rawRunId = String(rawRun?.run_id || "").trim();
+  return {
+    source_db: true,
+    source_db_run_id: rawRunId || null,
+    skip_ingest: true,
+    incoming_root: null,
+    keep_incoming: false,
+    skip_orders: false,
+    orders_root: null,
+    orders_source_db: true,
+    orders_source_db_run_id: rawRunId || null,
+    orders_math_only: false,
+    orders_coverage: 1.2,
+    sync_db: true,
+    db_create_schema: false,
+  };
+}
+
+function renderDashboardRunActionButton(run = selectedDashboardRun()) {
+  if (!el.dashboardRunActionBtn) return;
+  if (!run) {
+    el.dashboardRunActionBtn.disabled = true;
+    el.dashboardRunActionBtn.textContent = "Nessuna azione";
+    el.dashboardRunActionBtn.title = "Seleziona prima un aggiornamento";
+    return;
+  }
+  if (isRawDashboardRun(run)) {
+    const linkedRun = linkedPipelineRun(run);
+    if (linkedRun) {
+      el.dashboardRunActionBtn.disabled = false;
+      el.dashboardRunActionBtn.textContent = "Apri pipeline collegata";
+      el.dashboardRunActionBtn.title = `Apri la app_pipeline derivata da questa importazione raw (#${shortRunCode(linkedRun.run_id)})`;
+      return;
+    }
+    el.dashboardRunActionBtn.disabled = false;
+    el.dashboardRunActionBtn.textContent = "Avvia app_pipeline";
+    el.dashboardRunActionBtn.title = "Avvia la pipeline operativa usando questa importazione raw come sorgente DB";
+    return;
+  }
+  const sourceRawId = String(
+    run?.metadata?.source_sales_stock_run_id ||
+    run?.metadata?.source_orders_run_id ||
+    ""
+  ).trim();
+  if (sourceRawId) {
+    el.dashboardRunActionBtn.disabled = false;
+    el.dashboardRunActionBtn.textContent = "Apri import sorgente";
+    el.dashboardRunActionBtn.title = `Apri la raw_input_sync sorgente (#${sourceRawId.slice(0, 8)})`;
+    return;
+  }
+  el.dashboardRunActionBtn.disabled = true;
+  el.dashboardRunActionBtn.textContent = "Nessuna azione";
+  el.dashboardRunActionBtn.title = "Questa run non ha un collegamento operativo aggiuntivo";
+}
+
+async function handleDashboardRunAction() {
+  const run = selectedDashboardRun();
+  if (!run) return;
+  if (isRawDashboardRun(run)) {
+    const linkedRun = linkedPipelineRun(run);
+    if (linkedRun) {
+      state.dashboardRunId = linkedRun.run_id;
+      renderDashboardRunSelectForPair(dashboardRunsForSelectedPair());
+      renderDashboardRunActionButton(linkedRun);
+      await refreshDashboard();
+      return;
+    }
+    try {
+      setDashboardWarn("Avvio app_pipeline dalla raw_input_sync selezionata...");
+      const out = await api("/api/run", {
+        method: "POST",
+        body: JSON.stringify(pipelinePayloadFromRawRun(run)),
+      });
+      state.selectedRunId = out.run.run_id;
+      await refreshRuns();
+      await loadDashboardRuns({ forceLatestRun: true });
+      setDashboardWarn(`app_pipeline avviata da import raw: #${shortRunCode(out.run.run_id)}`);
+      return;
+    } catch (err) {
+      setDashboardWarn(`Avvio app_pipeline fallito: ${err.message}`);
+      return;
+    }
+  }
+  const sourceRawId = String(
+    run?.metadata?.source_sales_stock_run_id ||
+    run?.metadata?.source_orders_run_id ||
+    ""
+  ).trim();
+  if (!sourceRawId) return;
+  const rawRun = state.dashboardRuns.find((item) => item.run_id === sourceRawId) || null;
+  if (!rawRun) return;
+  state.dashboardRunId = rawRun.run_id;
+  renderDashboardRunSelectForPair(dashboardRunsForSelectedPair());
+  renderDashboardRunActionButton(rawRun);
+  await refreshDashboard();
+}
+
 async function api(url, options = {}) {
   const res = await fetch(url, {
     headers: { "Content-Type": "application/json" },
@@ -2652,8 +2804,14 @@ function pickBestDashboardSection(payload) {
 }
 
 function collectRunPayload() {
-  const val = (id) => document.getElementById(id).value.trim();
-  const chk = (id) => document.getElementById(id).checked;
+  const val = (id, fallback = "") => {
+    const node = document.getElementById(id);
+    return node ? String(node.value || "").trim() : fallback;
+  };
+  const chk = (id, fallback = false) => {
+    const node = document.getElementById(id);
+    return node ? !!node.checked : fallback;
+  };
   const skipOrders = chk("skipOrders");
   return {
     source_db: true,
@@ -2672,19 +2830,42 @@ function collectRunPayload() {
   };
 }
 
-async function startRun(evt) {
-  evt.preventDefault();
+function buildSimpleRunPayload(skipOrders = false) {
+  return {
+    source_db: true,
+    source_db_run_id: null,
+    skip_ingest: true,
+    incoming_root: null,
+    keep_incoming: false,
+    skip_orders: !!skipOrders,
+    orders_root: null,
+    orders_source_db: !skipOrders,
+    orders_source_db_run_id: null,
+    orders_math_only: false,
+    orders_coverage: 1.2,
+    sync_db: true,
+    db_create_schema: false,
+  };
+}
+
+async function launchRun(payload, successLabel = "Aggiornamento avviato") {
   el.runFormMsg.textContent = "Avvio aggiornamento...";
   try {
-    const payload = collectRunPayload();
     const out = await api("/api/run", { method: "POST", body: JSON.stringify(payload) });
     state.selectedRunId = out.run.run_id;
     state.runsOffset = 0;
-    el.runFormMsg.textContent = `Aggiornamento avviato: #${shortRunCode(out.run.run_id)}`;
+    el.runFormMsg.textContent = `${successLabel}: #${shortRunCode(out.run.run_id)}`;
     await refreshRuns();
+    return out;
   } catch (err) {
     el.runFormMsg.textContent = `Errore: ${err.message}`;
+    throw err;
   }
+}
+
+async function startRun(evt) {
+  evt.preventDefault();
+  await launchRun(collectRunPayload(), "Aggiornamento avanzato avviato");
 }
 
 async function toggleDeveloperMode() {
@@ -3655,6 +3836,7 @@ async function refreshDashboard() {
       if (el.dashboardSubtitle) {
         el.dashboardSubtitle.textContent = "Nessun aggiornamento caricabile per dashboard.";
       }
+      renderDashboardRunActionButton(null);
       return;
     }
 
@@ -3673,6 +3855,9 @@ async function refreshDashboard() {
       subtitleParts.push(`stato ${runStatus}`);
       subtitleParts.push(`inizio ${fmtDateCompact(out.run.started_at)}`);
       if (out.run.finished_at) subtitleParts.push(`fine ${fmtDateCompact(out.run.finished_at)}`);
+      if (isRawDashboardRun(out.run)) {
+        subtitleParts.push("run di importazione raw: i trasferimenti arrivano dopo una app_pipeline");
+      }
       if (out.baseline_run?.run_id) {
         const baseContext = runContextSummary(out.baseline_run, { includeMethods: false, fallbackDefault: false });
         subtitleParts.push(`confronto con ${baseContext || `#${shortRunCode(out.baseline_run.run_id)}`}`);
@@ -3695,10 +3880,12 @@ async function refreshDashboard() {
     renderBarChart(el.chartNextCurrentDeltaCategory, out.charts?.next_current_delta_positive_by_category || [], { unit: "pairs", digits: 2 });
     renderBarChart(el.chartNextCurrentPriceBand, out.charts?.next_current_by_price_band || [], { unit: "pairs", digits: 2 });
     renderAllDashboardTables();
+    renderDashboardRunActionButton(out.run);
     await ensureTransferArticleSelection();
   } catch (err) {
     setDashboardWarn(`Errore dashboard: ${err.message}`);
     renderTransferArticleEmpty(`Errore dettaglio articolo: ${err.message}`);
+    renderDashboardRunActionButton(selectedDashboardRun());
   } finally {
     state.dashboardRefreshing = false;
   }
@@ -3907,7 +4094,13 @@ function initEvents() {
   bindCatalogDropzone();
   el.refreshBtn.addEventListener("click", () => refreshAll(true));
   el.devModeBtn.addEventListener("click", toggleDeveloperMode);
-  el.runForm.addEventListener("submit", startRun);
+  el.runForm?.addEventListener("submit", startRun);
+  el.startFullRunBtn?.addEventListener("click", async () => {
+    await launchRun(buildSimpleRunPayload(false), "Aggiornamento completo avviato");
+  });
+  el.startTransfersOnlyRunBtn?.addEventListener("click", async () => {
+    await launchRun(buildSimpleRunPayload(true), "Aggiornamento solo trasferimenti avviato");
+  });
   el.catalogImportForm?.addEventListener("submit", startCatalogImport);
   el.catalogFiles?.addEventListener("change", handleCatalogFileSelection);
   el.catalogClearFilesBtn?.addEventListener("click", () => clearCatalogQueuedFiles({ clearMessage: true }));
@@ -4029,6 +4222,9 @@ function initEvents() {
     state.dashboardRunId = el.dashboardRunSelect?.value || null;
     state.dashboardSectionUserSelected = false;
     refreshDashboard();
+  });
+  el.dashboardRunActionBtn?.addEventListener("click", async () => {
+    await handleDashboardRunAction();
   });
   el.transferArticleLoadBtn?.addEventListener("click", () => {
     loadTransferArticleDetail();

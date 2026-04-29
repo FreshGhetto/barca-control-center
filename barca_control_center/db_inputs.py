@@ -136,14 +136,13 @@ def load_latest_clean_inputs_from_db(
             (run_id,),
         )
 
-        # Carica lo stock usando i dati più recenti per ogni articolo-negozio
-        # tra tutti i run completati degli ultimi 90 giorni.
-        # Questo garantisce che i reparti non presenti nell'ultimo run (es. SCARPE UOMO)
-        # vengano comunque inclusi se disponibili in run precedenti.
+        # In modalita' DB-first sales e stock devono provenire dallo stesso run sorgente.
+        # Mescolare stock da run diverse altera il perimetro reale della stagione e puo'
+        # generare trasferimenti non coerenti con i dati appena caricati.
         stock_df = _fetch_df(
             conn,
             """
-            SELECT DISTINCT ON (fs.article_code, fs.shop_code)
+            SELECT
               fs.snapshot_at,
               fs.article_code AS "Article",
               COALESCE(da.description, '') AS "Description",
@@ -159,14 +158,11 @@ def load_latest_clean_inputs_from_db(
             + """,
               fs.valore_giac AS "Valore_Giac"
             FROM fact_stock_snapshot fs
-            JOIN etl_run r ON r.run_id = fs.run_id
             LEFT JOIN dim_article da ON da.article_code = fs.article_code
-            WHERE r.status = 'completed'
-              AND COALESCE(r.finished_at, r.started_at) >= NOW() - INTERVAL '90 days'
-            ORDER BY fs.article_code, fs.shop_code,
-                     COALESCE(r.finished_at, r.started_at) DESC
+            WHERE fs.run_id = %s::uuid
+            ORDER BY fs.article_code, fs.shop_code
             """,
-            (),
+            (run_id,),
         )
         # Aggiungi log sui reparti caricati
         if verbose and not stock_df.empty and "Reparto" in stock_df.columns:

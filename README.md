@@ -200,9 +200,11 @@ Backup/restore automatico (Windows + Docker):
 
 ```powershell
 powershell -File .\ops\backup_barca.ps1
-powershell -File .\ops\restore_barca.ps1 -BackupFile "C:\BARCA\backups\2026-03-19\barca_barca_YYYYMMDD_HHMMSS.dump"
+powershell -File .\ops\restore_barca.ps1 -BackupFile ".\backups\db\2026-03-19\barca_barca_YYYYMMDD_HHMMSS.dump"
 powershell -File .\ops\install_daily_backup_task.ps1 -RunAt "02:30"
 ```
+
+Nota: i dump operativi vanno tenuti in `backups/db/` dentro il progetto. `db/` deve contenere solo schema, hardening e asset SQL versionati.
 
 ## Output principali
 - `suggested_transfers.csv` → trasferimenti consigliati aggregati per spedizione

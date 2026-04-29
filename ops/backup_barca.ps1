@@ -1,5 +1,5 @@
 param(
-    [string]$BackupRoot = "C:\BARCA\backups",
+    [string]$BackupRoot = "",
     [string]$DockerContainer = "barca-postgres",
     [string]$DbName = "barca",
     [string]$DbUser = "barca_user",
@@ -13,6 +13,10 @@ function Write-Log {
     param([string]$Message)
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     Write-Host "[$ts] $Message"
+}
+
+if (-not $BackupRoot) {
+    $BackupRoot = Join-Path (Split-Path -Parent $PSScriptRoot) "backups\db"
 }
 
 $dayFolder = Join-Path $BackupRoot (Get-Date -Format "yyyy-MM-dd")
