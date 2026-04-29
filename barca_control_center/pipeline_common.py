@@ -13,6 +13,11 @@ def newest_file(folder: Path, prefix: str) -> Path:
     return files[-1]
 
 
+def all_files(folder: Path, prefix: str) -> list:
+    """Restituisce tutti i CSV con il prefisso dato, ordinati per nome."""
+    return sorted(folder.glob(f"{prefix}_*.csv"))
+
+
 def load_valid_shop_codes(shops_cfg: Path):
     try:
         shops = pd.read_excel(shops_cfg, sheet_name=0)

@@ -16,6 +16,7 @@ except Exception:  # pragma: no cover
     openpyxl = None
 
 from .db_sync import run_db_sync
+from .excel_size_alignment import detect_size_data_shift
 from .pipeline_common import harmonize_clean_frames, load_valid_shop_codes
 from .reparto_sizes import SUPPORTED_SIZES, infer_reparto_from_path
 
@@ -188,9 +189,11 @@ def parse_shop_stock_report(path: Path, valid_codes: Optional[List[str]] = None)
             continue
 
         size_values = {size: 0.0 for size in SUPPORTED_SIZES}
+        size_shift = detect_size_data_shift(row, size_map, normalize=_clean_text)
         for idx, size in size_map.items():
-            if size in size_values and idx < len(row):
-                size_values[size] = _clean_non_negative(row[idx])
+            aligned_idx = idx + size_shift
+            if size in size_values and aligned_idx < len(row):
+                size_values[size] = _clean_non_negative(row[aligned_idx])
 
         record = {
             "Article": current_article,

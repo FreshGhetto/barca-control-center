@@ -8,5 +8,7 @@ output/
 config/backup/
 config/ui_settings.json
 
+postgres_data/
+
 # Variabili d'ambiente locali (non committare)
 .env

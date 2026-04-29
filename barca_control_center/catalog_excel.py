@@ -8,11 +8,70 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import pandas as pd
 from openpyxl import load_workbook
 
+from .excel_size_alignment import detect_size_data_shift
 
-EXCEL_PARSER_VERSION = "catalog_excel_v1"
+
+EXCEL_PARSER_VERSION = "catalog_excel_v2"
 _ARTICLE_RE = re.compile(r"^\s*[A-Za-z0-9]{1,4}\s*/\s*[A-Za-z0-9]{2,}\s*$")
-_SIZE_RE = re.compile(r"^\s*(\d{2})\s*$")
+# Matcha: "39", "39.0", "38.5", "4.5", "42 1/2", "XXS", "XS", "S", "M", "L", "XL", "XXL", ecc.
+# NOTA: la detection principale è in _parse_size_label() che è più permissiva
+_SIZE_RE = re.compile(r"^\s*(\d{1,3}(?:[.,]\d)?)\s*$")
 _INLINE_LABEL_CACHE: Dict[str, re.Pattern[str]] = {}
+
+
+def _parse_size_label(value: Any) -> Optional[str]:
+    """
+    Converte un valore di cella header in una label di taglia normalizzata.
+
+    - Interi:  39  → "39"
+    - Float:   39.0 → "39"  (interi-come-float),  38.5 → "38.5"
+    - Stringhe: "39", "39.0", "38,5", "38.5", "XS", "M", "42 1/2" → normalizzati
+    - None / stringa vuota → None  (colonna da saltare)
+    """
+    if value is None:
+        return None
+    # Se è un numero (int/float) converti prima
+    if isinstance(value, (int, float)):
+        if isinstance(value, float):
+            if value != value:  # NaN
+                return None
+            # float che è un intero (es. 39.0 → "39")
+            if value == int(value):
+                label = str(int(value))
+            else:
+                # mezze taglie (es. 38.5)
+                label = str(value).replace(",", ".")
+        else:
+            label = str(value)
+    else:
+        label = " ".join(str(value).replace("\xa0", " ").split()).strip()
+
+    if not label:
+        return None
+
+    # Normalizza separatore decimale
+    label_norm = label.replace(",", ".")
+
+    # Float-as-int in stringa: "39.0" → "39"
+    try:
+        f = float(label_norm)
+        if f == int(f) and int(f) > 0:
+            return str(int(f))
+        elif f > 0:
+            return label_norm  # mezza taglia: "38.5"
+    except (ValueError, TypeError):
+        pass
+
+    # Taglie alfanumeriche: XS, S, M, L, XL, XXL, UNICA, ...
+    upper = label.upper().strip()
+    if re.match(r"^(XXS|XS|S|M|L|XL|XXL|XXXL|UNICA|TU)$", upper):
+        return upper
+
+    # Qualsiasi altro formato numerico con slash (es. "42 1/2")
+    if re.match(r"^\d+\s*[/]\s*\d+$", label.strip()):
+        return re.sub(r"\s+", "", label.strip())
+
+    return None
 
 
 def ensure_xlsx(path: str | Path) -> Path:
@@ -152,11 +211,16 @@ def _find_table_header(row: List[Any]) -> Optional[Dict[str, int]]:
             perc_idx = idx
             break
 
-    size_cols: Dict[int, int] = {}
+    # Mappa {label_taglia: col_idx} — usa _parse_size_label per gestire
+    # interi, float (39.0→39, 38.5), alfanumerici (XS, M…).
+    # Le colonne con header vuoto vengono saltate automaticamente (returna None).
+    size_cols: Dict[str, int] = {}
     for idx, value in enumerate(row):
-        match = _SIZE_RE.match(_norm_str(value))
-        if match:
-            size_cols[int(match.group(1))] = idx
+        label = _parse_size_label(value)
+        if label is not None:
+            # Se la stessa taglia appare due volte, teniamo la prima occorrenza
+            if label not in size_cols:
+                size_cols[label] = idx
 
     return {
         "neg": neg_idx,
@@ -185,7 +249,7 @@ def parse_situazione_articoli_excel(
     tipologia = ""
 
     table = None
-    size_cols: Dict[int, int] = {}
+    size_cols: Dict[str, int] = {}  # {label_taglia: col_idx}
     cur_art = ""
     cur_descr = ""
     cur_colore = ""
@@ -200,12 +264,15 @@ def parse_situazione_articoli_excel(
         if not re.match(r"^[A-Z0-9]{1,4}$", neg_s):
             return
 
-        sizes: Dict[int, float] = {}
-        for size, idx in size_cols.items():
-            if idx >= len(row_values):
+        # Legge solo le taglie presenti nell'header, saltando le colonne vuote
+        sizes: Dict[str, float] = {}
+        size_shift = detect_size_data_shift(row_values, size_cols, normalize=_norm_str)
+        for size_label, idx in size_cols.items():
+            aligned_idx = idx + size_shift
+            if aligned_idx >= len(row_values):
                 continue
-            qty = _as_float(row_values[idx])
-            sizes[size] = qty
+            qty = _as_float(row_values[aligned_idx])
+            sizes[size_label] = qty
 
         out.append(
             {
@@ -228,10 +295,10 @@ def parse_situazione_articoli_excel(
                 "ven": _as_float(ven),
                 "perc_ven": _as_float(perc),
                 "sizes_present": 1 if size_cols else 0,
-                "sizes_json": json.dumps({str(k): v for k, v in sizes.items()}, ensure_ascii=False, sort_keys=True)
+                "sizes_json": json.dumps(sizes, ensure_ascii=False, sort_keys=True)
                 if size_cols
                 else "",
-                "synthetic_total": "",
+                "synthetic_total": 0,
             }
         )
 

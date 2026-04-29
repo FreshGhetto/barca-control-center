@@ -136,10 +136,14 @@ def load_latest_clean_inputs_from_db(
             (run_id,),
         )
 
+        # Carica lo stock usando i dati più recenti per ogni articolo-negozio
+        # tra tutti i run completati degli ultimi 90 giorni.
+        # Questo garantisce che i reparti non presenti nell'ultimo run (es. SCARPE UOMO)
+        # vengano comunque inclusi se disponibili in run precedenti.
         stock_df = _fetch_df(
             conn,
             """
-            SELECT
+            SELECT DISTINCT ON (fs.article_code, fs.shop_code)
               fs.snapshot_at,
               fs.article_code AS "Article",
               COALESCE(da.description, '') AS "Description",
@@ -151,17 +155,24 @@ def load_latest_clean_inputs_from_db(
               fs.venduto AS "Venduto",
               fs.sellout_percent AS "Sellout_Percent",
               """
-            + size_select_sql
-            + """
-              ,
+            + ",\n              ".join([f'fs.size_{size} AS "Size_{size}"' for size in SUPPORTED_SIZES])
+            + """,
               fs.valore_giac AS "Valore_Giac"
             FROM fact_stock_snapshot fs
+            JOIN etl_run r ON r.run_id = fs.run_id
             LEFT JOIN dim_article da ON da.article_code = fs.article_code
-            WHERE fs.run_id = %s::uuid
-            ORDER BY fs.article_code, fs.shop_code
+            WHERE r.status = 'completed'
+              AND COALESCE(r.finished_at, r.started_at) >= NOW() - INTERVAL '90 days'
+            ORDER BY fs.article_code, fs.shop_code,
+                     COALESCE(r.finished_at, r.started_at) DESC
             """,
-            (run_id,),
+            (),
         )
+        # Aggiungi log sui reparti caricati
+        if verbose and not stock_df.empty and "Reparto" in stock_df.columns:
+            reparti = stock_df["Reparto"].replace("", None).dropna().unique().tolist()
+            reparti_str = ", ".join(sorted(str(r) for r in reparti)) if reparti else "(nessuno)"
+            print(f"[DB-SOURCE] Stock reparti presenti: {reparti_str}")
 
     payload = {
         "source_run_id": run_id,

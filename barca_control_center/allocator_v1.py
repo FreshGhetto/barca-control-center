@@ -456,6 +456,63 @@ def duplicate_pairs_total(stock, article: str, shop: str) -> float:
     return float(sum(max(0.0, float(qty or 0.0) - 1.0) for qty in sizes.values()))
 
 
+def _find_excess_gap_receivers(
+    meta,
+    stock,
+    sales_signal,
+    signal_lookup,
+    article: str,
+    donor: str,
+    size: int,
+    shops_for_article: List[str],
+    *,
+    shop_total_stock: Optional[Dict] = None,
+    shop_capacity_target: Optional[Dict] = None,
+    donor_fascia_rank: int = 99,
+) -> List[Dict]:
+    """
+    Trova negozi di fascia *migliore* del donatore (rank più basso) che:
+    - hanno un buco sulla taglia ``size`` per ``article``
+    - hanno segnale vendite attivo
+    - hanno capacità disponibile
+
+    Usato nella fase di consolidamento per preferire negozi di fascia alta
+    rispetto all'invio diretto a M4.
+    Ordinati per fascia crescente (migliore prima), poi venduto decrescente.
+    """
+    candidates = []
+    for recv in shops_for_article:
+        if recv in EXCLUDE_SHOPS or recv in (WAREHOUSE, ONLINE, donor):
+            continue
+        fascia = meta.get(recv, {}).get("Fascia", np.nan)
+        if is_outlet(fascia):
+            continue
+        if role_for_shop(recv) != "STORE":
+            continue
+        recv_fascia_rank = fascia_rank_value(fascia)
+        # Solo negozi con fascia *migliore* (numero più basso) del donatore
+        if recv_fascia_rank >= donor_fascia_rank:
+            continue
+        local_sales_signal = local_sales_signal_for_shop(sales_signal, signal_lookup, article, recv)
+        if local_sales_signal <= 0.0:
+            continue  # solo negozi attivi
+        if float(stock.get((article, recv), {}).get(size, 0.0) or 0.0) >= 1.0:
+            continue  # taglia già coperta
+        if shop_total_stock is not None and shop_capacity_target is not None:
+            free = free_capacity(recv, shop_total_stock, shop_capacity_target)
+            if not np.isinf(free) and free < 1.0:
+                continue
+        candidates.append(
+            {
+                "shop": recv,
+                "fascia_rank": recv_fascia_rank,
+                "sales_signal": local_sales_signal,
+            }
+        )
+    candidates.sort(key=lambda x: (x["fascia_rank"], -x["sales_signal"], x["shop"]))
+    return candidates
+
+
 def prioritized_donors_for_size(
     meta,
     stock,
@@ -899,10 +956,41 @@ def run_allocation_frames(
     ops_in_used = {s: 0.0 for s in shop_total_stock.keys()}
     ops_out_used = {s: 0.0 for s in shop_total_stock.keys()}
 
+    # ── WAREHOUSE (M4) AUTO-INJECTION ─────────────────────────────────────────
+    # Se M4 non compare nella lista negozi (lista-negozi.xlsx), lo aggiungiamo
+    # come negozio virtuale con ruolo WAREHOUSE. In questo modo l'eccedenza di
+    # stock da negozi con zero vendite viene consolidata a M4 invece di finire
+    # all'ultimo outlet della lista (es. SD).
+    m4_was_auto_injected = WAREHOUSE not in meta
+    if m4_was_auto_injected:
+        meta[WAREHOUSE] = {
+            "Fascia": np.nan,
+            "Mq": np.nan,
+            "CapacityPairs": np.nan,
+            "CapacitySource": "auto_injected",
+            "CapacityStatus": np.nan,
+        }
+        shop_total_stock[WAREHOUSE] = shop_total_stock.get(WAREHOUSE, 0.0)
+        shop_capacity[WAREHOUSE] = np.nan
+        shop_capacity_target[WAREHOUSE] = float("inf")
+        ops_in_budget[WAREHOUSE] = float("inf")
+        ops_out_budget[WAREHOUSE] = float("inf")
+        ops_in_used[WAREHOUSE] = 0.0
+        ops_out_used[WAREHOUSE] = 0.0
+
     # Build list of (article,shop) present in stock
     article_to_shops = {}
     for (a, s) in stock.keys():
         article_to_shops.setdefault(a, set()).add(s)
+
+    # Aggiungi WAREHOUSE a tutti gli articoli come destinazione virtuale
+    # per la consolidazione dell'eccedenza.
+    for a in list(article_to_shops.keys()):
+        article_to_shops[a].add(WAREHOUSE)
+        key_m4 = (a, WAREHOUSE)
+        if key_m4 not in stock:
+            stock[key_m4] = {sz: 0.0 for sz in SIZES}
+            total[key_m4] = 0.0
 
     transfers = []
     capacity_blocks = 0
@@ -933,12 +1021,21 @@ def run_allocation_frames(
                 continue
             sig = signal_lookup.get((article, s), {})
             local_sales_signal = local_sales_signal_for_shop(sales_signal, signal_lookup, article, s)
+            missing_core_sizes = int(sig.get("MissingCoreSizes", 0) or 0)
+            # Un negozio è ricevitore se:
+            # (a) NotebookDestinationCandidate=True  → vendite + stock basso (≤ threshold), oppure
+            # (b) ha vendite attive E ha taglie core mancanti (anche se stock totale > threshold).
+            # Il fallback nel sig.get non viene mai raggiunto perché
+            # NotebookDestinationCandidate è sempre presente nel segnale: usiamo `or` esplicito.
             receiver_candidate = bool(
-                sig.get("NotebookDestinationCandidate", sig.get("ReceiverEligibleBySales", local_sales_signal > 0.0))
+                sig.get("NotebookDestinationCandidate", False)
+                or (
+                    sig.get("ReceiverEligibleBySales", local_sales_signal > 0.0)
+                    and missing_core_sizes > 0
+                )
             )
             if not receiver_candidate:
-                continue  # nessun segnale vendite → salta
-            missing_core_sizes = int(sig.get("MissingCoreSizes", 0) or 0)
+                continue  # nessun segnale vendite o nessuna taglia mancante → salta
             current_total = float(total.get((article, s), 0.0) or 0.0)
             fascia_rank_s = int(float(fascia)) if not pd.isna(fascia) else 99
             receivers.append(
@@ -1115,39 +1212,90 @@ def run_allocation_frames(
                     if not moved:
                         break
 
-        # ── OUTLET FALLBACK (solo duplicati non-core) ──────────────────────────
-        # Spostamento soft: solo pezzi in eccesso (qty > 1) di taglie NON core.
-        # NON si sposta l'intera linea in un solo negozio.
-        if outlet:
-            for s in list(shops_for_article):
-                if s in EXCLUDE_SHOPS or s in (WAREHOUSE, ONLINE):
-                    continue
-                fascia_s = meta.get(s, {}).get("Fascia", np.nan)
-                if is_outlet(fascia_s):
-                    continue
-                if not should_reallocate_broken_line(meta, sales_signal, signal_lookup, article, s):
-                    continue
-                req_sizes_s = required_run_sizes(
-                    fascia_s, reparto=article_reparto_value, available_sizes=article_sizes,
-                )
-                # Sposta solo i veri duplicati di taglie non-core verso l'outlet
-                for sz in article_sizes:
-                    if sz in req_sizes_s:
-                        continue  # proteggi le taglie core
+        # ── CONSOLIDAMENTO ECCEDENZA + REDISTRIBUZIONE FASCIA-ALTA ───────────────
+        # Per negozi con ZERO vendite sull'articolo e qty >= 2 su una taglia:
+        #
+        # 1. PRIMA OPZIONE — negozio di fascia migliore con buco
+        #    Sia per taglie CORE che NON-CORE: se esiste un negozio di fascia
+        #    migliore (rank inferiore) con vendite attive e un buco su quella
+        #    taglia, il paio in eccesso va lì invece che a M4.
+        #    → si lascia sempre almeno 1 paio al negozio donatore.
+        #
+        # 2. SECONDA OPZIONE — M4 (fallback, solo taglie NON-CORE)
+        #    Se nessun negozio di fascia migliore ha bisogno della taglia,
+        #    le taglie NON-CORE in eccesso vengono consolidate a M4.
+        #    Le taglie CORE restano al negozio (non vanno a M4).
+        #
+        # Questo evita il doppio giro del camion: invece di mandare a M4 e poi
+        # ri-spedire quando serve, distribuiamo direttamente dove c'è bisogno.
+        consolidation_target = WAREHOUSE if WAREHOUSE in meta else outlet
+        for s in list(shops_for_article):
+            if s in EXCLUDE_SHOPS or s in (WAREHOUSE, ONLINE):
+                continue
+            fascia_s = meta.get(s, {}).get("Fascia", np.nan)
+            if is_outlet(fascia_s):
+                continue
+            if not should_reallocate_broken_line(meta, sales_signal, signal_lookup, article, s):
+                continue
+            req_sizes_s = required_run_sizes(
+                fascia_s, reparto=article_reparto_value, available_sizes=article_sizes,
+            )
+            donor_fascia_rank_s = fascia_rank_value(fascia_s)
+
+            for sz in article_sizes:
+                if float(stock.get((article, s), {}).get(sz, 0.0) or 0.0) < 2.0:
+                    continue  # serve almeno un duplicato per cedere (si lascia 1)
+                is_core = sz in req_sizes_s
+
+                # Fase A: invia l'eccedenza a negozi di fascia migliore con buco
+                while stock.get((article, s), {}).get(sz, 0.0) >= 2.0:
+                    if not ops_budget_allows_move(s, ops_out_used, ops_out_budget):
+                        break
+                    gap_recvs = _find_excess_gap_receivers(
+                        meta, stock, sales_signal, signal_lookup,
+                        article, s, sz, shops_for_article,
+                        shop_total_stock=shop_total_stock,
+                        shop_capacity_target=shop_capacity_target,
+                        donor_fascia_rank=donor_fascia_rank_s,
+                    )
+                    moved = False
+                    for recv_info in gap_recvs:
+                        recv = recv_info["shop"]
+                        if ops_budget_allows_move(recv, ops_in_used, ops_in_budget):
+                            apply_transfer_move(
+                                stock, total, shop_total_stock,
+                                ops_out_used, ops_in_used, transfers,
+                                article, sz, s, recv,
+                                "Redistribuzione fascia-alta: eccesso a negozio con buco",
+                            )
+                            moved = True
+                            break
+                    if not moved:
+                        break  # nessun candidato disponibile → esci
+
+                # Fase B: eccedenza residua (solo taglie NON-CORE) → M4 come fallback
+                if not is_core and consolidation_target:
                     while (
-                        stock[(article, s)].get(sz, 0.0) >= 2.0  # solo se coppia doppia
-                        and free_capacity(outlet, shop_total_stock, shop_capacity_target) >= 1.0
+                        stock.get((article, s), {}).get(sz, 0.0) >= 2.0
+                        and free_capacity(consolidation_target, shop_total_stock, shop_capacity_target) >= 1.0
                         and ops_budget_allows_move(s, ops_out_used, ops_out_budget)
-                        and ops_budget_allows_move(outlet, ops_in_used, ops_in_budget)
+                        and ops_budget_allows_move(consolidation_target, ops_in_used, ops_in_budget)
                     ):
+                        reason = (
+                            "Consolidamento M4: non-core eccesso"
+                            if consolidation_target == WAREHOUSE
+                            else "Outlet: duplicato non-core"
+                        )
                         apply_transfer_move(
                             stock, total, shop_total_stock,
                             ops_out_used, ops_in_used, transfers,
-                            article, sz, s, outlet,
-                            "Outlet: duplicato non-core",
+                            article, sz, s, consolidation_target,
+                            reason,
                         )
-                if not ops_budget_allows_move(s, ops_out_used, ops_out_budget):
-                    ops_blocks += 1
+                # Taglie CORE residue (dopo fase A): restano al negozio, non a M4.
+
+            if not ops_budget_allows_move(s, ops_out_used, ops_out_budget):
+                ops_blocks += 1
 
     detailed_df = pd.DataFrame(transfers)
 
@@ -1177,6 +1325,9 @@ def run_allocation_frames(
     rows = []
     for (article, shop), sizes in stock.items():
         if shop in EXCLUDE_SHOPS:
+            continue
+        # Salta le righe M4 iniettate artificialmente senza stock reale
+        if m4_was_auto_injected and shop == WAREHOUSE and total.get((article, shop), 0.0) == 0.0:
             continue
         fascia = meta.get(shop, {}).get("Fascia", np.nan)
         cap = shop_capacity.get(shop, np.nan)

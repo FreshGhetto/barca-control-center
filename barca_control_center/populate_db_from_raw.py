@@ -11,7 +11,7 @@ from .db_sync import run_db_sync
 from .ingest_agent import ingest_incoming
 from .orders_pipeline import has_order_inputs, run_orders_pipeline
 from .parse_data_v2 import parse_articles, parse_sales
-from .pipeline_common import harmonize_clean_frames, load_valid_shop_codes, newest_file
+from .pipeline_common import harmonize_clean_frames, load_valid_shop_codes, newest_file, all_files
 
 
 def parse_args() -> argparse.Namespace:
@@ -137,11 +137,27 @@ def main():
         )
 
     sales_src = args.sales_file or newest_file(input_dir, "sales")
-    stock_src = args.stock_file or newest_file(input_dir, "stock")
+    stock_sources = [args.stock_file] if args.stock_file else all_files(input_dir, "stock")
+    if not stock_sources:
+        raise FileNotFoundError(f"Nessun file stock trovato in {input_dir}")
+
     print(f"[STEP 1/4] Parse sales da {sales_src}")
     sales_df = parse_sales(sales_src, clean_sales, valid_codes=valid_shop_codes, snapshot_at=snapshot_at)
-    print(f"[STEP 1/4] Parse stock da {stock_src}")
-    stock_df = parse_articles(stock_src, clean_stock, valid_codes=valid_shop_codes, snapshot_at=snapshot_at)
+
+    # Parsa tutti i file stock e unisce i DataFrame
+    stock_dfs = []
+    for stock_src in stock_sources:
+        print(f"[STEP 1/4] Parse stock da {stock_src}")
+        tmp_out = clean_stock.with_suffix(f'.tmp_{stock_src.stem}.csv')
+        sdf = parse_articles(str(stock_src), str(tmp_out), valid_codes=valid_shop_codes, snapshot_at=snapshot_at)
+        if not sdf.empty:
+            stock_dfs.append(sdf)
+    if stock_dfs:
+        stock_df = pd.concat(stock_dfs, ignore_index=True)
+        if 'Article' in stock_df.columns and 'Shop' in stock_df.columns:
+            stock_df = stock_df.drop_duplicates(subset=['Article', 'Shop'], keep='last')
+    else:
+        stock_df = pd.DataFrame()
 
     sales_df, stock_df, align_report = harmonize_clean_frames(sales_df, stock_df)
     sales_df.to_csv(clean_sales, index=False)

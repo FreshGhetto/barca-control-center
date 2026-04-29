@@ -41,7 +41,16 @@ def _extract_report_date(text: str) -> Optional[dt.date]:
 
 def _extract_season_code(text: str, filename: str) -> Optional[str]:
     t = text.upper()
+    # Pattern normale: "STAGIONE: 26E" o "STAGIONE 26E"
     m = re.search(r"STAGIONE[:\s]*([0-9]{2}[A-Z])", t)
+    if m:
+        return m.group(1).lower()
+    # Pattern XLS: "STAGIONE  DA:,26E" (con virgola tra label e valore)
+    m = re.search(r"STAGIONE\s+DA\s*:?[,\s]+([0-9]{2}[A-Z])\b", t)
+    if m:
+        return m.group(1).lower()
+    # Pattern da nome file: "26e_sd_1" oppure "26e_excel" oppure "26e_saldo"
+    m = re.search(r"([0-9]{2}[a-zA-Z])_", filename, flags=re.IGNORECASE)
     if m:
         return m.group(1).lower()
     m = re.search(r"([0-9]{2}[a-zA-Z])_sd_[1-4]", filename, flags=re.IGNORECASE)
@@ -149,8 +158,12 @@ def _convert_to_csv(src: Path, dst: Path):
 def _target_path(root: Path, kind: str, report_date: Optional[dt.date], season_code: Optional[str]) -> Optional[Path]:
     month_tag = (report_date or dt.date.today()).strftime("%Y-%m")
     if kind == "sales_report":
+        if season_code:
+            return root / "input" / f"sales_{season_code}_{month_tag}.csv"
         return root / "input" / f"sales_{month_tag}.csv"
     if kind == "stock_report":
+        if season_code:
+            return root / "input" / f"stock_{season_code}_{month_tag}.csv"
         return root / "input" / f"stock_{month_tag}.csv"
 
     if kind.startswith("orders_"):

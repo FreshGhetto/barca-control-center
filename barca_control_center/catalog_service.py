@@ -478,7 +478,13 @@ def _build_size_rows(catalog_df: pd.DataFrame) -> list[Tuple[str, str, str, int,
             continue
         for key, value in (data or {}).items():
             try:
-                size = int(key)
+                # Supporta "39", "39.0", "38.5" → int (38.5 → 39 arrotondato non corretto,
+                # quindi convertiamo solo se la chiave rappresenta un intero esatto)
+                f_key = float(key)
+                if f_key != int(f_key):
+                    # mezza taglia (es. 38.5): skippata perché la colonna DB è INTEGER
+                    continue
+                size = int(f_key)
                 qty = float(value)
             except Exception:
                 continue

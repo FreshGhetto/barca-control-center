@@ -76,6 +76,9 @@ OUTPUT_FILES = [
 DASHBOARD_TABLE_COLUMNS: Dict[str, List[str]] = {
     "transfer_proposals": [
         "article_code",
+        "reparto",
+        "categoria",
+        "marchio",
         "size",
         "from_shop_code",
         "from_observed_sales_signal",
@@ -2482,23 +2485,23 @@ def _dashboard_article_detail_payload_from_db(
                         SELECT from_shop_code AS shop_code
                         FROM public.fact_transfer_suggestion
                         WHERE run_id = %s::uuid
-                          AND article_code = %s
+                          AND UPPER(article_code) = UPPER(%s)
                         UNION
                         SELECT to_shop_code AS shop_code
                         FROM public.fact_transfer_suggestion
                         WHERE run_id = %s::uuid
-                          AND article_code = %s
+                          AND UPPER(article_code) = UPPER(%s)
                     ),
                     shops AS (
                         SELECT shop_code
                         FROM public.fact_stock_snapshot
                         WHERE run_id = %s::uuid
-                          AND article_code = %s
+                          AND UPPER(article_code) = UPPER(%s)
                         UNION
                         SELECT shop_code
                         FROM public.fact_feature_state
                         WHERE run_id = %s::uuid
-                          AND article_code = %s
+                          AND UPPER(article_code) = UPPER(%s)
                         UNION
                         SELECT shop_code FROM transfer_shops
                     )
@@ -2520,11 +2523,11 @@ def _dashboard_article_detail_payload_from_db(
                     FROM shops s
                     LEFT JOIN public.fact_stock_snapshot fs
                       ON fs.run_id = %s::uuid
-                     AND fs.article_code = %s
+                     AND UPPER(fs.article_code) = UPPER(%s)
                      AND fs.shop_code = s.shop_code
                     LEFT JOIN public.fact_feature_state ff
                       ON ff.run_id = %s::uuid
-                     AND ff.article_code = %s
+                     AND UPPER(ff.article_code) = UPPER(%s)
                      AND ff.shop_code = s.shop_code
                     LEFT JOIN public.dim_shop ds
                       ON ds.shop_code = s.shop_code
@@ -2545,7 +2548,7 @@ def _dashboard_article_detail_payload_from_db(
                       t.qty
                     FROM public.fact_transfer_suggestion t
                     WHERE t.run_id = %s::uuid
-                      AND t.article_code = %s
+                      AND UPPER(t.article_code) = UPPER(%s)
                     ORDER BY t.size ASC, t.from_shop_code ASC, t.to_shop_code ASC, t.reason ASC
                     """,
                     (rid, article),
@@ -2553,11 +2556,116 @@ def _dashboard_article_detail_payload_from_db(
                 movement_rows = _fetch_dict_rows(cur)
 
         if not shop_rows_raw and not movement_rows:
+            # Fallback: cerca il run più recente che ha dati per questo articolo
+            # (utile se l'articolo era in un run precedente ma non nell'ultimo).
+            cur.execute(
+                """
+                SELECT r.run_id
+                FROM public.etl_run r
+                WHERE r.run_id <> %s::uuid
+                  AND (
+                    EXISTS (
+                        SELECT 1 FROM public.fact_stock_snapshot fs
+                        WHERE fs.run_id = r.run_id
+                          AND UPPER(fs.article_code) = UPPER(%s)
+                        LIMIT 1
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM public.fact_feature_state ff
+                        WHERE ff.run_id = r.run_id
+                          AND UPPER(ff.article_code) = UPPER(%s)
+                        LIMIT 1
+                    )
+                  )
+                ORDER BY COALESCE(r.finished_at, r.started_at) DESC
+                LIMIT 1
+                """,
+                (rid, article, article),
+            )
+            fallback_row = cur.fetchone()
+            if fallback_row:
+                rid = str(fallback_row[0])
+                # Ripeti le query principali con il run_id di fallback
+                cur.execute(
+                    """
+                    WITH transfer_shops AS (
+                        SELECT from_shop_code AS shop_code
+                        FROM public.fact_transfer_suggestion
+                        WHERE run_id = %s::uuid AND article_code = %s
+                        UNION
+                        SELECT to_shop_code AS shop_code
+                        FROM public.fact_transfer_suggestion
+                        WHERE run_id = %s::uuid AND article_code = %s
+                    ),
+                    shops AS (
+                        SELECT shop_code FROM public.fact_stock_snapshot
+                        WHERE run_id = %s::uuid AND UPPER(article_code) = UPPER(%s)
+                        UNION
+                        SELECT shop_code FROM public.fact_feature_state
+                        WHERE run_id = %s::uuid AND UPPER(article_code) = UPPER(%s)
+                        UNION
+                        SELECT shop_code FROM transfer_shops
+                    )
+                    SELECT
+                      s.shop_code,
+                      COALESCE(ff.fascia, ds.fascia) AS fascia,
+                      COALESCE(ff.role, CASE WHEN s.shop_code = 'WEB' THEN 'ONLINE' WHEN s.shop_code = 'M4' THEN 'WAREHOUSE' ELSE 'STORE' END) AS role,
+                      COALESCE(ff.is_outlet, FALSE) AS is_outlet,
+                      COALESCE(ff.observed_sales_signal, 0) AS observed_sales_signal,
+                      COALESCE(ff.missing_core_sizes, 0) AS missing_core_sizes,
+                      COALESCE(ff.destination_priority_score, 0) AS destination_priority_score,
+                      COALESCE(ff.source_priority_score, 0) AS source_priority_score,
+                      COALESCE(ff.demand_hybrid, 0) AS demand_hybrid,
+                      COALESCE(fs.giacenza, 0) AS before_total,
+                      COALESCE(ff.stock_after, fs.giacenza, 0) AS after_total,
+                      """
+                    + size_select_sql
+                    + """
+                    FROM shops s
+                    LEFT JOIN public.fact_stock_snapshot fs
+                      ON fs.run_id = %s::uuid AND UPPER(fs.article_code) = UPPER(%s) AND fs.shop_code = s.shop_code
+                    LEFT JOIN public.fact_feature_state ff
+                      ON ff.run_id = %s::uuid AND UPPER(ff.article_code) = UPPER(%s) AND ff.shop_code = s.shop_code
+                    LEFT JOIN public.dim_shop ds ON ds.shop_code = s.shop_code
+                    ORDER BY COALESCE(ff.fascia, ds.fascia, 99), s.shop_code
+                    """,
+                    (rid, article, rid, article, rid, article, rid, article, rid, article, rid, article),
+                )
+                shop_rows_raw = _fetch_dict_rows(cur)
+                cur.execute(
+                    """
+                    SELECT t.article_code, t.size, t.from_shop_code, t.to_shop_code,
+                           COALESCE(t.reason, '') AS reason, t.qty
+                    FROM public.fact_transfer_suggestion t
+                    WHERE t.run_id = %s::uuid AND UPPER(t.article_code) = UPPER(%s)
+                    ORDER BY t.size ASC, t.from_shop_code ASC, t.to_shop_code ASC
+                    """,
+                    (rid, article),
+                )
+                movement_rows = _fetch_dict_rows(cur)
+                # Aggiorna il run mostrato con quello di fallback
+                cur.execute(
+                    "SELECT run_id, run_type, status, started_at, finished_at, metadata FROM public.etl_run WHERE run_id = %s::uuid LIMIT 1",
+                    (rid,),
+                )
+                fb_run_row = cur.fetchone()
+                if fb_run_row:
+                    run = {
+                        "run_id": str(fb_run_row[0]),
+                        "run_type": fb_run_row[1],
+                        "status": fb_run_row[2],
+                        "started_at": fb_run_row[3].isoformat() if fb_run_row[3] else None,
+                        "finished_at": fb_run_row[4].isoformat() if fb_run_row[4] else None,
+                        "metadata": fb_run_row[5] if isinstance(fb_run_row[5], dict) else {},
+                        "_fallback": True,
+                    }
+
+        if not shop_rows_raw and not movement_rows:
             return {
                 "connected": True,
                 "run": run,
                 "article": None,
-                "reason": f"Nessun dato per articolo {article}",
+                "reason": f"Nessun dato per articolo '{article}' in nessun run disponibile.",
             }
 
         inbound_by_shop_size: Dict[tuple[str, int], float] = {}
@@ -2859,21 +2967,25 @@ def _dashboard_summary_payload(dsn: str, run_id: Optional[str], table_limit: int
                 )
                 orders_by_mode = _fetch_chart_rows(cur)
 
+                # CTE materializzata per evitare nested loop 2209×14176
                 cur.execute(
                     f"""
+                    WITH fos AS MATERIALIZED (
+                      SELECT module, article_code, season_code, fascia_prezzo
+                      FROM public.fact_order_source WHERE run_id = %s::uuid
+                    )
                     SELECT
                       COALESCE(NULLIF(os.fascia_prezzo, ''), 'n/a') AS label,
                       SUM(COALESCE(fo.totale_qty, 0)) AS value
                     FROM public.fact_order_forecast fo
-                    LEFT JOIN public.fact_order_source os
-                      ON os.run_id = fo.run_id
-                     AND os.module = fo.module
+                    LEFT JOIN fos os
+                      ON os.module = fo.module
                      AND os.article_code = fo.article_code
-                     AND os.season_code IS NOT DISTINCT FROM fo.season_code
-                     WHERE fo.run_id = %s::uuid {sc_filter_fo}
-                     GROUP BY COALESCE(NULLIF(os.fascia_prezzo, ''), 'n/a')
+                     AND os.season_code = fo.season_code
+                    WHERE fo.run_id = %s::uuid {sc_filter_fo}
+                    GROUP BY COALESCE(NULLIF(os.fascia_prezzo, ''), 'n/a')
                     """,
-                    (rid, *sc_param),
+                    (rid, rid, *sc_param),
                 )
                 orders_by_price_band = sorted(_fetch_chart_rows(cur), key=lambda row: _price_band_sort_key(row.get("label")))
 
@@ -2895,10 +3007,26 @@ def _dashboard_summary_payload(dsn: str, run_id: Optional[str], table_limit: int
                 )
                 critical_by_shop = _fetch_chart_rows(cur)
 
+                # Usa CTE per applicare LIMIT prima dei JOIN pesanti su fact_feature_state.
+                # Il LIMIT è volutamente alto (50000) per garantire che tutti i trasferimenti
+                # siano visibili nel frontend, indipendentemente da table_limit (che riguarda
+                # altre tabelle). Ridurre questo valore taglierebbe articoli con qty bassa.
+                _TRANSFER_ROW_LIMIT = 50000
                 cur.execute(
                     """
+                    WITH top_t AS (
+                      SELECT article_code, size, from_shop_code, to_shop_code,
+                             COALESCE(reason, '') AS reason, qty
+                      FROM public.fact_transfer_suggestion
+                      WHERE run_id = %s::uuid
+                      ORDER BY qty DESC, article_code ASC
+                      LIMIT %s
+                    )
                     SELECT
                       t.article_code,
+                      COALESCE(da.reparto, '') AS reparto,
+                      COALESCE(da.categoria, '') AS categoria,
+                      COALESCE(da.marchio, '') AS marchio,
                       t.size,
                       t.from_shop_code,
                       ff.observed_sales_signal AS from_observed_sales_signal,
@@ -2907,27 +3035,32 @@ def _dashboard_summary_payload(dsn: str, run_id: Optional[str], table_limit: int
                       tf.observed_sales_signal AS to_observed_sales_signal,
                       tf.missing_core_sizes AS to_missing_core_sizes,
                       tf.destination_priority_score AS to_destination_priority_score,
-                      COALESCE(t.reason, '') AS reason,
+                      t.reason,
                       t.qty
-                    FROM public.fact_transfer_suggestion t
+                    FROM top_t t
+                    LEFT JOIN public.dim_article da
+                      ON da.article_code = t.article_code
                     LEFT JOIN public.fact_feature_state ff
-                      ON ff.run_id = t.run_id
+                      ON ff.run_id = %s::uuid
                      AND ff.article_code = t.article_code
                      AND ff.shop_code = t.from_shop_code
                     LEFT JOIN public.fact_feature_state tf
-                      ON tf.run_id = t.run_id
+                      ON tf.run_id = %s::uuid
                      AND tf.article_code = t.article_code
                      AND tf.shop_code = t.to_shop_code
-                    WHERE t.run_id = %s::uuid
-                    ORDER BY qty DESC, article_code ASC
-                    LIMIT %s
+                    ORDER BY t.qty DESC, t.article_code ASC
                     """,
-                    (rid, table_limit),
+                    (rid, _TRANSFER_ROW_LIMIT, rid, rid),
                 )
                 transfer_rows = _fetch_dict_rows(cur)
 
                 cur.execute(
                     f"""
+                    WITH fos AS MATERIALIZED (
+                      SELECT module, article_code, season_code,
+                             fascia_prezzo, prezzo_listino, prezzo_vendita
+                      FROM public.fact_order_source WHERE run_id = %s::uuid
+                    )
                     SELECT
                       fo.module,
                       fo.season_code,
@@ -2940,16 +3073,15 @@ def _dashboard_summary_payload(dsn: str, run_id: Optional[str], table_limit: int
                       fo.predizione_vendite,
                       fo.budget_acquisto
                     FROM public.fact_order_forecast fo
-                    LEFT JOIN public.fact_order_source os
-                      ON os.run_id = fo.run_id
-                     AND os.module = fo.module
+                    LEFT JOIN fos os
+                      ON os.module = fo.module
                      AND os.article_code = fo.article_code
-                     AND os.season_code IS NOT DISTINCT FROM fo.season_code
-                     WHERE fo.run_id = %s::uuid {sc_filter_fo}
-                     ORDER BY totale_qty DESC NULLS LAST, article_code ASC
+                     AND os.season_code = fo.season_code
+                    WHERE fo.run_id = %s::uuid {sc_filter_fo}
+                    ORDER BY totale_qty DESC NULLS LAST, article_code ASC
                     LIMIT %s
                     """,
-                    (rid, *sc_param, table_limit),
+                    (rid, rid, *sc_param, table_limit),
                 )
                 order_rows = _fetch_dict_rows(cur)
 
@@ -2985,6 +3117,11 @@ def _dashboard_summary_payload(dsn: str, run_id: Optional[str], table_limit: int
                         ORDER BY season_code DESC
                         LIMIT 1
                     ),
+                    fos_current AS MATERIALIZED (
+                        SELECT article_code, season_code, venduto_periodo
+                        FROM public.fact_order_source
+                        WHERE run_id = %s::uuid AND module = 'current'
+                    ),
                     global_factor AS (
                         SELECT COALESCE(
                             AVG(
@@ -2997,36 +3134,42 @@ def _dashboard_summary_payload(dsn: str, run_id: Optional[str], table_limit: int
                             1.0
                         ) AS factor
                         FROM public.fact_order_forecast fo
-                        JOIN public.fact_order_source os
-                          ON os.run_id = fo.run_id
-                         AND os.module = 'current'
-                         AND os.article_code = fo.article_code
-                         AND os.season_code IS NOT DISTINCT FROM fo.season_code
+                        JOIN fos_current os
+                          ON os.article_code = fo.article_code
+                         AND os.season_code = fo.season_code
+                        WHERE fo.run_id = %s::uuid
+                          AND fo.module = 'current'
+                          AND fo.mode = 'math'
+                    ),
+                    fos_current_cat AS MATERIALIZED (
+                        SELECT fo.article_code, fo.season_code, fo.totale_qty,
+                               os.venduto_periodo, os2.categoria, os2.tipologia
+                        FROM public.fact_order_forecast fo
+                        JOIN fos_current os
+                          ON os.article_code = fo.article_code
+                         AND os.season_code = fo.season_code
+                        LEFT JOIN public.fact_order_source os2
+                          ON os2.run_id = fo.run_id
+                         AND os2.module = fo.module
+                         AND os2.article_code = fo.article_code
+                         AND os2.season_code = fo.season_code
                         WHERE fo.run_id = %s::uuid
                           AND fo.module = 'current'
                           AND fo.mode = 'math'
                     ),
                     factor_by_attr AS (
                         SELECT
-                          os.categoria,
-                          os.tipologia,
+                          categoria,
+                          tipologia,
                           AVG(
                               CASE
-                                  WHEN COALESCE(os.venduto_periodo, 0) > 0
-                                  THEN fo.totale_qty / NULLIF(os.venduto_periodo, 0)
+                                  WHEN COALESCE(venduto_periodo, 0) > 0
+                                  THEN totale_qty / NULLIF(venduto_periodo, 0)
                                   ELSE NULL
                               END
                           ) AS factor
-                        FROM public.fact_order_forecast fo
-                        JOIN public.fact_order_source os
-                          ON os.run_id = fo.run_id
-                         AND os.module = 'current'
-                         AND os.article_code = fo.article_code
-                         AND os.season_code IS NOT DISTINCT FROM fo.season_code
-                        WHERE fo.run_id = %s::uuid
-                          AND fo.module = 'current'
-                          AND fo.mode = 'math'
-                        GROUP BY os.categoria, os.tipologia
+                        FROM fos_current_cat
+                        GROUP BY categoria, tipologia
                     )
                     SELECT
                       c.season_code AS from_cont_season,
@@ -3064,7 +3207,7 @@ def _dashboard_summary_payload(dsn: str, run_id: Optional[str], table_limit: int
                       AND c.module = 'continuativa'
                     ORDER BY transition_score DESC, predicted_current_qty DESC, c.article_code ASC
                     """,
-                    (rid, rid, rid, rid),
+                    (rid, rid, rid, rid, rid),
                 )
                 next_current_all = _fetch_dict_rows(cur)
                 next_current_rows = next_current_all[:table_limit]

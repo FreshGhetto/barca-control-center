@@ -1,0 +1,21 @@
+services:
+  db:
+    image: postgres:16
+    container_name: barca-db
+    restart: always
+    environment:
+      - POSTGRES_DB=barca
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      # Schema SQL applicato all'init (solo su DB vuoto, ignorato se postgres_data esiste già)
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
+      - ./db/hardening_v1.sql:/docker-entrypoint-initdb.d/02_hardening_v1.sql
+      - ./db/hardening_v2.sql:/docker-entrypoint-initdb.d/03_hardening_v2.sql
+      # Crea una cartella locale per non perdere i dati ogni volta che spegni
+      - ./postgres_data:/var/lib/postgresql/data
+
+  # Se hai un'applicazione da avviare, di solito qui ci sarebbe il servizio 'app'
+  # Per ora concentriamoci sul far partire il DB

@@ -53,7 +53,7 @@ const state = {
     offset: 0,
   },
   dashboardTableState: {
-    transfer_proposals: { sortKey: "qty", sortDir: "desc", search: "", rowLimit: 20, showAll: false },
+    transfer_proposals: { sortKey: "qty", sortDir: "desc", search: "", rowLimit: 20, showAll: false, repartoFilter: "", categoriaFilter: "", marchioFilter: "" },
     order_proposals: { sortKey: "totale_qty", sortDir: "desc", search: "", rowLimit: 20, showAll: false },
     critical_articles: { sortKey: "deficit", sortDir: "desc", search: "", rowLimit: 20, showAll: false },
     next_current_candidates: { sortKey: "transition_score", sortDir: "desc", search: "", rowLimit: 20, showAll: false },
@@ -132,6 +132,9 @@ const el = {
   criticalTableBody: document.getElementById("criticalTableBody"),
   nextCurrentTableBody: document.getElementById("nextCurrentTableBody"),
   transferTableSearch: document.getElementById("transferTableSearch"),
+  transferRepartoFilter: document.getElementById("transferRepartoFilter"),
+  transferCategoriaFilter: document.getElementById("transferCategoriaFilter"),
+  transferMarchioFilter: document.getElementById("transferMarchioFilter"),
   ordersTableSearch: document.getElementById("ordersTableSearch"),
   criticalTableSearch: document.getElementById("criticalTableSearch"),
   nextCurrentTableSearch: document.getElementById("nextCurrentTableSearch"),
@@ -2053,6 +2056,15 @@ function getDashboardTableRows(tableKey) {
   if (searchNorm) {
     filtered = raw.filter((row) => cfg.columns.some((k) => normalizeText(row[k]).includes(searchNorm)));
   }
+  // Filtri extra per transfer_proposals: reparto, categoria, marchio
+  if (tableKey === "transfer_proposals") {
+    const repartoF = normalizeText(tState.repartoFilter || "").trim();
+    const categoriaF = normalizeText(tState.categoriaFilter || "").trim();
+    const marchioF = normalizeText(tState.marchioFilter || "").trim();
+    if (repartoF) filtered = filtered.filter((row) => normalizeText(row.reparto).includes(repartoF));
+    if (categoriaF) filtered = filtered.filter((row) => normalizeText(row.categoria).includes(categoriaF));
+    if (marchioF) filtered = filtered.filter((row) => normalizeText(row.marchio).includes(marchioF));
+  }
   const sorted = [...filtered];
   const sortKey = tState.sortKey;
   const numeric = cfg.numericColumns.includes(sortKey);
@@ -2114,6 +2126,41 @@ function renderDashboardTableByKey(tableKey) {
 
 function renderAllDashboardTables() {
   Object.keys(DASHBOARD_TABLE_CONFIG).forEach((tableKey) => renderDashboardTableByKey(tableKey));
+  populateTransferFilters();
+}
+
+function populateTransferFilters() {
+  const rows = Array.isArray(state.dashboardData?.tables?.transfer_proposals)
+    ? state.dashboardData.tables.transfer_proposals
+    : [];
+  const reparti = [...new Set(rows.map((r) => String(r.reparto || "")).filter(Boolean))].sort();
+  const categorie = [...new Set(rows.map((r) => String(r.categoria || "")).filter(Boolean))].sort();
+  const marchi = [...new Set(rows.map((r) => String(r.marchio || "")).filter(Boolean))].sort();
+
+  if (el.transferRepartoFilter) {
+    const cur = el.transferRepartoFilter.value;
+    el.transferRepartoFilter.innerHTML =
+      '<option value="">Reparto: tutti</option>' +
+      reparti.map((v) => `<option value="${escHtml(v)}">${escHtml(v)}</option>`).join("");
+    el.transferRepartoFilter.value = reparti.includes(cur) ? cur : "";
+    state.dashboardTableState.transfer_proposals.repartoFilter = el.transferRepartoFilter.value || "";
+  }
+  if (el.transferCategoriaFilter) {
+    const cur = el.transferCategoriaFilter.value;
+    el.transferCategoriaFilter.innerHTML =
+      '<option value="">Categoria: tutte</option>' +
+      categorie.map((v) => `<option value="${escHtml(v)}">${escHtml(v)}</option>`).join("");
+    el.transferCategoriaFilter.value = categorie.includes(cur) ? cur : "";
+    state.dashboardTableState.transfer_proposals.categoriaFilter = el.transferCategoriaFilter.value || "";
+  }
+  if (el.transferMarchioFilter) {
+    const cur = el.transferMarchioFilter.value;
+    el.transferMarchioFilter.innerHTML =
+      '<option value="">Marchio: tutti</option>' +
+      marchi.map((v) => `<option value="${escHtml(v)}">${escHtml(v)}</option>`).join("");
+    el.transferMarchioFilter.value = marchi.includes(cur) ? cur : "";
+    state.dashboardTableState.transfer_proposals.marchioFilter = el.transferMarchioFilter.value || "";
+  }
 }
 
 function escapeCsvCell(v) {
@@ -3836,6 +3883,20 @@ function initDashboardTableControls() {
     if (cfg.rowLimitEl) {
       cfg.rowLimitEl.value = String(state.dashboardTableState[tableKey].rowLimit || 20);
     }
+  });
+
+  // Listener filtri extra per transfer_proposals
+  el.transferRepartoFilter?.addEventListener("change", () => {
+    state.dashboardTableState.transfer_proposals.repartoFilter = el.transferRepartoFilter.value || "";
+    renderDashboardTableByKey("transfer_proposals");
+  });
+  el.transferCategoriaFilter?.addEventListener("change", () => {
+    state.dashboardTableState.transfer_proposals.categoriaFilter = el.transferCategoriaFilter.value || "";
+    renderDashboardTableByKey("transfer_proposals");
+  });
+  el.transferMarchioFilter?.addEventListener("change", () => {
+    state.dashboardTableState.transfer_proposals.marchioFilter = el.transferMarchioFilter.value || "";
+    renderDashboardTableByKey("transfer_proposals");
   });
 }
 
