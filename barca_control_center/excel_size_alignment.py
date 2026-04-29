@@ -12,17 +12,12 @@ def detect_size_data_shift(
     *,
     normalize: Callable[[Any], str] | None = None,
 ) -> int:
-    if not size_col_map:
-        return 0
+    """Restituisce sempre 0: il simbolo '%' nella prima colonna taglia
+    è un residuo del campo %VEN, NON un indicatore di shift.
+    I dati delle taglie sono sempre allineati con le posizioni dell'header.
 
-    first_size_col = min(size_col_map.values())
-    if first_size_col >= len(row):
-        return 0
-
-    raw_value = row[first_size_col]
-    if normalize is None:
-        text = "" if raw_value is None else str(raw_value).strip()
-    else:
-        text = normalize(raw_value).strip()
-
-    return 1 if text in {"%", "％"} else 0
+    Bug precedente: il '%' veniva interpretato come shift +1, causando
+    la lettura sbagliata di tutte le quantità per taglia nelle righe
+    con percentuale vendita > 0 (le taglie risultavano scalate di 1).
+    """
+    return 0

@@ -456,7 +456,7 @@ def duplicate_pairs_total(stock, article: str, shop: str) -> float:
     return float(sum(max(0.0, float(qty or 0.0) - 1.0) for qty in sizes.values()))
 
 
-def _find_excess_gap_receivers(
+def _find_excess_depth_receivers(
     meta,
     stock,
     sales_signal,
@@ -469,16 +469,17 @@ def _find_excess_gap_receivers(
     shop_total_stock: Optional[Dict] = None,
     shop_capacity_target: Optional[Dict] = None,
     donor_fascia_rank: int = 99,
+    donor_qty: float = 0.0,
 ) -> List[Dict]:
     """
     Trova negozi di fascia *migliore* del donatore (rank più basso) che:
-    - hanno un buco sulla taglia ``size`` per ``article``
+    - hanno meno giacenza del donatore per questa taglia (es. 0 o 1 se il donatore ha 2)
     - hanno segnale vendite attivo
     - hanno capacità disponibile
 
     Usato nella fase di consolidamento per preferire negozi di fascia alta
     rispetto all'invio diretto a M4.
-    Ordinati per fascia crescente (migliore prima), poi venduto decrescente.
+    Ordinati per fascia crescente (migliore prima), giacenza crescente, poi venduto decrescente.
     """
     candidates = []
     for recv in shops_for_article:
@@ -496,8 +497,10 @@ def _find_excess_gap_receivers(
         local_sales_signal = local_sales_signal_for_shop(sales_signal, signal_lookup, article, recv)
         if local_sales_signal <= 0.0:
             continue  # solo negozi attivi
-        if float(stock.get((article, recv), {}).get(size, 0.0) or 0.0) >= 1.0:
-            continue  # taglia già coperta
+        recv_qty = float(stock.get((article, recv), {}).get(size, 0.0) or 0.0)
+        # Selezioniamo negozi che hanno MENO stock del donatore
+        if recv_qty >= donor_qty:
+            continue
         if shop_total_stock is not None and shop_capacity_target is not None:
             free = free_capacity(recv, shop_total_stock, shop_capacity_target)
             if not np.isinf(free) and free < 1.0:
@@ -507,9 +510,10 @@ def _find_excess_gap_receivers(
                 "shop": recv,
                 "fascia_rank": recv_fascia_rank,
                 "sales_signal": local_sales_signal,
+                "stock_qty": recv_qty,
             }
         )
-    candidates.sort(key=lambda x: (x["fascia_rank"], -x["sales_signal"], x["shop"]))
+    candidates.sort(key=lambda x: (x["fascia_rank"], x["stock_qty"], -x["sales_signal"], x["shop"]))
     return candidates
 
 
@@ -1247,16 +1251,18 @@ def run_allocation_frames(
                     continue  # serve almeno un duplicato per cedere (si lascia 1)
                 is_core = sz in req_sizes_s
 
-                # Fase A: invia l'eccedenza a negozi di fascia migliore con buco
+                # Fase A: invia l'eccedenza a negozi di fascia migliore con meno giacenza
                 while stock.get((article, s), {}).get(sz, 0.0) >= 2.0:
+                    current_donor_qty = stock.get((article, s), {}).get(sz, 0.0)
                     if not ops_budget_allows_move(s, ops_out_used, ops_out_budget):
                         break
-                    gap_recvs = _find_excess_gap_receivers(
+                    gap_recvs = _find_excess_depth_receivers(
                         meta, stock, sales_signal, signal_lookup,
                         article, s, sz, shops_for_article,
                         shop_total_stock=shop_total_stock,
                         shop_capacity_target=shop_capacity_target,
                         donor_fascia_rank=donor_fascia_rank_s,
+                        donor_qty=current_donor_qty,
                     )
                     moved = False
                     for recv_info in gap_recvs:
@@ -1266,7 +1272,7 @@ def run_allocation_frames(
                                 stock, total, shop_total_stock,
                                 ops_out_used, ops_in_used, transfers,
                                 article, sz, s, recv,
-                                "Redistribuzione fascia-alta: eccesso a negozio con buco",
+                                "Redistribuzione fascia-alta: approfondimento stock",
                             )
                             moved = True
                             break

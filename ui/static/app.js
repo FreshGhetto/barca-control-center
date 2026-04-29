@@ -2316,7 +2316,7 @@ function renderTransferArticleDetail(detail) {
             `,
           )
           .join("")
-      : "<tr class='empty-row'><td colspan='5'>Nessun movimento registrato per questo articolo.</td></tr>";
+      : "<tr class='empty-row'><td colspan='5'><strong style='color: var(--text-warn);'>Nessun trasferimento suggerito</strong> per questo articolo. La tabella mostra la situazione attuale.</td></tr>";
   }
 
   const shopRows = Array.isArray(detail?.shop_rows) ? detail.shop_rows : [];
@@ -4031,11 +4031,13 @@ function initEvents() {
     refreshDashboard();
   });
   el.transferArticleLoadBtn?.addEventListener("click", () => {
+    if (el.transferArticleInput) state.selectedTransferArticle = el.transferArticleInput.value.trim();
     loadTransferArticleDetail();
   });
   el.transferArticleInput?.addEventListener("keydown", (evt) => {
     if (evt.key !== "Enter") return;
     evt.preventDefault();
+    state.selectedTransferArticle = el.transferArticleInput.value.trim();
     loadTransferArticleDetail();
   });
   el.transferArticleExportXlsxBtn?.addEventListener("click", async () => {

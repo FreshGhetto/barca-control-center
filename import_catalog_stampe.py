@@ -67,20 +67,20 @@ try:
         excel_files=excel_files,
         price_files=price_files,
         sheet=0,
-        create_schema=True,
+        create_schema=False,
         verbose=True,
         progress_cb=progress_cb,
     )
     elapsed = time.time() - t0
     print()
-    print(f"✓ Import completato in {elapsed:.1f}s")
+    print(f"\n[OK] Import completato in {elapsed:.1f}s")
     print(f"  run_id: {result['run_id']}")
     print(f"  stagioni: {result.get('catalog_seasons', [])}")
     print(f"  conteggi:")
     for k, v in (result.get("counts") or {}).items():
         print(f"    {k}: {v}")
 except Exception as e:
-    print(f"\n✗ ERRORE durante l'import: {e}")
+    print(f"\n[ERRORE] durante l'import: {e}")
     import traceback; traceback.print_exc()
     sys.exit(1)
 
