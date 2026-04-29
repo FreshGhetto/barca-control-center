@@ -5,7 +5,12 @@ __pycache__/
 incoming/
 input/orders/
 output/
-backups/
+backups/*
+!backups/db/
+backups/db/*
+!backups/db/README.md
+!backups/db/restore-points/
+!backups/db/restore-points/**
 config/backup/
 config/ui_settings.json
 
